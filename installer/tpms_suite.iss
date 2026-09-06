@@ -1,5 +1,5 @@
 #define MyAppName "TPMS Suite"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Xynovix"
 #define MyAppExeName "TPMS_Suite.exe"
 

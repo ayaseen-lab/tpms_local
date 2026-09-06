@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from config import FREQUENCY_PRESETS, get_rtl433_dir, get_rtl433_exe
+from config import FREQUENCY_PRESETS, RTL433_DISABLED_PROTOCOL_IDS, get_rtl433_dir, get_rtl433_exe
 
 try:
   from tpms_bench.paths import results_dir
@@ -285,6 +285,11 @@ class Rtl433Runner:
 
     # Stronger FSK detection — default 250k + plain auto often under-decodes vs Board LF.
     cmd.extend(["-Y", "autolevel", "-Y", "minmax"])
+
+    # Enable all rtl_433 25.12 disabled-by-default protocols (Confluence "full 433_rtl" intent).
+    # -G is deprecated; "-R -n -R n" adds protocol n without clearing the default set.
+    for proto_id in RTL433_DISABLED_PROTOCOL_IDS:
+      cmd.extend(["-R", f"-{proto_id}", "-R", str(proto_id)])
 
     if iq_path:
       path = Path(iq_path)

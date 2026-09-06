@@ -147,6 +147,28 @@ def parse_json_lines(text: str) -> list[SdrPacket]:
     return packets
 
 
+def _extra_protocol_flags() -> list[str]:
+    """Enable rtl_433 protocols that are disabled by default (full decoder set)."""
+    flags: list[str] = []
+    try:
+        from sdr_ui.config import RTL433_DISABLED_PROTOCOL_IDS
+
+        ids = RTL433_DISABLED_PROTOCOL_IDS
+    except Exception:
+        try:
+            from config import RTL433_DISABLED_PROTOCOL_IDS
+
+            ids = RTL433_DISABLED_PROTOCOL_IDS
+        except Exception:
+            ids = (
+                6, 7, 13, 14, 24, 37, 48, 61, 62, 64, 72, 86, 101, 106, 107, 117, 118, 123,
+                129, 150, 162, 169, 198, 200, 216, 233, 242, 245, 248, 260, 270,
+            )
+    for proto_id in ids:
+        flags.extend(["-R", f"-{proto_id}", "-R", str(proto_id)])
+    return flags
+
+
 def capture_command(
     iq_path: Path,
     frequency_hz: int = 433920000,
@@ -160,7 +182,7 @@ def capture_command(
     iq_path.parent.mkdir(parents=True, exist_ok=True)
     # Half of the 1 Msps live-decode rate — IQ archive is for offline replay.
     rate = max(250_000, int(sample_rate))
-    return [
+    cmd = [
         binary,
         "-f",
         str(frequency_hz),
@@ -179,6 +201,8 @@ def capture_command(
         "-w",
         str(iq_path),
     ]
+    cmd.extend(_extra_protocol_flags())
+    return cmd
 
 
 def start_capture(

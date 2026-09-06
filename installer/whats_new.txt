@@ -1,15 +1,18 @@
-TPMS Suite 1.1.0
+TPMS Suite 1.2.0
 
 What's new
 ----------
-• Start Both — start TPMS Board and SDR Receiver together (one RTL-SDR at a time)
-• Comparative Analysis — Compare Excel / Compare PDF from the header
-• Side-by-side OK/NOK for every Board row plus SDR-only Sensor IDs
-• Vehicle / Protocol column — Board make/model, SDR protocol for SDR-only lines
-• Live Board table columns for SDR compare result and reason
-• Multi-page comparative PDF tables with visible column headings
+• Full rtl_433 decoder set — enables all protocols disabled by default in 25.12
+  (including Jansite TY02S / Nissan TPMS and other starred protocols)
+• Record IQ — optional CU8 capture for offline SDR analysis (kept when no TPMS decoded)
+• Half sample rate while recording IQ (~500k) to keep file size manageable
+• Prefer rtl_433-rtlsdr.exe for Nooelec / RTL-SDR dongles
+• Stronger FSK detection (autolevel + minmax) and 1 Msps live decode
+• Board live table cleanup — stretch columns, clearer NOK notes / root cause
+• Stop honors bad COM / interruptible serial open
 
 Notes
 -----
 Comparative reports use the current session only (Board rows + SDR sensors in memory).
 SEGGER J-Link is not bundled. Install J-Link separately if you need SRAM capture.
+IQ files are written under results\iq when Record IQ is enabled.

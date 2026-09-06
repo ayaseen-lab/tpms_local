@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "TPMS Suite"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 APP_VENDOR = "Xynovix"
 
 # Bundled rtl_433 MSVC build (included in executable)
@@ -18,6 +18,13 @@ RTL_433_DOWNLOAD_URL = (
 
 # Prefer rtl_433-rtlsdr for RTL-SDR dongles; fall back to generic build
 RTL_433_EXE_CANDIDATES = ("rtl_433-rtlsdr.exe", "rtl_433.exe")
+
+# Protocols disabled by default in rtl_433 25.12 (marked * in -R help).
+# Enable alongside defaults via "-R -<id> -R <id>" (replaces deprecated -G).
+RTL433_DISABLED_PROTOCOL_IDS: tuple[int, ...] = (
+  6, 7, 13, 14, 24, 37, 48, 61, 62, 64, 72, 86, 101, 106, 107, 117, 118, 123,
+  129, 150, 162, 169, 198, 200, 216, 233, 242, 245, 248, 260, 270,
+)
 
 # Zadig for RTL-SDR driver setup (bundled in executable)
 ZADIG_VERSION = "2.9"
