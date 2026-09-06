@@ -1,0 +1,15 @@
+TPMS Suite 1.1.0
+
+What's new
+----------
+• Start Both — start TPMS Board and SDR Receiver together (one RTL-SDR at a time)
+• Comparative Analysis — Compare Excel / Compare PDF from the header
+• Side-by-side OK/NOK for every Board row plus SDR-only Sensor IDs
+• Vehicle / Protocol column — Board make/model, SDR protocol for SDR-only lines
+• Live Board table columns for SDR compare result and reason
+• Multi-page comparative PDF tables with visible column headings
+
+Notes
+-----
+Comparative reports use the current session only (Board rows + SDR sensors in memory).
+SEGGER J-Link is not bundled. Install J-Link separately if you need SRAM capture.

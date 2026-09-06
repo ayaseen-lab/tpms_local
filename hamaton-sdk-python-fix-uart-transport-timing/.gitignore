@@ -1,0 +1,34 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local protocol specifications and confidential source data
+docs/specifications/
+*.pdf
+*.xlsx
+
+# Runtime output
+*.log
+*.cu8
+*.cs8
+*.cf32
+captures/
+results/

@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+results/
+.DS_Store
+build/
+dist/
+dist_installer/
+installer/_download_cache/
+installer/tpms_suite.ico
+sdr_ui/vendor/rtl_433/**
+!sdr_ui/vendor/rtl_433/README.txt
+sdr_ui/vendor/zadig.exe
