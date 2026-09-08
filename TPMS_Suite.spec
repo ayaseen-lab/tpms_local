@@ -42,6 +42,7 @@ hiddenimports = [
     "tpms_view",
     "shell",
     "comparative_report",
+    "iq_urh_tool",
     "serial.tools.list_ports",
     "PIL._tkinter_finder",
 ]

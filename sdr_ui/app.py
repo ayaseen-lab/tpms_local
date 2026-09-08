@@ -370,7 +370,7 @@ class SdrView(ctk.CTkFrame):
     prog_row = ctk.CTkFrame(self, fg_color="transparent")
     prog_row.pack(fill="x")
     self.progress_label = ctk.CTkLabel(
-      prog_row, text="Session: 0 readings  ·  Record IQ uses ½ sample rate; file kept only if no TPMS decoded (empty/successful discarded)",
+      prog_row, text="Session: 0 readings  ·  Record IQ saves full-rate .cu8 (kept after stop for IQ / URH replay)",
       font=ctk.CTkFont(size=10), text_color=COLOR_TEXT_MUTED,
     )
     self.progress_label.pack(side="left")
@@ -592,7 +592,7 @@ class SdrView(ctk.CTkFrame):
       if self._session_start is None:
         self._session_start = datetime.now()
       self._update_export_button()
-      iq_note = " · IQ @½ rate (keep if no decode)" if record_iq else ""
+      iq_note = " · IQ recording (full rate, kept)" if record_iq else ""
       self.footer_label.configure(text=f"Listening on {preset}{iq_note}…")
 
   def _pause_listen(self):

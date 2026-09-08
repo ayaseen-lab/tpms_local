@@ -174,13 +174,12 @@ def capture_command(
     frequency_hz: int = 433920000,
     duration_s: float = 15.0,
     *,
-    sample_rate: int = 500_000,
+    sample_rate: int = 1_000_000,
 ) -> list[str] | None:
     binary = rtl_433_path()
     if not binary:
         return None
     iq_path.parent.mkdir(parents=True, exist_ok=True)
-    # Half of the 1 Msps live-decode rate — IQ archive is for offline replay.
     rate = max(250_000, int(sample_rate))
     cmd = [
         binary,
@@ -210,7 +209,7 @@ def start_capture(
     frequency_hz: int = 433920000,
     duration_s: float = 15.0,
 ) -> subprocess.Popen | SdrCaptureResult:
-    cmd = capture_command(iq_path, frequency_hz, duration_s, sample_rate=500_000)
+    cmd = capture_command(iq_path, frequency_hz, duration_s, sample_rate=1_000_000)
     if not cmd:
         return SdrCaptureResult(False, [], None, "rtl_433 not installed")
     try:

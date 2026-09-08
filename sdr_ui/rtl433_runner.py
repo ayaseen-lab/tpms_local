@@ -278,9 +278,8 @@ class Rtl433Runner:
     if ppm:
       cmd.extend(["-p", str(ppm)])
 
-    # Full rate for live decode; half rate while writing IQ (rtl_433 uses one -s for both).
-    base_rate = int(preset.get("sample_rate") or 1000000)
-    sample_rate = max(250000, base_rate // 2) if iq_path else base_rate
+    # Same sample rate for live decode and IQ write so offline replay matches live counts.
+    sample_rate = int(preset.get("sample_rate") or 1000000)
     cmd.extend(["-s", str(sample_rate)])
 
     # Stronger FSK detection — default 250k + plain auto often under-decodes vs Board LF.
@@ -331,8 +330,8 @@ class Rtl433Runner:
     self.on_log(f"Starting: {' '.join(cmd)}")
     if iq_path:
       self.on_log(
-        f"IQ recording ON at half sample rate → {iq_path} "
-        f"(kept only if no TPMS decoded; replay: rtl_433-rtlsdr -r <file.cu8> -F json)"
+        f"IQ recording ON @ full sample rate → {iq_path} "
+        f"(kept after stop; replay: rtl_433-rtlsdr -r <file.cu8> -F json)"
       )
 
     try:
@@ -435,7 +434,7 @@ class Rtl433Runner:
     self._finalize_iq_file()
 
   def _finalize_iq_file(self) -> None:
-    """Keep IQ only when nothing useful was decoded (or file is empty → delete)."""
+    """Keep non-empty IQ after stop so IQ/URH replay can match the live session."""
     if not self.iq_path:
       return
     try:
@@ -449,19 +448,10 @@ class Rtl433Runner:
         self.on_log(f"IQ discarded (empty): {path.name}")
         self.iq_path = None
         return
-      # Interesting = RF captured but rtl_433 decoded no TPMS — keep for offline replay.
-      if self._tpms_decode_count > 0:
-        path.unlink(missing_ok=True)
-        self.on_log(
-          f"IQ discarded ({size / (1024 * 1024):.1f} MB) — {self._tpms_decode_count} TPMS "
-          f"packet(s) already decoded live ({path.name})"
-        )
-        self.iq_path = None
-        return
       mb = size / (1024 * 1024)
       self.on_log(
-        f"IQ kept ({mb:.1f} MB, no TPMS decoded): {path} — "
-        f"replay: rtl_433-rtlsdr -r \"{path.name}\" -F json"
+        f"IQ kept ({mb:.1f} MB, {self._tpms_decode_count} live TPMS packet(s)): {path} — "
+        f"open on IQ / URH tab or: rtl_433-rtlsdr -r \"{path.name}\" -F json"
       )
     except Exception as exc:
       self.on_log(f"IQ status check failed: {exc}")

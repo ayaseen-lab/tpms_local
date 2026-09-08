@@ -14,8 +14,23 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## IQ → URH → Excel
+
+Use the **IQ / URH** tab in the suite (or run standalone):
+
+```powershell
+.venv\Scripts\python.exe iq_urh_tool.py
+```
+
+1. Browse to an IQ file (e.g. `results/iq/*.cu8`)
+2. **Open in URH** — copies `.cu8` to `.complex16u` and launches Universal Radio Hacker (`pip install urh` if needed)
+3. **Decode → Excel** — replays with the suite rtl_433 decoder set and writes an SDR-format Excel report
+
+**Do both** opens URH and exports Excel in one step.
+
 ## What you get
 
+- **IQ / URH** — open IQ captures in Universal Radio Hacker and export decoded Excel
 - **SDR Receiver** — live rtl_433 telemetry, sensor cards, history, driver setup
 - **TPMS Board** — Excel opcode database plus optional custom CODE A / B / C fields
 - **Start Both** — start Board + SDR together (Board skips live IQ so SDR owns the dongle)

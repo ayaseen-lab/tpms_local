@@ -23,6 +23,7 @@ import customtkinter as ctk
 from app import SdrView
 from comparative_report import build_comparison, export_comparative_excel, export_comparative_pdf
 from dialogs import ask_save_path
+from iq_urh_tool import IqUrhView
 from themes import (
     COLOR_BG,
     COLOR_BTN_EXPORT,
@@ -43,7 +44,7 @@ from themes import (
 from tpms_view import TpmsView
 
 APP_TITLE = "TPMS Suite"
-APP_SUBTITLE = "TPMS Board  ·  SDR Receiver  ·  switch views without stopping a run"
+APP_SUBTITLE = "TPMS Board  ·  SDR Receiver  ·  IQ / URH  ·  switch views without stopping a run"
 
 
 class CombinedApp(ctk.CTk):
@@ -103,7 +104,16 @@ class CombinedApp(ctk.CTk):
             font=ctk.CTkFont(size=13, weight="bold"),
             command=lambda: self.show_view("sdr"),
         )
-        self.sdr_tab.pack(side="left")
+        self.sdr_tab.pack(side="left", padx=(0, 8))
+        self.iq_tab = ctk.CTkButton(
+            nav,
+            text="IQ / URH",
+            width=140,
+            height=36,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=lambda: self.show_view("iq"),
+        )
+        self.iq_tab.pack(side="left")
         ctk.CTkLabel(
             nav,
             text="Tabs switch view only — runs keep going.",
@@ -154,23 +164,30 @@ class CombinedApp(ctk.CTk):
     def _build_views(self) -> None:
         self.sdr_view = SdrView(self.content, on_status_change=self._on_sdr_status)
         self.board_view = TpmsView(self.content, on_status_change=self._on_board_status)
-        # Both stay created so processing continues; only the active view is mapped
+        self.iq_view = IqUrhView(self.content)
+        # All stay created so processing continues; only the active view is mapped
         # so CODE A/B/C fields can take keyboard focus.
         self.sdr_view.grid(row=0, column=0, sticky="nsew")
         self.board_view.grid(row=0, column=0, sticky="nsew")
+        self.iq_view.grid(row=0, column=0, sticky="nsew")
         self.show_view("board")
 
     def show_view(self, name: str) -> None:
         self._active = name
+        self.board_view.grid_remove()
+        self.sdr_view.grid_remove()
+        self.iq_view.grid_remove()
+        self._paint_tab(self.board_tab, False)
+        self._paint_tab(self.sdr_tab, False)
+        self._paint_tab(self.iq_tab, False)
         if name == "sdr":
-            self.board_view.grid_remove()
             self.sdr_view.grid(row=0, column=0, sticky="nsew")
             self._paint_tab(self.sdr_tab, True)
-            self._paint_tab(self.board_tab, False)
+        elif name == "iq":
+            self.iq_view.grid(row=0, column=0, sticky="nsew")
+            self._paint_tab(self.iq_tab, True)
         else:
-            self.sdr_view.grid_remove()
             self.board_view.grid(row=0, column=0, sticky="nsew")
-            self._paint_tab(self.sdr_tab, False)
             self._paint_tab(self.board_tab, True)
             self.after(50, self.board_view.focus_code_fields)
 
@@ -296,6 +313,7 @@ class CombinedApp(ctk.CTk):
     def _on_close(self) -> None:
         self.sdr_view.shutdown()
         self.board_view.shutdown()
+        self.iq_view.shutdown()
         self.destroy()
 
 

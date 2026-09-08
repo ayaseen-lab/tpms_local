@@ -4,7 +4,7 @@ What's new
 ----------
 • Full rtl_433 decoder set — enables all protocols disabled by default in 25.12
   (including Jansite TY02S / Nissan TPMS and other starred protocols)
-• Record IQ — optional CU8 capture for offline SDR analysis (kept when no TPMS decoded)
+• Record IQ — full-rate CU8 kept after stop for IQ / URH offline replay
 • Half sample rate while recording IQ (~500k) to keep file size manageable
 • Prefer rtl_433-rtlsdr.exe for Nooelec / RTL-SDR dongles
 • Stronger FSK detection (autolevel + minmax) and 1 Msps live decode
