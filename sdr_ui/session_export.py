@@ -27,6 +27,7 @@ WARN_FILL = PatternFill("solid", fgColor="FFF7ED")
 READING_HEADERS = [
   "Sensor ID",
   "Timestamp",
+  "rtl_433 Decoder",
   "Brand/Type",
   "Result",
   "Pressure (PSI)",
@@ -38,6 +39,7 @@ READING_HEADERS = [
 
 AVERAGE_HEADERS = [
   "Sensor ID",
+  "rtl_433 Decoder",
   "Brand/Type",
   "Readings",
   "Result",
@@ -150,6 +152,19 @@ def _iter_id_groups(readings: List[TelemetryReading]) -> Iterable[Tuple[str, Lis
     yield sensor_id, list(group)
 
 
+def _decoder_label(reading: TelemetryReading) -> str:
+  return reading.display_decoder
+
+
+def _unique_decoders(group_rows: List[TelemetryReading]) -> str:
+  labels: List[str] = []
+  for reading in group_rows:
+    label = _decoder_label(reading)
+    if label and label not in labels:
+      labels.append(label)
+  return ", ".join(labels) if labels else "—"
+
+
 def _average_rows(readings: List[TelemetryReading]) -> List[List[Any]]:
   rows: List[List[Any]] = []
   for sensor_id, group_rows in _iter_id_groups(readings):
@@ -168,6 +183,7 @@ def _average_rows(readings: List[TelemetryReading]) -> List[List[Any]]:
     rows.append(
       [
         sensor_id,
+        _unique_decoders(group_rows),
         ", ".join(brands),
         len(group_rows),
         result,
@@ -189,7 +205,7 @@ def _write_averages_sheet(wb: Workbook, readings: List[TelemetryReading]) -> Non
   ws = wb.create_sheet("Averages")
   _style_header(ws, AVERAGE_HEADERS)
   for excel_row, row in enumerate(_average_rows(readings), start=2):
-    status = str(row[3])
+    status = str(row[4])
     fill = OK_FILL if status == "OK" else LOW_FILL if status == "NOK" else None
     for col, val in enumerate(row, start=1):
       cell = ws.cell(row=excel_row, column=col, value=val)
@@ -197,10 +213,13 @@ def _write_averages_sheet(wb: Workbook, readings: List[TelemetryReading]) -> Non
         cell.fill = fill
   _set_widths(
     ws,
-    {1: 16, 2: 28, 3: 12, 4: 12, 5: 18, 6: 18, 7: 16, 8: 16, 9: 22, 10: 22, 11: 14, 12: 12, 13: 36},
+    {
+      1: 16, 2: 36, 3: 28, 4: 12, 5: 12, 6: 18, 7: 18, 8: 16, 9: 16,
+      10: 22, 11: 22, 12: 14, 13: 12, 14: 36,
+    },
   )
   ws.freeze_panes = "A2"
-  ws.auto_filter.ref = f"A1:M{max(ws.max_row, 1)}"
+  ws.auto_filter.ref = f"A1:N{max(ws.max_row, 1)}"
 
 
 def _write_readings_sheet(wb: Workbook, readings: List[TelemetryReading]) -> None:
@@ -240,6 +259,7 @@ def _write_readings_sheet(wb: Workbook, readings: List[TelemetryReading]) -> Non
       values = [
         reading.sensor_id,
         reading.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        _decoder_label(reading),
         _brand_type(reading),
         result,
         _round(reading.psi, 2),
@@ -253,7 +273,10 @@ def _write_readings_sheet(wb: Workbook, readings: List[TelemetryReading]) -> Non
       for col in range(1, len(values) + 1):
         ws.cell(row=excel_row, column=col).fill = fill
 
-  _set_widths(ws, {1: 18, 2: 22, 3: 28, 4: 10, 5: 16, 6: 16, 7: 14, 8: 18, 9: 36})
+  _set_widths(
+    ws,
+    {1: 18, 2: 22, 3: 36, 4: 28, 5: 10, 6: 16, 7: 16, 8: 14, 9: 18, 10: 36},
+  )
   ws.freeze_panes = "A2"
 
 
@@ -309,8 +332,8 @@ def export_session_pdf(
   meta = meta or {}
   snapshot = list(readings)
   avg_rows = _average_rows(snapshot)
-  ok_n = sum(1 for row in avg_rows if row[3] == "OK")
-  nok_n = sum(1 for row in avg_rows if row[3] == "NOK")
+  ok_n = sum(1 for row in avg_rows if row[4] == "OK")
+  nok_n = sum(1 for row in avg_rows if row[4] == "NOK")
   path.parent.mkdir(parents=True, exist_ok=True)
 
   navy = colors.HexColor("#1A365D")
@@ -329,6 +352,13 @@ def export_session_pdf(
   body = ParagraphStyle(
     "sdr_body", parent=base["Normal"], fontSize=9, textColor=navy,
     leading=12, alignment=TA_LEFT,
+  )
+  tiny = ParagraphStyle(
+    "sdr_tiny", parent=base["Normal"], fontSize=7, textColor=navy, leading=9,
+  )
+  th = ParagraphStyle(
+    "sdr_th", parent=base["Normal"], fontName="Helvetica-Bold",
+    fontSize=7, textColor=colors.white, leading=9, alignment=TA_CENTER,
   )
 
   def header_footer(canvas, doc):
@@ -350,6 +380,11 @@ def export_session_pdf(
     canvas.drawRightString(A4[0] - 14 * mm, 4.5 * mm, f"Page {doc.page}")
     canvas.restoreState()
 
+  def cell(text: object, style=tiny) -> Paragraph:
+    raw = str(text if text is not None else "—").replace("\n", " ").strip() or "—"
+    escaped = raw.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return Paragraph(escaped, style)
+
   story = [
     Paragraph("SDR Receiver Report", title),
     Paragraph("RTL-SDR / rtl_433 telemetry session — this is not a TPMS board report", sub),
@@ -361,6 +396,11 @@ def export_session_pdf(
       f"<b>Sensors:</b> {len(avg_rows)}",
       body,
     ),
+    Paragraph(
+      "<b>rtl_433 Decoder</b> = which library protocol decoded each sensor "
+      "(protocol number + full decoder name from rtl_433).",
+      body,
+    ),
     Spacer(1, 4 * mm),
   ]
   for key, val in meta.items():
@@ -368,26 +408,41 @@ def export_session_pdf(
   story.append(Spacer(1, 5 * mm))
   story.append(Paragraph("Per-sensor averages", ParagraphStyle("h", parent=base["Heading2"], textColor=navy, fontSize=13)))
 
-  table_data = [["Sensor ID", "Brand/Type", "Readings", "Result", "Avg PSI", "Avg °C", "Time to OK", "Span", "NOK reason"]]
+  table_data = [[
+    Paragraph(h, th)
+    for h in [
+      "Sensor ID",
+      "rtl_433 Decoder",
+      "Brand/Type",
+      "Reads",
+      "Result",
+      "Avg PSI",
+      "Avg °C",
+      "Time to OK",
+      "Span",
+      "NOK reason",
+    ]
+  ]]
   for row in avg_rows:
     table_data.append(
       [
-        str(row[0]),
-        str(row[1]),
-        str(row[2]),
-        str(row[3]),
-        "" if row[4] is None else f"{row[4]:.2f}",
-        "" if row[5] is None else f"{row[5]:.1f}",
-        _format_seconds(row[10]),
-        _format_seconds(row[11]),
-        str(row[12] or ""),
+        cell(row[0]),
+        cell(row[1]),
+        cell(row[2]),
+        cell(row[3]),
+        cell(row[4]),
+        cell("" if row[5] is None else f"{row[5]:.2f}"),
+        cell("" if row[6] is None else f"{row[6]:.1f}"),
+        cell(_format_seconds(row[11])),
+        cell(_format_seconds(row[12])),
+        cell(row[13] or ""),
       ]
     )
   if len(table_data) == 1:
-    table_data.append(["—"] * 9)
+    table_data.append([cell("—")] * 10)
   tbl = Table(
     table_data,
-    colWidths=[22 * mm, 30 * mm, 16 * mm, 14 * mm, 18 * mm, 16 * mm, 18 * mm, 16 * mm, 32 * mm],
+    colWidths=[18 * mm, 42 * mm, 22 * mm, 12 * mm, 12 * mm, 14 * mm, 12 * mm, 16 * mm, 14 * mm, 24 * mm],
     repeatRows=1,
   )
   tbl.setStyle(

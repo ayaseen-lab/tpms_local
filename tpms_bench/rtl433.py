@@ -134,9 +134,26 @@ def parse_json_lines(text: str) -> list[SdrPacket]:
         sensor_id = data.get("id") or data.get("ID") or data.get("sensor_id")
         if sensor_id is not None:
             sensor_id = str(sensor_id).replace(" ", "").lstrip("0x").upper()
+        model = data.get("model") or data.get("type")
+        proto_raw = data.get("protocol")
+        protocol_id = None
+        if proto_raw is not None and proto_raw != "":
+            try:
+                protocol_id = int(proto_raw)
+            except (TypeError, ValueError):
+                protocol_id = None
+        try:
+            from config import format_rtl433_decoder
+
+            protocol = format_rtl433_decoder(protocol_id, str(model) if model else None)
+        except Exception:
+            if protocol_id is not None and model:
+                protocol = f"[{protocol_id}] {model}"
+            else:
+                protocol = model
         packets.append(
             SdrPacket(
-                protocol=data.get("model") or data.get("type"),
+                protocol=protocol,
                 sensor_id=sensor_id,
                 pressure=data.get("pressure_kPa") or data.get("pressure_BAR") or data.get("pressure"),
                 temperature=data.get("temperature_C") or data.get("temperature"),
@@ -148,25 +165,27 @@ def parse_json_lines(text: str) -> list[SdrPacket]:
 
 
 def _extra_protocol_flags() -> list[str]:
-    """Enable rtl_433 protocols that are disabled by default (full decoder set)."""
-    flags: list[str] = []
+    """Enable every decoder in the current rtl_433 library (including disabled-by-default)."""
+    binary = rtl_433_path()
+    exe = Path(binary) if binary else None
     try:
-        from sdr_ui.config import RTL433_DISABLED_PROTOCOL_IDS
+        from config import rtl433_full_decoder_flags
 
-        ids = RTL433_DISABLED_PROTOCOL_IDS
+        return rtl433_full_decoder_flags(exe)
     except Exception:
         try:
-            from config import RTL433_DISABLED_PROTOCOL_IDS
+            from sdr_ui.config import rtl433_full_decoder_flags
 
-            ids = RTL433_DISABLED_PROTOCOL_IDS
+            return rtl433_full_decoder_flags(exe)
         except Exception:
             ids = (
                 6, 7, 13, 14, 24, 37, 48, 61, 62, 64, 72, 86, 101, 106, 107, 117, 118, 123,
                 129, 150, 162, 169, 198, 200, 216, 233, 242, 245, 248, 260, 270,
             )
-    for proto_id in ids:
-        flags.extend(["-R", f"-{proto_id}", "-R", str(proto_id)])
-    return flags
+            flags: list[str] = []
+            for proto_id in ids:
+                flags.extend(["-R", f"-{proto_id}", "-R", str(proto_id)])
+            return flags
 
 
 def capture_command(
@@ -197,6 +216,8 @@ def capture_command(
         "minmax",
         "-M",
         "level",
+        "-M",
+        "protocol",
         "-w",
         str(iq_path),
     ]

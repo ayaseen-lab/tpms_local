@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS runs (
     battery_voltage TEXT,
     sdr_compare TEXT,
     sdr_reason TEXT,
+    rtl433_decoder TEXT,
     iq_file TEXT,
     sensor_id TEXT,
     frequency TEXT,
@@ -44,6 +45,8 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(runs)")}
     if "duration_s" not in existing:
         conn.execute("ALTER TABLE runs ADD COLUMN duration_s TEXT")
+    if "rtl433_decoder" not in existing:
+        conn.execute("ALTER TABLE runs ADD COLUMN rtl433_decoder TEXT")
 
 
 def completed_rows(conn: sqlite3.Connection) -> set[int]:

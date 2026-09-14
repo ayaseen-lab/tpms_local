@@ -28,7 +28,14 @@ for path in (ROOT, ROOT / "sdr_ui"):
 
 import customtkinter as ctk
 
-from config import APP_NAME, APP_VERSION, RTL433_DISABLED_PROTOCOL_IDS, get_rtl433_exe
+from config import (
+    APP_NAME,
+    APP_VERSION,
+    compact_rtl433_command,
+    get_rtl433_exe,
+    rtl433_decoder_enablement,
+    rtl433_full_decoder_flags,
+)
 from rtl433_runner import TelemetryReading, parse_rtl433_json
 from session_export import export_session_excel
 from themes import (
@@ -49,10 +56,10 @@ from themes import (
 )
 
 IQ_EXTENSIONS = {".cu8", ".complex16u", ".complex16s", ".complex", ".complex32u", ".complex32s", ".wav"}
-DEFAULT_SAMPLE_RATE = 1_000_000  # matches accurate offline decode of session IQ
-DEFAULT_FREQ_MHZ = 433.92
-# Only probe alternate rates on small files; multi-pass on multi‑GB IQ takes hours.
-REPLAY_SAMPLE_RATES = (1_000_000, 500_000, 250_000)
+# Ahmad / bench guidance: 1024k is enough for IQ replay; carrier 432.92 MHz FSK.
+DEFAULT_SAMPLE_RATE = 1_024_000
+DEFAULT_FREQ_MHZ = 432.92
+REPLAY_SAMPLE_RATES = (1_024_000, 1_000_000, 500_000, 250_000)
 AUTO_RATE_MAX_BYTES = 80 * 1024 * 1024  # 80 MB
 
 
@@ -139,22 +146,33 @@ def open_in_urh(iq_for_urh: Path, urh_path: Optional[Path] = None) -> None:
 
 
 def _extra_protocol_flags() -> list[str]:
-    flags: list[str] = []
-    for proto_id in RTL433_DISABLED_PROTOCOL_IDS:
-        flags.extend(["-R", f"-{proto_id}", "-R", str(proto_id)])
-    return flags
+    return rtl433_full_decoder_flags(get_rtl433_exe())
 
 
 def infer_sample_rate_hz(iq_path: Path, fallback: int = DEFAULT_SAMPLE_RATE) -> int:
-    """Prefer 1 Msps; honor nearby URH_IMPORT_NOTES.txt when present."""
+    """Prefer 1024k; honor nearby URH_IMPORT_NOTES.txt when present."""
     notes = iq_path.parent / "URH_IMPORT_NOTES.txt"
     if notes.is_file():
         text = notes.read_text(encoding="utf-8", errors="replace").lower()
+        if "1024000" in text or "1024k" in text or "1.024" in text:
+            return 1_024_000
         if "1000000" in text or "1e6" in text or "1 msps" in text:
             return 1_000_000
         if "500000" in text or "500k" in text:
             return 500_000
     return int(fallback)
+
+
+def infer_freq_mhz(iq_path: Path, fallback: float = DEFAULT_FREQ_MHZ) -> float:
+    """Prefer 432.92 MHz FSK carrier; honor nearby notes when present."""
+    notes = iq_path.parent / "URH_IMPORT_NOTES.txt"
+    if notes.is_file():
+        text = notes.read_text(encoding="utf-8", errors="replace").lower()
+        if "432.92" in text or "432920000" in text:
+            return 432.92
+        if "433.92" in text or "433920000" in text:
+            return 433.92
+    return float(fallback)
 
 
 def decode_iq_with_rtl433(
@@ -219,6 +237,8 @@ def decode_iq_with_rtl433(
             "time:iso",
             "-M",
             "level",
+            "-M",
+            "protocol",
             "-Y",
             "autolevel",
             "-Y",
@@ -226,7 +246,9 @@ def decode_iq_with_rtl433(
         ]
         cmd.extend(_extra_protocol_flags())
         if on_progress:
+            on_progress(rtl433_decoder_enablement(binary))
             on_progress(f"rtl_433 replay @ {rate} Hz (timeout {timeout_s}s)…")
+            on_progress(compact_rtl433_command(cmd))
 
         env = os.environ.copy()
         env["PATH"] = str(binary.parent) + os.pathsep + env.get("PATH", "")
@@ -303,6 +325,16 @@ def readings_from_telemetry_csv(csv_path: Path) -> list[TelemetryReading]:
                 timestamp = datetime.now()
             sid = str(row.get("id") or row.get("ID") or "").strip()
             model = str(row.get("protocol") or row.get("model") or "Unknown")
+            proto_raw = row.get("protocol_id") or row.get("Protocol")
+            protocol_id = None
+            if proto_raw not in (None, ""):
+                try:
+                    protocol_id = int(float(str(proto_raw)))
+                except (TypeError, ValueError):
+                    protocol_id = None
+            decoder = str(row.get("decoder") or row.get("Decoder") or "").strip()
+            if not decoder:
+                decoder = f"[{protocol_id}] {model}" if protocol_id is not None else model
             readings.append(
                 TelemetryReading(
                     sensor_id=sid or "unknown",
@@ -314,6 +346,8 @@ def readings_from_telemetry_csv(csv_path: Path) -> list[TelemetryReading]:
                     timestamp=timestamp,
                     frequency_mhz=fget("freq_MHz", "freq"),
                     raw=dict(row),
+                    decoder=decoder,
+                    protocol_id=protocol_id,
                 )
             )
     return readings
@@ -332,7 +366,7 @@ def export_iq_excel(
         "Source IQ": str(source_iq),
         "Sample rate": f"{sample_rate} Hz",
         "Center frequency": f"{freq_mhz} MHz",
-        "Decoder": "rtl_433 replay @ 1 Msps (suite protocol set — matches offline telemetry.csv)",
+        "Decode settings": "rtl_433 replay @ 1024k / 432.92 MHz FSK (full library decoder set)",
         "URH file": str(urh_path) if urh_path else "—",
         "Unique sensors": len({r.sensor_id for r in readings if r.has_sensor_id()}),
         "Packets decoded": len(readings),
@@ -366,7 +400,7 @@ class IqUrhView(ctk.CTkFrame):
         ).pack(anchor="w", padx=16, pady=(12, 0))
         ctk.CTkLabel(
             banner,
-            text="Open a capture in URH, demodulate visually, export decoded TPMS in suite Excel format",
+            text="Open a capture in URH (FSK @ 432.92 MHz), demodulate visually, export decoded TPMS Excel",
             font=ctk.CTkFont(size=12),
             text_color=COLOR_HEADER_SUB,
         ).pack(anchor="w", padx=16, pady=(2, 10))
@@ -411,8 +445,9 @@ class IqUrhView(ctk.CTkFrame):
         self.auto_rate.grid(row=1, column=2, padx=(16, 0), sticky="w")
         ctk.CTkLabel(
             body,
-            text="Use 1000000 Hz for session IQ (e.g. sdr_session_*.cu8). 500000 on that file only yields a few packets. "
-            "Large files take several minutes. Or import an existing telemetry.csv → Excel.",
+            text="Defaults: 1024000 Hz sample rate, 432.92 MHz FSK carrier. "
+            "Wrong rate (e.g. 500000) on session IQ yields almost no packets. Large files take several minutes. "
+            "Or use CSV → Excel for an existing telemetry.csv.",
             font=ctk.CTkFont(size=11),
             text_color=COLOR_TEXT_DIM,
             wraplength=820,
@@ -501,20 +536,26 @@ class IqUrhView(ctk.CTkFrame):
         self._urh_prepared = None
         self.file_label.configure(text=str(self._iq_path), text_color=COLOR_TEXT)
         inferred = infer_sample_rate_hz(self._iq_path, DEFAULT_SAMPLE_RATE)
+        inferred_freq = infer_freq_mhz(self._iq_path, DEFAULT_FREQ_MHZ)
         self.rate_entry.delete(0, "end")
         self.rate_entry.insert(0, str(inferred))
+        self.freq_entry.delete(0, "end")
+        self.freq_entry.insert(0, str(inferred_freq))
         mb = self._iq_path.stat().st_size / (1024 * 1024)
-        self._log(f"Selected: {self._iq_path} ({mb:.0f} MB) — sample rate set to {inferred} Hz")
+        self._log(
+            f"Selected: {self._iq_path} ({mb:.0f} MB) — "
+            f"{inferred} Hz, {inferred_freq} MHz FSK"
+        )
 
     def _settings(self) -> tuple[int, float]:
         try:
             rate = int(float(self.rate_entry.get().strip().replace(",", "")))
         except ValueError as exc:
-            raise ValueError("Sample rate must be a number (e.g. 1000000).") from exc
+            raise ValueError("Sample rate must be a number (e.g. 1024000).") from exc
         try:
             freq = float(self.freq_entry.get().strip().replace(",", "."))
         except ValueError as exc:
-            raise ValueError("Frequency must be MHz (e.g. 433.92).") from exc
+            raise ValueError("Frequency must be MHz (e.g. 432.92).") from exc
         if rate < 250_000:
             raise ValueError("Sample rate should be at least 250000 Hz for these captures.")
         return rate, freq
@@ -540,7 +581,7 @@ class IqUrhView(ctk.CTkFrame):
             messagebox.showinfo(
                 APP_NAME,
                 "Universal Radio Hacker should open with the signal.\n\n"
-                "In URH: confirm sample rate / modulation, then demodulate on the Interpretation tab.\n"
+                "In URH: set sample rate 1024000 and center 432.92 MHz (FSK), then demodulate.\n"
                 "Use Decode → Excel here for suite-format TPMS export.",
                 parent=self._toplevel(),
             )
@@ -664,7 +705,7 @@ class IqUrhView(ctk.CTkFrame):
                 readings,
                 source,
                 Path(dest),
-                sample_rate=1_000_000,
+                sample_rate=1_024_000,
                 freq_mhz=DEFAULT_FREQ_MHZ,
                 urh_path=None,
             )

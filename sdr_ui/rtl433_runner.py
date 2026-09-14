@@ -9,7 +9,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from config import FREQUENCY_PRESETS, RTL433_DISABLED_PROTOCOL_IDS, get_rtl433_dir, get_rtl433_exe
+from config import (
+  FREQUENCY_PRESETS,
+  compact_rtl433_command,
+  format_rtl433_decoder,
+  get_rtl433_dir,
+  get_rtl433_exe,
+  rtl433_decoder_enablement,
+  rtl433_full_decoder_flags,
+)
 
 try:
   from tpms_bench.paths import results_dir
@@ -41,6 +49,9 @@ class TelemetryReading:
   frequency_mhz: Optional[float] = None
   # Seconds from first packet for this ID until OK (or until latest packet if still NOK).
   acquire_seconds: Optional[float] = None
+  # rtl_433 decoder that produced this packet, e.g. "[60] Schrader".
+  decoder: str = ""
+  protocol_id: Optional[int] = None
 
   @property
   def psi(self) -> Optional[float]:
@@ -122,7 +133,21 @@ class TelemetryReading:
       timestamp=newer.timestamp,
       frequency_mhz=newer.frequency_mhz if newer.frequency_mhz is not None else self.frequency_mhz,
       acquire_seconds=newer.acquire_seconds if newer.acquire_seconds is not None else self.acquire_seconds,
+      decoder=newer.decoder or self.decoder,
+      protocol_id=newer.protocol_id if newer.protocol_id is not None else self.protocol_id,
     )
+
+  @property
+  def display_decoder(self) -> str:
+    label = (self.decoder or "").strip()
+    if label and label not in {"—", "-"}:
+      # Upgrade bare model labels to full library names when possible.
+      if self.protocol_id is not None or "[" not in label:
+        enriched = format_rtl433_decoder(self.protocol_id, self.model or label)
+        if enriched and enriched != "—":
+          return enriched
+      return label
+    return format_rtl433_decoder(self.protocol_id, self.model)
 
 
 def _safe_float(val: Any) -> Optional[float]:
@@ -206,6 +231,15 @@ def parse_rtl433_json(line: str) -> Optional[TelemetryReading]:
   if freq and freq > 1e6:
     freq = freq / 1e6
 
+  protocol_id: Optional[int] = None
+  proto_raw = data.get("protocol")
+  if proto_raw is not None and proto_raw != "":
+    try:
+      protocol_id = int(proto_raw)
+    except (TypeError, ValueError):
+      protocol_id = None
+  decoder = format_rtl433_decoder(protocol_id, model)
+
   return TelemetryReading(
     sensor_id=sensor_id,
     model=model,
@@ -218,6 +252,8 @@ def parse_rtl433_json(line: str) -> Optional[TelemetryReading]:
     status=status,
     raw=data,
     frequency_mhz=freq,
+    decoder=decoder,
+    protocol_id=protocol_id,
   )
 
 
@@ -256,7 +292,10 @@ class Rtl433Runner:
     exe = get_rtl433_exe()
     preset = FREQUENCY_PRESETS.get(preset_name, FREQUENCY_PRESETS["433 MHz — EU / Asia TPMS"])
 
-    cmd = [str(exe), "-d", str(device_index), "-F", "json", "-M", "time:iso", "-M", "level"]
+    cmd = [
+      str(exe), "-d", str(device_index), "-F", "json",
+      "-M", "time:iso", "-M", "level", "-M", "protocol",
+    ]
 
     if units in ("si", "customary"):
       cmd.extend(["-C", units])
@@ -285,10 +324,8 @@ class Rtl433Runner:
     # Stronger FSK detection — default 250k + plain auto often under-decodes vs Board LF.
     cmd.extend(["-Y", "autolevel", "-Y", "minmax"])
 
-    # Enable all rtl_433 25.12 disabled-by-default protocols (Confluence "full 433_rtl" intent).
-    # -G is deprecated; "-R -n -R n" adds protocol n without clearing the default set.
-    for proto_id in RTL433_DISABLED_PROTOCOL_IDS:
-      cmd.extend(["-R", f"-{proto_id}", "-R", str(proto_id)])
+    # Enable every decoder in the current rtl_433 library (queried from -R help).
+    cmd.extend(rtl433_full_decoder_flags(exe))
 
     if iq_path:
       path = Path(iq_path)
@@ -327,7 +364,8 @@ class Rtl433Runner:
     cmd = self.build_command(
       preset_name, custom_freq_mhz, gain, ppm, device_index, units, iq_path=iq_path
     )
-    self.on_log(f"Starting: {' '.join(cmd)}")
+    self.on_log(rtl433_decoder_enablement(exe))
+    self.on_log(f"Starting: {compact_rtl433_command(cmd)}")
     if iq_path:
       self.on_log(
         f"IQ recording ON @ full sample rate → {iq_path} "

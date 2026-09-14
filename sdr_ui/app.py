@@ -168,7 +168,7 @@ class SdrView(ctk.CTkFrame):
     self.tree = ttk.Treeview(tree_host, columns=columns, show="headings", height=6, style="Combined.Treeview")
     headings = {
       "num": "#",
-      "protocol": "Protocol",
+      "protocol": "rtl_433 Decoder",
       "id": "Sensor ID",
       "result": "Result",
       "pressure": "Pressure",
@@ -417,7 +417,7 @@ class SdrView(ctk.CTkFrame):
     result = "OK" if reading.qualifies_ok() else "NOK"
     return (
       index,
-      reading.model or "—",
+      reading.display_decoder,
       reading.sensor_id or "na",
       result,
       reading.display_pressure,
@@ -479,6 +479,7 @@ class SdrView(ctk.CTkFrame):
       "Unique Sensors": len(self._sensors),
       "OK sensors": self._sensor_counts()[0],
       "NOK sensors": self._sensor_counts()[1],
+      "rtl_433 Decoder column": "Protocol number + full library decoder name that decoded each packet",
       "OK/NOK rule": "Per detected sensor: ID + temperature + (pressure or battery), values merged across packets",
       "Time to reading": "Seconds from first packet for that Sensor ID until OK (or until last packet if still NOK)",
       "Session Start": self._session_start.strftime("%Y-%m-%d %H:%M:%S") if self._session_start else "—",

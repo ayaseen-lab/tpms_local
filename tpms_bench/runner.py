@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from .board import BoardSession, BoardTelemetry, generate_unique_oeid
-from .compare import compare
+from .compare import best_packet, compare
 from .excel_io import append_manual_code_row, copy_workbook, create_blank_database, load_output, parse_code, write_row
 from .paths import app_root, results_dir
 from .results_db import clear_all, completed_rows, connect, counts, upsert
@@ -447,6 +447,28 @@ def reset_session_db() -> None:
     db.close()
 
 
+def _decoder_from_sdr(sdr: SdrCaptureResult | None, sensor_id: str | None) -> str:
+    if sdr is None or not sdr.packets:
+        return "na"
+    packet = best_packet(sdr, sensor_id)
+    if packet is None:
+        return "na"
+    label = (packet.protocol or "").strip()
+    if not label:
+        return "na"
+    # Enrich short labels like "[123] Jansite" using the rtl_433 library catalog.
+    try:
+        from config import format_rtl433_decoder
+        import re
+
+        match = re.match(r"\[(\d+)\]\s*(.*)", label)
+        if match:
+            return format_rtl433_decoder(int(match.group(1)), match.group(2) or None)
+        return format_rtl433_decoder(None, label)
+    except Exception:
+        return label
+
+
 def _blank_result(performance: str, reason: str) -> dict:
     return {
         "Board performance": performance,
@@ -455,6 +477,7 @@ def _blank_result(performance: str, reason: str) -> dict:
         "Baterry voltage": "na",
         "SDR compare": "na",
         "SDR reason": "na",
+        "rtl_433 Decoder": "na",
         "IQ file": "na",
         "Sensor ID": "na",
         "Frequency": "na",
@@ -474,9 +497,11 @@ def _telemetry_values(
     ok = tel.qualifies_ok()
     if skip_sdr or sdr is None:
         sdr_compare, sdr_reason, iq_file = "na", "SDR skipped", "na"
+        decoder = "na"
     else:
         sdr_compare, sdr_reason = compare(tel, sdr)
         iq_file = na(sdr.iq_path)
+        decoder = _decoder_from_sdr(sdr, tel.sensor_id)
         if sdr.iq_path and (not sdr.packets) and sdr.error:
             # Keep the IQ path visible in the SDR reason for offline replay.
             if sdr.iq_path not in (sdr_reason or ""):
@@ -489,6 +514,7 @@ def _telemetry_values(
         "Baterry voltage": "na" if tel.battery_voltage_v is None else f"{tel.battery_voltage_v:.3f}",
         "SDR compare": sdr_compare,
         "SDR reason": sdr_reason,
+        "rtl_433 Decoder": decoder,
         "IQ file": iq_file,
         "Sensor ID": na(tel.sensor_id),
         "Frequency": na(tel.frequency_mhz),
@@ -508,6 +534,7 @@ def _commit(ws, cols, excel_row, values, record, db, wb) -> None:
             "battery_voltage": values["Baterry voltage"],
             "sdr_compare": values["SDR compare"],
             "sdr_reason": values["SDR reason"],
+            "rtl433_decoder": values.get("rtl_433 Decoder", "na"),
             "iq_file": values["IQ file"],
             "sensor_id": values["Sensor ID"],
             "frequency": values["Frequency"],

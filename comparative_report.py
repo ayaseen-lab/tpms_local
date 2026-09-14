@@ -60,6 +60,7 @@ COMPARISON_HEADERS = [
     "TPMS Board reason",
     "SDR result",
     "SDR reason",
+    "rtl_433 Decoder",
     "Board time (s)",
     "SDR time (s)",
     "Comparison",
@@ -77,6 +78,7 @@ class CompareRow:
     verdict: str = ""
     excel_row: int = 0
     vehicle: str = ""
+    sdr_decoder: str = ""
     board_time_s: float | None = None
     sdr_time_s: float | None = None
 
@@ -155,13 +157,40 @@ def _sdr_side(snapshot: Any) -> tuple[str, str]:
 
 
 def _sdr_protocol(snapshot: Any) -> str:
-    """SDR UI stores the protocol name in TelemetryReading.model (Protocol column)."""
+    """Full rtl_433 library decoder label for this SDR reading."""
+    if hasattr(snapshot, "display_decoder"):
+        label = str(getattr(snapshot, "display_decoder", "") or "").strip()
+        if label and label not in {"—", "-"}:
+            return label
+    if hasattr(snapshot, "decoder"):
+        label = str(getattr(snapshot, "decoder", "") or "").strip()
+        if label and label not in {"—", "-"}:
+            return label
     if hasattr(snapshot, "model"):
-        return str(getattr(snapshot, "model", None) or "").strip()
+        model = str(getattr(snapshot, "model", None) or "").strip()
+        protocol_id = getattr(snapshot, "protocol_id", None)
+        try:
+            from config import format_rtl433_decoder
+
+            return format_rtl433_decoder(protocol_id, model)
+        except Exception:
+            return model
     if isinstance(snapshot, dict):
-        return str(
-            snapshot.get("model") or snapshot.get("protocol") or ""
-        ).strip()
+        for key in ("decoder", "display_decoder", "rtl_433_decoder"):
+            label = str(snapshot.get(key) or "").strip()
+            if label and label not in {"—", "-"}:
+                return label
+        model = str(snapshot.get("model") or snapshot.get("protocol") or "").strip()
+        protocol_id = snapshot.get("protocol_id")
+        try:
+            from config import format_rtl433_decoder
+
+            return format_rtl433_decoder(
+                int(protocol_id) if protocol_id not in (None, "") else None,
+                model,
+            )
+        except Exception:
+            return model
     return ""
 
 
@@ -222,10 +251,11 @@ def build_comparison(
         sdr_res = ""
         sdr_reason = ""
         sdr_time = None
+        sdr_decoder = ""
         if key:
             board_seen_keys.add(key)
             if key in sdr_map:
-                display_sdr, sdr_res, sdr_reason, _protocol, sdr_time = sdr_map[key]
+                display_sdr, sdr_res, sdr_reason, sdr_decoder, sdr_time = sdr_map[key]
                 display = display or display_sdr
 
         if key and key in sdr_map:
@@ -247,6 +277,7 @@ def build_comparison(
                 verdict=verdict,
                 excel_row=excel_row,
                 vehicle=vehicle,
+                sdr_decoder=sdr_decoder or "—",
                 board_time_s=board_time,
                 sdr_time_s=sdr_time,
             )
@@ -270,6 +301,7 @@ def build_comparison(
                 verdict="SDR_ONLY",
                 excel_row=0,
                 vehicle=protocol or "—",
+                sdr_decoder=protocol or "—",
                 board_time_s=None,
                 sdr_time_s=sdr_time,
             )
@@ -319,6 +351,7 @@ def export_comparative_excel(path: str | Path, comparison: ComparisonResult) -> 
             row.board_reason,
             row.sdr_result or "—",
             row.sdr_reason,
+            row.sdr_decoder or "—",
             _format_seconds(row.board_time_s),
             _format_seconds(row.sdr_time_s),
             row.verdict,
@@ -330,10 +363,13 @@ def export_comparative_excel(path: str | Path, comparison: ComparisonResult) -> 
                 cmp_ws.cell(row=cmp_ws.max_row, column=col).fill = fill
     _set_widths(
         cmp_ws,
-        {1: 10, 2: 22, 3: 16, 4: 14, 5: 14, 6: 22, 7: 12, 8: 22, 9: 12, 10: 12, 11: 12},
+        {
+            1: 10, 2: 22, 3: 16, 4: 14, 5: 14, 6: 22, 7: 12, 8: 22,
+            9: 34, 10: 12, 11: 12, 12: 12,
+        },
     )
     cmp_ws.freeze_panes = "A2"
-    cmp_ws.auto_filter.ref = f"A1:K{max(cmp_ws.max_row, 1)}"
+    cmp_ws.auto_filter.ref = f"A1:L{max(cmp_ws.max_row, 1)}"
 
     info = wb.create_sheet("Report Info")
     info["A1"] = REPORT_KIND
@@ -545,9 +581,10 @@ def export_comparative_pdf(path: str | Path, comparison: ComparisonResult) -> Pa
                 cell(row.sensor_id, 16),
                 cell(row.seen_by, 14),
                 cell(row.board_result, 8),
-                cell(row.board_reason, 28),
+                cell(row.board_reason, 24),
                 cell(row.sdr_result, 8),
-                cell(row.sdr_reason, 28),
+                cell(row.sdr_reason, 24),
+                cell(row.sdr_decoder or "—", 34),
                 cell(_format_seconds(row.board_time_s), 10),
                 cell(_format_seconds(row.sdr_time_s), 10),
                 cell(row.verdict, 12),
@@ -555,17 +592,18 @@ def export_comparative_pdf(path: str | Path, comparison: ComparisonResult) -> Pa
         )
 
     col_widths = [
-        12 * mm,
-        26 * mm,
-        20 * mm,
+        11 * mm,
+        24 * mm,
         18 * mm,
         16 * mm,
-        28 * mm,
         14 * mm,
-        28 * mm,
+        24 * mm,
+        12 * mm,
+        24 * mm,
+        34 * mm,
+        14 * mm,
+        14 * mm,
         16 * mm,
-        16 * mm,
-        18 * mm,
     ]
     chunk_size = 16
     header_style = [
@@ -583,7 +621,7 @@ def export_comparative_pdf(path: str | Path, comparison: ComparisonResult) -> Pa
         ("RIGHTPADDING", (0, 0), (-1, -1), 2),
     ]
     if not body_rows:
-        empty = Table([header, [cell("—")] * 9], colWidths=col_widths, repeatRows=1)
+        empty = Table([header, [cell("—")] * len(COMPARISON_HEADERS)], colWidths=col_widths, repeatRows=1)
         empty.setStyle(TableStyle(header_style))
         story.append(empty)
     else:

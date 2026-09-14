@@ -20,11 +20,169 @@ RTL_433_DOWNLOAD_URL = (
 RTL_433_EXE_CANDIDATES = ("rtl_433-rtlsdr.exe", "rtl_433.exe")
 
 # Protocols disabled by default in rtl_433 25.12 (marked * in -R help).
-# Enable alongside defaults via "-R -<id> -R <id>" (replaces deprecated -G).
+# Fallback only — live IDs are read from the bundled binary via ``rtl_433 -R help``.
 RTL433_DISABLED_PROTOCOL_IDS: tuple[int, ...] = (
   6, 7, 13, 14, 24, 37, 48, 61, 62, 64, 72, 86, 101, 106, 107, 117, 118, 123,
   129, 150, 162, 169, 198, 200, 216, 233, 242, 245, 248, 260, 270,
 )
+
+# Cache: resolved exe path → (catalog, disabled ids). Empty key = last successful parse.
+_protocol_info_cache: dict[str, tuple[dict[int, str], tuple[int, ...]]] = {}
+
+
+def _run_rtl433_help(exe: Path | None, topic: str) -> str:
+  import subprocess
+
+  binary = exe if exe is not None else get_rtl433_exe()
+  if not binary or not Path(binary).is_file():
+    return ""
+  try:
+    result = subprocess.run(
+      [str(binary), topic, "help"],
+      capture_output=True,
+      text=True,
+      encoding="utf-8",
+      errors="replace",
+      timeout=20,
+      cwd=str(Path(binary).parent),
+    )
+  except Exception:
+    return ""
+  return (result.stdout or "") + "\n" + (result.stderr or "")
+
+
+def _rtl433_cache_key(exe: Path | None) -> str:
+  binary = Path(exe) if exe is not None else get_rtl433_exe()
+  try:
+    path = Path(binary)
+    if path.is_file():
+      return str(path.resolve())
+  except Exception:
+    pass
+  return ""
+
+
+def _rtl433_protocol_info(exe: Path | None = None) -> tuple[dict[int, str], tuple[int, ...]]:
+  """Parse the current library's ``-R help`` once: id → name, plus disabled-by-default ids."""
+  import re
+
+  key = _rtl433_cache_key(exe)
+  cached = _protocol_info_cache.get(key) if key else None
+  if cached is not None:
+    return cached
+
+  text = _run_rtl433_help(exe, "-R")
+  catalog: dict[int, str] = {}
+  disabled: list[int] = []
+  if text:
+    for match in re.finditer(r"\[(\d+)\](\*)?\s+(.+)", text):
+      name = match.group(3).strip()
+      if name.startswith("=") or "Disabled by default" in name:
+        continue
+      proto_id = int(match.group(1))
+      catalog[proto_id] = name
+      if match.group(2):
+        disabled.append(proto_id)
+
+  disabled_ids = tuple(disabled) if disabled else RTL433_DISABLED_PROTOCOL_IDS
+  info = (catalog, disabled_ids)
+  if key and catalog:
+    _protocol_info_cache[key] = info
+  return info
+
+
+def discover_disabled_protocol_ids(exe: Path | None = None) -> tuple[int, ...]:
+  """Protocol ids marked ``*`` (disabled by default) in the current rtl_433 library."""
+  _catalog, disabled = _rtl433_protocol_info(exe)
+  return disabled
+
+
+def rtl433_protocol_catalog(exe: Path | None = None) -> dict[int, str]:
+  """Map protocol ID → full library decoder name from ``rtl_433 -R help``."""
+  catalog, _disabled = _rtl433_protocol_info(exe)
+  return catalog
+
+
+def format_rtl433_decoder(
+  protocol_id: int | None = None,
+  model: str | None = None,
+  *,
+  exe: Path | None = None,
+) -> str:
+  """Human label for the rtl_433 library decoder that produced a packet."""
+  catalog = rtl433_protocol_catalog(exe)
+  model_text = (model or "").strip()
+  if protocol_id is not None:
+    name = catalog.get(int(protocol_id))
+    if name:
+      return f"[{protocol_id}] {name}"
+    if model_text:
+      return f"[{protocol_id}] {model_text}"
+    return f"[{protocol_id}]"
+  if model_text:
+    model_l = model_text.lower().replace("_", " ").replace("-", " ")
+    for pid, name in catalog.items():
+      name_l = name.lower().replace("_", " ").replace("-", " ")
+      if name_l == model_l or name_l.startswith(model_l + " ") or model_l.startswith(name_l + " "):
+        return f"[{pid}] {name}"
+    return model_text
+  return "—"
+
+
+def rtl433_full_decoder_flags(exe: Path | None = None) -> list[str]:
+  """CLI flags that enable every decoder in the current rtl_433 library.
+
+  Listing every protocol id (not only the disabled-by-default ones) turns on
+  the full catalog. The first ``-R`` replaces rtl_433's default set, so every
+  id from ``-R help`` must be included.
+  """
+  catalog, disabled = _rtl433_protocol_info(exe)
+  if catalog:
+    flags: list[str] = []
+    for proto_id in sorted(catalog):
+      flags.extend(["-R", str(proto_id)])
+    return flags
+  # Binary could not be queried — keep defaults and add known disabled ids.
+  flags = []
+  for proto_id in disabled:
+    flags.extend(["-R", f"-{proto_id}", "-R", str(proto_id)])
+  return flags
+
+
+def rtl433_decoder_enablement(exe: Path | None = None) -> str:
+  """Short log line: how many current-library decoders are being enabled."""
+  catalog, disabled = _rtl433_protocol_info(exe)
+  n_disabled = len(disabled)
+  if catalog:
+    return (
+      f"rtl_433 {RTL_433_VERSION} library: enabling all {len(catalog)} decoders "
+      f"({n_disabled} were disabled by default)"
+    )
+  return (
+    f"rtl_433 {RTL_433_VERSION} library: catalog unavailable — enabling "
+    f"{n_disabled} known disabled-by-default decoders"
+  )
+
+
+def compact_rtl433_command(cmd: list[str]) -> str:
+  """Join a rtl_433 command, collapsing ``-R <id>`` runs so logs stay readable."""
+  parts: list[str] = []
+  r_count = 0
+  i = 0
+  while i < len(cmd):
+    if cmd[i] == "-R" and i + 1 < len(cmd):
+      r_count += 1
+      i += 2
+      continue
+    if r_count:
+      parts.append(f"-R<{r_count} decoders>")
+      r_count = 0
+    parts.append(cmd[i])
+    i += 1
+  if r_count:
+    parts.append(f"-R<{r_count} decoders>")
+  return " ".join(parts)
+
 
 # Zadig for RTL-SDR driver setup (bundled in executable)
 ZADIG_VERSION = "2.9"

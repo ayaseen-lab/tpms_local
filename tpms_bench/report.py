@@ -226,7 +226,10 @@ def build_pdf(dest: Path | None = None) -> Path:
         )
     )
 
-    veh_header = ["#", "Vehicle", "OE", "Supplier", "CODE A", "CODE B", "CODE C", "ID", "MHz", "°C", "P", "V", "Board", "Time"]
+    veh_header = [
+        "#", "Vehicle", "OE", "Supplier", "CODE A", "CODE B", "CODE C",
+        "ID", "rtl_433 Decoder", "MHz", "°C", "P", "V", "Board", "Time",
+    ]
     veh_data = [veh_header]
     for row in success:
         dur_raw = row["duration_s"] if "duration_s" in row.keys() else None
@@ -241,6 +244,13 @@ def build_pdf(dest: Path | None = None) -> Path:
         else:
             mins, secs = divmod(int(round(dur_s)), 60)
             dur_txt = f"{mins}m {secs:02d}s"
+        decoder = "—"
+        try:
+            raw_dec = row["rtl433_decoder"] if "rtl433_decoder" in row.keys() else None
+            if raw_dec not in (None, "", "na"):
+                decoder = str(raw_dec)
+        except (KeyError, IndexError, TypeError):
+            decoder = "—"
         veh_data.append(
             [
                 str(row["excel_row"]),
@@ -251,6 +261,7 @@ def build_pdf(dest: Path | None = None) -> Path:
                 str(row["code_b"]),
                 str(row["code_c"]),
                 _hex_id(row["sensor_id"]),
+                Paragraph(decoder, styles["tiny"]),
                 str(row["frequency"] if row["frequency"] not in (None, "na") else "—"),
                 str(row["temperature"] if row["temperature"] not in (None, "na") else "—"),
                 str(row["pressure"] if row["pressure"] not in (None, "na") else "—"),
@@ -260,20 +271,23 @@ def build_pdf(dest: Path | None = None) -> Path:
             ]
         )
     if len(veh_data) == 1:
-        veh_data.append(["—"] * 14)
+        veh_data.append(["—"] * 15)
 
     # Portrait table may be tight — use slightly smaller columns
     veh_table = Table(
         veh_data,
-        colWidths=[9 * mm, 28 * mm, 18 * mm, 16 * mm, 18 * mm, 18 * mm, 18 * mm, 16 * mm, 9 * mm, 9 * mm, 7 * mm, 10 * mm, 12 * mm, 12 * mm],
+        colWidths=[
+            8 * mm, 22 * mm, 14 * mm, 12 * mm, 14 * mm, 14 * mm, 14 * mm,
+            14 * mm, 28 * mm, 8 * mm, 8 * mm, 7 * mm, 9 * mm, 10 * mm, 10 * mm,
+        ],
         repeatRows=1,
     )
     veh_cmds = [
         ("BACKGROUND", (0, 0), (-1, 0), NAVY),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 6.5),
-        ("FONTSIZE", (0, 1), (-1, -1), 6.5),
+        ("FONTSIZE", (0, 0), (-1, 0), 6),
+        ("FONTSIZE", (0, 1), (-1, -1), 6),
         ("FONTNAME", (4, 1), (7, -1), "Courier"),
         ("GRID", (0, 0), (-1, -1), 0.2, LINE),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -284,8 +298,8 @@ def build_pdf(dest: Path | None = None) -> Path:
         bg = OK_BG if row["board_performance"] == "OK" else colors.HexColor("#B2F5EA")
         veh_cmds.append(("BACKGROUND", (0, i), (-1, i), bg))
         if row["board_performance"] == "OK":
-            veh_cmds.append(("FONTNAME", (12, i), (12, i), "Helvetica-Bold"))
-            veh_cmds.append(("TEXTCOLOR", (12, i), (12, i), GREEN))
+            veh_cmds.append(("FONTNAME", (13, i), (13, i), "Helvetica-Bold"))
+            veh_cmds.append(("TEXTCOLOR", (13, i), (13, i), GREEN))
     veh_table.setStyle(TableStyle(veh_cmds))
     story.append(KeepTogether([veh_table]))
 

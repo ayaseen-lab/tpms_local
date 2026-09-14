@@ -17,6 +17,7 @@ RESULT_COLUMNS = [
     "Baterry voltage",
     "SDR compare",
     "SDR reason",
+    "rtl_433 Decoder",
     "IQ file",
     "Sensor ID",
     "Frequency",
