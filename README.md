@@ -61,7 +61,7 @@ A manual triple is tested in addition to Excel rows. If no Excel file is selecte
 powershell -ExecutionPolicy Bypass -File .\build_installer.ps1
 ```
 
-That script downloads official **rtl_433** (MSVC x64 25.12) and **Zadig 2.9**, builds a folder-based (not one-file) app, then compiles `dist_installer\TPMS_Suite_Setup_1.2.0.exe`.
+That script downloads official **rtl_433** (MSVC x64 25.12) and **Zadig 2.9**, builds a folder-based (not one-file) app, then compiles `dist_installer\TPMS_Suite_Setup_1.3.0.exe`.
 
 SEGGER J-Link is **not** bundled (separate vendor license). Install J-Link on the PC if you need SRAM capture on the board tab.
 

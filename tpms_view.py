@@ -53,7 +53,7 @@ from themes import (
 from tpms_bench.excel_io import parse_code, stamp_board_report_info
 from tpms_bench.report import build_pdf
 from tpms_bench.runner import OUT_XLSX, BenchRunner, ManualCode, ProgressEvent, reset_session_db
-from tpms_bench.uart import default_port, find_serial_ports
+from tpms_bench.uart import default_port, find_serial_ports, port_device
 from widgets import StatCard
 
 CODE_A_BG = "#E0F2FE"
@@ -291,7 +291,7 @@ class TpmsView(ctk.CTkFrame):
         )
         self.port_var = ctk.StringVar(value=default_port())
         self.port_combo = ctk.CTkComboBox(
-            port_group, values=find_serial_ports() or [default_port()], width=130, height=30, **combo_colors()
+            port_group, values=find_serial_ports() or [default_port()], width=260, height=30, **combo_colors()
         )
         self.port_combo.set(self.port_var.get())
         self.port_combo.pack(side="left", padx=(0, 4))
@@ -662,7 +662,7 @@ class TpmsView(ctk.CTkFrame):
         self.stop_btn.configure(state="normal")
         self._set_state_badge("RUNNING")
 
-        port = self.port_combo.get().strip() or default_port()
+        port = port_device(self.port_combo.get()) or port_device(default_port())
         self.runner = BenchRunner(
             port=port,
             source_xlsx=self.source_xlsx,

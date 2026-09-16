@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "TPMS Suite"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_VENDOR = "Xynovix"
 
 # Bundled rtl_433 MSVC build (included in executable)

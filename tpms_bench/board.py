@@ -291,16 +291,18 @@ class BoardSession:
         return self.transport_mode
 
     def verify_hardware(self) -> tuple[bool, str]:
+        """Require USB-TTL TX open and at least one RX path (USB-TTL RX or J-Link).
+
+        J-Link is optional. A missing/unplugged programmer must not fail the check
+        when Query Version already returns over USB-TTL.
+        """
         if self.should_stop():
             return False, "stopped"
         issues: list[str] = []
         if not self.serial.is_open:
             issues.append(f"USB-TTL port {self.serial.port} not open")
         else:
-            try:
-                self.ttl_ok = True
-            except Exception as exc:
-                issues.append(f"USB-TTL: {exc}")
+            self.ttl_ok = True
 
         if self.should_stop():
             return False, "stopped"
@@ -310,17 +312,28 @@ class BoardSession:
         if dump.ok:
             self._signal("jlink", f"SRAM {len(dump.blob)} bytes")
         else:
-            issues.append(dump.message)
+            # Soft warning only — do not fail the bench when UART RX works.
+            self._signal("jlink", dump.message)
 
         if self.should_stop():
             return False, "stopped"
         self.uart_rx_active = self._probe_uart_rx()
         if not self.uart_rx_active and not self.jlink_ok:
-            issues.append("No USB-TTL RX and no board reply path")
+            detail = dump.message if dump.message else "no board reply path"
+            issues.append(
+                "No USB-TTL RX reply and no J-Link RX path "
+                f"({detail}). Use the CH340/USB-TTL COM port (not J-Link CDC UART), "
+                "confirm 115200 baud cable to the board, or connect the SEGGER programmer."
+            )
 
         if issues:
             return False, "; ".join(issues)
-        rx = "USB-TTL RX" if self.uart_rx_active else "Board RX"
+        if self.uart_rx_active and self.jlink_ok:
+            rx = "USB-TTL RX + J-Link"
+        elif self.uart_rx_active:
+            rx = "USB-TTL RX"
+        else:
+            rx = "J-Link RX"
         return True, f"TX {self.serial.port} · RX {rx}"
 
     def send_codec(self, codec: CommandCodec) -> None:

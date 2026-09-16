@@ -1,5 +1,5 @@
 #define MyAppName "TPMS Suite"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.3.0"
 #define MyAppPublisher "Xynovix"
 #define MyAppExeName "TPMS_Suite.exe"
 
@@ -25,7 +25,7 @@ SetupIconFile=tpms_suite.ico
 InfoBeforeFile=whats_new.txt
 VersionInfoVersion={#MyAppVersion}
 VersionInfoCompany={#MyAppPublisher}
-VersionInfoDescription=TPMS Suite Setup — comparative Board vs SDR reporting
+VersionInfoDescription=TPMS Suite Setup — full rtl_433 catalog, IQ/URH, comparative reports
 VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
 VersionInfoCopyright=Copyright (C) {#MyAppPublisher}
