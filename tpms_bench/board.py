@@ -10,20 +10,22 @@ from typing import Callable
 
 from hamaton.codec import CommandCodec
 from hamaton.commands.cancel import CancelCodec
-from hamaton.commands.program_sensor import ProgramOneSensorCodec
 from hamaton.commands.query_version import QueryVersionCodec
-from hamaton.commands.receive_rf import ReceiveRfCodec
-from hamaton.commands.trigger import TriggerCodec
 from hamaton.exceptions import CodecError, FrameError, UnexpectedResponseError
 from hamaton.frame import HamatonFrame
 from hamaton.models import CommandResult, ProgramResult, SensorReading
 from hamaton.parser import HamatonStreamParser
-from hamaton.sensor_reading import parse_sensor_reading
 
 from . import jlink_ram
+from .program_one import ProgramSensorCodec as ProgramOneSensorCodec
 from .program_search import ProgramSearchCodec, SearchProgress
 from .query_sensor import QuerySensorCodec, QuerySensorReading
 from .rtl433 import SdrCaptureResult, finish_capture, start_capture
+from .sensor_reading import (
+    SensorReceiveRfCodec as ReceiveRfCodec,
+    SensorTriggerCodec as TriggerCodec,
+    parse_sensor_reading,
+)
 
 UART_POLL_S = 0.04
 JLINK_POLL_S = 0.28
@@ -34,7 +36,8 @@ QUERY_RETRIES = 1
 TX_GAP_S = 0.04
 # Settle after Cancel before Program — keep short for high row throughput.
 POST_CANCEL_S = 0.06
-PROGRAM_TIMEOUT_S = 3.2
+# The board answers Program in ~2-6 s, so keep the window above the slow end.
+PROGRAM_TIMEOUT_S = 7.0
 PROGRAM_RESEND_S = 1.4
 CANCEL_WAIT_S = 0.12
 LF_SEARCH_TIMEOUT_S = 2.2
@@ -819,7 +822,10 @@ class BoardSession:
             tel.sensor_id = returned_id
             if program_trusted:
                 tel.programmed_id = returned_id
-            if requested_id and returned_id != requested_id:
+            # A 28-bit protocol cannot hold a full 32-bit OEID, so the board
+            # choosing its own ID there is expected, not a fault.
+            id_bits = getattr(program.value, "id_bit_length", 0x20)
+            if requested_id and returned_id != requested_id and id_bits >= 0x20:
                 tel.reasons.append(
                     f"program used ID {returned_id} (requested OEID {requested_id})"
                 )

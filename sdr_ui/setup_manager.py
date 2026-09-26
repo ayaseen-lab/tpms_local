@@ -36,7 +36,7 @@ class SetupManager:
     self.on_progress(message, percent)
 
   def is_rtl433_installed(self) -> bool:
-    return resolve_rtl433_exe_in(get_rtl433_dir()) is not None
+    return get_rtl433_exe().is_file()
 
   def is_rtl433_bundled(self) -> bool:
     return resolve_rtl433_exe_in(get_bundled_rtl433_dir()) is not None
@@ -55,7 +55,17 @@ class SetupManager:
     return False
 
   def download_rtl433(self) -> bool:
-    """Fallback only when bundled copy is missing (e.g. dev build without vendor/)."""
+    """Fallback only when bundled copy is missing (Windows). On macOS use Homebrew."""
+    import sys
+
+    if not sys.platform.startswith("win"):
+      exe = get_rtl433_exe()
+      if exe.is_file():
+        self._report(f"Using system rtl_433: {exe}", 0.9)
+        return True
+      self._report("Install rtl_433 with Homebrew: brew install rtl_433", 0.0)
+      return False
+
     target_dir = get_rtl433_dir()
     zip_path = get_app_data_dir() / RTL_433_ZIP_NAME
 
@@ -177,6 +187,13 @@ class SetupManager:
       return False, str(exc)
 
   def run_full_setup(self) -> bool:
+    import sys
+
+    if not sys.platform.startswith("win") and get_rtl433_exe().is_file():
+      self._report(f"Using system rtl_433: {get_rtl433_exe()}", 0.9)
+      self._report("Setup complete.", 1.0)
+      return True
+
     if self.is_rtl433_bundled():
       ok = self.deploy_bundled_rtl433()
     elif not self.is_rtl433_installed():
@@ -185,7 +202,7 @@ class SetupManager:
       ok = True
       self._report("rtl_433 already installed.", 0.9)
 
-    if self.is_zadig_bundled():
+    if sys.platform.startswith("win") and self.is_zadig_bundled():
       self.deploy_bundled_zadig()
       self._report("Zadig driver tool ready (bundled).", 0.95)
 

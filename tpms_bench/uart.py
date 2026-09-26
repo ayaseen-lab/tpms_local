@@ -30,12 +30,41 @@ def _score_port(port) -> int:
         score += 10
     if any(h in text for h in _AVOID_HINTS):
         score -= 100
+    # macOS: prefer call-out cu.* and real usbserial (CH340) over J-Link usbmodem.
+    if sys.platform == "darwin":
+        if port.device.startswith("/dev/cu.usbserial"):
+            score += 50
+        elif port.device.startswith("/dev/cu."):
+            score += 20
+        elif port.device.startswith("/dev/tty."):
+            score -= 20
+        if "USBMODEM" in port.device.upper():
+            score -= 40
     return score
 
 
 def list_serial_port_choices() -> list[tuple[str, str]]:
-    """Return (device, label) pairs, preferred USB-TTL first."""
+    """Return (device, label) pairs, preferred USB-TTL first (never Bluetooth)."""
     ports = list(serial.tools.list_ports.comports())
+    if sys.platform == "darwin":
+        filtered = [
+            p
+            for p in ports
+            if not any(
+                p.device.startswith(skip)
+                for skip in (
+                    "/dev/cu.Bluetooth",
+                    "/dev/cu.Apple",
+                    "/dev/cu.debug",
+                    "/dev/tty.Bluetooth",
+                )
+            )
+        ]
+        if filtered:
+            ports = filtered
+        cu = [p for p in ports if p.device.startswith("/dev/cu.")]
+        if cu:
+            ports = cu
     ports.sort(key=_score_port, reverse=True)
     return [(p.device, _port_label(p)) for p in ports]
 

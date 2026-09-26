@@ -68,6 +68,12 @@ LED_IDLE = "#64748B"
 LED_TTL_ON = "#34D399"
 LED_JLINK_ON = "#FBBF24"
 
+# Hamaton database preselected on startup when it is present.
+DEFAULT_HAMATON_XLSX = Path(
+    "/Users/mr.macbook/Downloads/hamaton-sdk-python-fix-uart-transport-timing"
+    "/Hamaton_database_20260126_1305.xlsx"
+)
+
 
 class TpmsView(ctk.CTkFrame):
     """Board validation UI. Switching away from this frame does not stop the bench."""
@@ -96,6 +102,7 @@ class TpmsView(ctk.CTkFrame):
         self._build_ui()
         self._reset_display()
         restored = self._restore_session_from_db()
+        self._autoload_default_excel()
         self.after(150, self._drain)
         self.after(80, self._animate_badge)
         self._notify_status()
@@ -750,9 +757,18 @@ class TpmsView(ctk.CTkFrame):
         )
         if not path:
             return
-        self.source_xlsx = Path(path)
+        self._load_excel(Path(path))
+
+    def _load_excel(self, path: Path) -> None:
+        self.source_xlsx = path
         self.file_label.configure(text=self.source_xlsx.name, text_color=COLOR_GREEN)
         self.status_var.set(f"Database loaded: {self.source_xlsx.name} — add custom codes if needed, then Start Test")
+
+    def _autoload_default_excel(self) -> None:
+        """Preselect the Hamaton database so a run can start without browsing."""
+        if self.source_xlsx or not DEFAULT_HAMATON_XLSX.is_file():
+            return
+        self._load_excel(DEFAULT_HAMATON_XLSX)
 
     def reset_session(self) -> None:
         if self.worker and self.worker.is_alive():

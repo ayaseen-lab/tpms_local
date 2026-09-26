@@ -227,6 +227,17 @@ class CombinedApp(ctk.CTk):
             )
             return
 
+        from tpms_bench.hardware import check_hardware_trio
+
+        trio = check_hardware_trio()
+        if not trio.usb_ttl.ok:
+            messagebox.showerror(
+                "Start Both — hardware",
+                "USB-TTL (CH340) required for Board TX.\n\n" + "\n".join(trio.summary_lines()),
+                parent=self,
+            )
+            return
+
         # Validate / start Board first (needs Excel or codes); skip Board IQ capture.
         if not self.board_view.is_running():
             started = self.board_view.start_test(skip_sdr=True)
@@ -236,10 +247,13 @@ class CombinedApp(ctk.CTk):
         if not self.sdr_view.is_running():
             self.sdr_view.start_listen()
 
+        paths = "\n".join(f"• {line}" for line in trio.summary_lines())
         messagebox.showinfo(
             "Start Both",
             "Started TPMS Board and SDR Receiver together.\n\n"
+            f"{paths}\n\n"
             "• Board: Hamaton bench (live IQ capture off — dongle free for SDR tab)\n"
+            "• Between rows: RF stop + UART flush so row 2+ can program\n"
             "• SDR: listening for RF — use Compare Excel/PDF when both have IDs\n\n"
             "Keep the SDR Receiver tab band set to your sensor frequency.",
             parent=self,

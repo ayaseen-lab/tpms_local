@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -239,6 +240,27 @@ def capture_command(
     return cmd
 
 
+def free_dongle() -> None:
+    """Kill an rtl_433 left behind by a previous run so the dongle is claimable."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "rtl_433.exe"],
+                capture_output=True,
+                timeout=8,
+                check=False,
+            )
+        else:
+            subprocess.run(
+                ["pkill", "-f", "rtl_433"],
+                capture_output=True,
+                timeout=8,
+                check=False,
+            )
+    except Exception:
+        pass
+
+
 def start_capture(
     iq_path: Path,
     frequency_hz: int = 433920000,
@@ -247,6 +269,7 @@ def start_capture(
     cmd = capture_command(iq_path, frequency_hz, duration_s, sample_rate=1_000_000)
     if not cmd:
         return SdrCaptureResult(False, [], None, "rtl_433 not installed")
+    free_dongle()
     try:
         return subprocess.Popen(
             cmd,

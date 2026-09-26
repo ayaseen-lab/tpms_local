@@ -16,8 +16,14 @@ RTL_433_DOWNLOAD_URL = (
     f"{RTL_433_VERSION}/{RTL_433_ZIP_NAME}"
 )
 
-# Prefer rtl_433-rtlsdr for RTL-SDR dongles; fall back to generic build
-RTL_433_EXE_CANDIDATES = ("rtl_433-rtlsdr.exe", "rtl_433.exe")
+# Prefer rtl_433-rtlsdr for RTL-SDR dongles; fall back to generic build.
+# Include extensionless names for macOS / Linux Homebrew installs.
+RTL_433_EXE_CANDIDATES = (
+  "rtl_433-rtlsdr.exe",
+  "rtl_433.exe",
+  "rtl_433-rtlsdr",
+  "rtl_433",
+)
 
 # Protocols disabled by default in rtl_433 25.12 (marked * in -R help).
 # Fallback only — live IDs are read from the bundled binary via ``rtl_433 -R help``.
@@ -237,9 +243,21 @@ def get_project_root() -> Path:
 
 def resolve_rtl433_exe_in(dir_path: Path) -> Path | None:
   for name in RTL_433_EXE_CANDIDATES:
+    if name.endswith(".exe") and not sys.platform.startswith("win"):
+      continue
     candidate = dir_path / name
     if candidate.is_file():
       return candidate
+  return None
+
+
+def _path_rtl433() -> Path | None:
+  import shutil
+
+  for name in ("rtl_433-rtlsdr", "rtl_433"):
+    found = shutil.which(name)
+    if found:
+      return Path(found)
   return None
 
 
@@ -289,8 +307,13 @@ def get_zadig_exe() -> Path:
 
 
 def get_app_data_dir() -> Path:
-  base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-  path = Path(base) / "TPMSMonitor"
+  if sys.platform == "darwin":
+    base = Path.home() / "Library" / "Application Support"
+  elif sys.platform.startswith("win"):
+    base = Path(os.environ.get("LOCALAPPDATA", Path.home()))
+  else:
+    base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+  path = base / "TPMSMonitor"
   path.mkdir(parents=True, exist_ok=True)
   return path
 
@@ -308,13 +331,26 @@ def get_rtl433_version_marker() -> Path:
 
 
 def get_rtl433_exe() -> Path:
+  # On macOS/Linux prefer Homebrew / PATH over leftover Windows AppData zips.
+  if not sys.platform.startswith("win"):
+    native = _path_rtl433()
+    if native:
+      return native
+
   deployed = resolve_rtl433_exe_in(get_rtl433_dir())
   if deployed:
     return deployed
   bundled = resolve_rtl433_exe_in(get_bundled_rtl433_dir())
   if bundled:
     return bundled
-  return get_rtl433_dir() / RTL_433_EXE_CANDIDATES[0]
+
+  native = _path_rtl433()
+  if native:
+    return native
+
+  if sys.platform.startswith("win"):
+    return get_rtl433_dir() / RTL_433_EXE_CANDIDATES[0]
+  return Path("/opt/homebrew/bin/rtl_433")
 
 
 def get_config_file() -> Path:

@@ -434,6 +434,13 @@ class Rtl433Runner:
 
     try:
       self._stop_event.clear()
+      # An rtl_433 orphaned by a previous session keeps the dongle claimed.
+      try:
+        from tpms_bench.rtl433 import free_dongle
+
+        free_dongle()
+      except Exception:
+        pass
       workdir = exe.parent if exe.parent.is_dir() else get_rtl433_dir()
       env = os.environ.copy()
       env["PATH"] = str(workdir) + os.pathsep + env.get("PATH", "")
