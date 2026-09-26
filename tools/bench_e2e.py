@@ -54,7 +54,8 @@ def main() -> int:
                 f"row {event.excel_row:>3} {event.performance:<3} "
                 f"id={event.sensor_id or '—':<9} {event.temperature or '—':>4}C "
                 f"{event.voltage or '—':>6}V  sdr={event.sdr_compare or '—':<8} "
-                f"{(event.duration_s or 0):5.1f}s  {event.reason or ''}",
+                f"{(event.duration_s or 0):5.1f}s  {event.reason or ''}\n"
+                f"        sdr_reason: {event.sdr_reason or '—'}",
                 flush=True,
             )
             if len(done) >= limit:

@@ -223,6 +223,9 @@ def capture_command(
         "json",
         "-s",
         str(rate),
+        # Match the SDR Receiver tab — auto gain is too low for a bench sensor.
+        "-g",
+        "40",
         "-Y",
         "autolevel",
         "-Y",
