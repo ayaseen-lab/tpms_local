@@ -317,5 +317,31 @@ class CombinedApp(ctk.CTk):
         self.destroy()
 
 
+def _acquire_single_instance() -> bool:
+    """Allow only one TPMS Suite window — two instances fight over the RTL-SDR (usb_open)."""
+    if platform.system() != "Windows":
+        return True
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    # Keep a process-global handle so the mutex stays held for the app lifetime.
+    global _INSTANCE_MUTEX  # noqa: PLW0603
+    _INSTANCE_MUTEX = kernel32.CreateMutexW(None, False, "Local\\Xynovix_TPMS_Suite_SingleInstance")
+    already = kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    if already:
+        messagebox.showerror(
+            APP_TITLE,
+            "TPMS Suite is already running.\n\n"
+            "Close the other window first — two instances share one RTL-SDR and cause usb_open errors.",
+        )
+        return False
+    return True
+
+
 def run_app() -> None:
+    if not _acquire_single_instance():
+        return
     CombinedApp().mainloop()
+
+
+_INSTANCE_MUTEX = None

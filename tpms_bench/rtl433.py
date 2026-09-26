@@ -131,9 +131,21 @@ def parse_json_lines(text: str) -> list[SdrPacket]:
             continue
         if not isinstance(data, dict):
             continue
-        sensor_id = data.get("id") or data.get("ID") or data.get("sensor_id")
+        sensor_id = data.get("id") or data.get("ID") or data.get("sensor_id") or data.get("id_str")
         if sensor_id is not None:
-            sensor_id = str(sensor_id).replace(" ", "").lstrip("0x").upper()
+            raw = str(sensor_id).replace(" ", "")
+            if raw.lower().startswith("0x"):
+                raw = raw[2:]
+            if raw.isdigit():
+                try:
+                    sensor_id = f"{int(raw) & 0xFFFFFFFF:08X}"
+                except ValueError:
+                    sensor_id = raw.upper()
+            else:
+                try:
+                    sensor_id = f"{int(raw, 16) & 0xFFFFFFFF:08X}"
+                except ValueError:
+                    sensor_id = raw.upper()
         model = data.get("model") or data.get("type")
         proto_raw = data.get("protocol")
         protocol_id = None
@@ -214,6 +226,8 @@ def capture_command(
         "autolevel",
         "-Y",
         "minmax",
+        "-Y",
+        "magest",
         "-M",
         "level",
         "-M",

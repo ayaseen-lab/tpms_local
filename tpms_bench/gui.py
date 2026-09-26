@@ -444,17 +444,25 @@ class BenchApp(tk.Tk):
         table_card = tk.Frame(body, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1)
         table_card.pack(fill="both", expand=True)
         self.table_count_var = tk.StringVar(value="0 rows")
-        columns = ("row", "vehicle", "supplier", "codes", "result", "id", "temp", "volt", "reason")
+        columns = ("row", "vehicle", "supplier", "codes", "result", "id", "decoder", "temp", "volt", "reason")
         self.tree = ttk.Treeview(table_card, columns=columns, show="headings", height=14)
         headings = {
             "row": "Row #", "vehicle": "Vehicle (Make / Model / Year)", "supplier": "OE Supplier",
             "codes": "CODE A / B / C", "result": "Result", "id": "Sensor ID",
+            "decoder": "rtl_433 Decoder",
             "temp": "Temp °C", "volt": "Battery V", "reason": "Note / NOK Diagnostics",
         }
-        widths = {"row": 55, "vehicle": 210, "supplier": 100, "codes": 240, "result": 70, "id": 100, "temp": 70, "volt": 80, "reason": 200}
+        widths = {
+            "row": 55, "vehicle": 190, "supplier": 90, "codes": 200, "result": 65,
+            "id": 90, "decoder": 150, "temp": 65, "volt": 70, "reason": 160,
+        }
         for col in columns:
             self.tree.heading(col, text=headings[col])
-            self.tree.column(col, width=widths[col], anchor="center" if col in ("row", "result", "id", "temp", "volt") else "w")
+            self.tree.column(
+                col,
+                width=widths[col],
+                anchor="center" if col in ("row", "result", "id", "temp", "volt") else "w",
+            )
 
         scroll = ttk.Scrollbar(table_card, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
@@ -526,9 +534,7 @@ class BenchApp(tk.Tk):
             if not self.source_xlsx:
                 return
 
-        reset_session_db()
-        self._clear_readings()
-        self._reset_display()
+        # Keep prior results; only Reset Session clears the DB.
         self.is_paused = False
         self.start_time = time.monotonic()
 
@@ -544,7 +550,7 @@ class BenchApp(tk.Tk):
         self.runner = BenchRunner(
             port=port,
             source_xlsx=self.source_xlsx,
-            resume=False,
+            resume=True,
             skip_sdr=False,
             on_progress=self.queue.put,
         )
@@ -679,18 +685,28 @@ class BenchApp(tk.Tk):
         elif event.kind == "row_done":
             self._update_stat_labels(event.pending, event.done, event.ok, event.nok, event.total)
             if event.sensor_id and event.sensor_id != "na":
+                decoder = (event.rtl433_decoder or "").strip()
+                decoder_bit = f"  ·  {decoder}" if decoder and decoder not in {"na", "—"} else ""
                 self.reading_var.set(
-                    f"Live Telemetry:  ID  {event.sensor_id}  ·  {event.temperature} °C  ·  {event.voltage} V"
+                    f"Live Telemetry:  ID  {event.sensor_id}  ·  {event.temperature} °C  ·  "
+                    f"{event.voltage} V{decoder_bit}"
                 )
             item = self.tree.insert("", 0, values=(
                 event.excel_row, f"{event.make} {event.model}", event.supplier or "—",
                 f"{event.code_a}  {event.code_b}  {event.code_c}", event.performance,
-                event.sensor_id or "na", event.temperature or "na", event.voltage or "na",
+                event.sensor_id or "na",
+                event.rtl433_decoder or "—",
+                event.temperature or "na", event.voltage or "na",
                 event.reason or event.message or "",
             ), tags=(event.performance or "SKIP",))
             self._flash_row(item, event.performance or "SKIP")
             self._refresh_table_count()
             self.tree.see(item)
+            decoder = (event.rtl433_decoder or "").strip()
+            if decoder and decoder not in {"na", "—", ""}:
+                self.status_var.set(
+                    f"Row {event.excel_row} done · {event.performance} · rtl_433 Decoder: {decoder}"
+                )
 
         elif event.kind == "finished":
             self._end_session("COMPLETED", BLUE, event.message)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -49,11 +50,58 @@ DATABASE_HEADERS = [
 ]
 
 
+def _is_permission_error(exc: BaseException) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 13:
+        return True
+    text = str(exc).lower()
+    return "permission denied" in text or "being used by another process" in text
+
+
+def alternate_workbook_path(preferred: Path) -> Path:
+    """Unlocked sibling path when Excel (or another app) holds the preferred file."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return preferred.with_name(f"{preferred.stem}_live_{stamp}{preferred.suffix}")
+
+
+def save_workbook(wb: Workbook, path: Path) -> Path:
+    """Save workbook; if the target is locked (Excel open), write a live alternate."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        wb.save(path)
+        return path
+    except Exception as exc:
+        if not _is_permission_error(exc):
+            raise
+        alt = alternate_workbook_path(path)
+        wb.save(alt)
+        return alt
+
+
 def copy_workbook(source: Path, dest: Path, *, force: bool = False) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if force or not dest.exists():
-        shutil.copy2(source, dest)
-    return dest
+        try:
+            shutil.copy2(source, dest)
+            return dest
+        except Exception as exc:
+            if not _is_permission_error(exc):
+                raise
+            alt = alternate_workbook_path(dest)
+            shutil.copy2(source, alt)
+            return alt
+    # Resume path: preferred exists but may be locked for later saves — probe write access.
+    try:
+        with dest.open("a+b"):
+            pass
+        return dest
+    except Exception as exc:
+        if not _is_permission_error(exc):
+            raise
+        alt = alternate_workbook_path(dest)
+        shutil.copy2(dest, alt)
+        return alt
 
 
 def create_blank_database(dest: Path) -> Path:
@@ -65,8 +113,7 @@ def create_blank_database(dest: Path) -> Path:
     for col, name in enumerate(DATABASE_HEADERS, start=1):
         if not name.startswith("Col"):
             ws.cell(1, col, name)
-    wb.save(dest)
-    return dest
+    return save_workbook(wb, dest)
 
 
 def append_manual_code_row(
@@ -148,7 +195,7 @@ def stamp_board_report_info(path: Path) -> None:
     ws["B4"] = "TPMS Board (USB-TTL / Hamaton bench) — not SDR Receiver"
     ws.column_dimensions["A"].width = 22
     ws.column_dimensions["B"].width = 64
-    wb.save(path)
+    save_workbook(wb, path)
 
 
 def write_row(ws: Worksheet, cols: dict[str, int], row: int, values: dict[str, object]) -> None:

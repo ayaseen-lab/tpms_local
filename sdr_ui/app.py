@@ -1,6 +1,7 @@
 """SDR Receiver view — RTL-SDR telemetry dashboard (embeddable frame)."""
 
 import threading
+import time
 import tkinter as tk
 from collections import deque
 from datetime import datetime
@@ -15,6 +16,7 @@ from config import APP_NAME, DEFAULT_PRESET, FREQUENCY_PRESETS, get_rtl433_exe
 from dialogs import ask_save_path
 from rtl433_runner import Rtl433Runner, TelemetryReading
 from session_export import export_session_excel, export_session_pdf
+from session_persist import clear_session_file, load_session, save_session
 from setup_manager import SetupManager
 from setup_wizard import SetupWizard
 from themes import (
@@ -73,6 +75,15 @@ class SdrView(ctk.CTkFrame):
     self._latest: Optional[TelemetryReading] = None
     self._session_start: Optional[datetime] = None
     self._exporting = False
+    # Batch UI work — per-packet tree/stat updates freeze the GUI under dense TPMS RF.
+    self._pending_readings: Deque[TelemetryReading] = deque()
+    self._pending_lock = threading.Lock()
+    self._flush_scheduled = False
+    self._autosave_dirty = False
+    self._last_live_bar_ts = 0.0
+    self._UI_FLUSH_MS = 200
+    self._AUTOSAVE_MS = 8000
+    self._LIVE_BAR_MIN_MS = 350
 
     self.runner = Rtl433Runner(
       on_reading=self._on_reading,
@@ -83,8 +94,16 @@ class SdrView(ctk.CTkFrame):
     self._setup_styles()
     self._build_ui()
     self._load_prefs()
+    restored = self._restore_session_snapshot()
     self._update_stats()
     self._notify_status()
+    self.after(self._AUTOSAVE_MS, self._autosave_tick)
+    if restored:
+      self.after(200, lambda: self._log(
+        f"Restored {len(self._sensors)} SDR sensor(s) from last session — press START to resume RF."
+      ))
+      # Do not auto-start listen: it races duplicate windows (usb_open ERROR) and
+      # overwrites the restored snapshot before the operator is ready.
 
     if self.setup_mgr.is_first_run():
       self.after(400, self._show_setup)
@@ -226,7 +245,7 @@ class SdrView(ctk.CTkFrame):
     self.running_badge.pack(side="right")
     ctk.CTkLabel(
       title_row,
-      text="rtl_433  ·  1 Msps decode boost  ·  OK/NOK from packet completeness",
+      text="rtl_433  ·  fast TPMS-only  ·  locked 433.92  ·  IQ off",
       font=ctk.CTkFont(size=11),
       text_color=COLOR_TEXT_DIM,
     ).pack(side="right", padx=(0, 12))
@@ -287,7 +306,7 @@ class SdrView(ctk.CTkFrame):
     self.gain_combo = ctk.CTkComboBox(
       settings_row, values=["auto", "0", "20", "30", "40", "49.6"], width=72, height=28, **combo_colors()
     )
-    self.gain_combo.set("40")
+    self.gain_combo.set("49.6")
     self.gain_combo.pack(side="left", padx=(0, 8))
     ctk.CTkLabel(settings_row, text="PPM", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_TEXT_DIM).pack(
       side="left", padx=(0, 4)
@@ -318,7 +337,8 @@ class SdrView(ctk.CTkFrame):
       text_color=COLOR_TEXT,
       **switch_colors(),
     )
-    self.record_iq_switch.select()
+    # Off by default — writing IQ while listening drops packets and lowers unique ID count.
+    self.record_iq_switch.deselect()
     self.record_iq_switch.pack(side="left", padx=(10, 0))
     ctk.CTkButton(
       settings_row,
@@ -381,10 +401,11 @@ class SdrView(ctk.CTkFrame):
   def _flash_row(self, item_id: str, tag: str, step: int = 0) -> None:
     if not self.tree.exists(item_id):
       return
+    # Keep flashes short — long animations stack up and freeze SDR under packet load.
     try:
-      if step < 3:
+      if step < 2:
         self.tree.item(item_id, tags=("flash",))
-        self.after(70, lambda i=item_id, t=tag, s=step + 1: self._flash_row(i, t, s))
+        self.after(50, lambda i=item_id, t=tag, s=step + 1: self._flash_row(i, t, s))
       else:
         self.tree.item(item_id, tags=(tag,))
     except tk.TclError:
@@ -595,6 +616,16 @@ class SdrView(ctk.CTkFrame):
       self._update_export_button()
       iq_note = " · IQ recording (full rate, kept)" if record_iq else ""
       self.footer_label.configure(text=f"Listening on {preset}{iq_note}…")
+    else:
+      self.footer_label.configure(text="SDR failed to start — see Activity Terminal")
+      if hasattr(self, "activity_terminal"):
+        self.activity_terminal.expand()
+      messagebox.showerror(
+        APP_NAME,
+        "SDR could not start rtl_433.\n\n"
+        "Close any other TPMS Suite / SDR window, unplug/replug the RTL-SDR, then press START again.",
+        parent=self._toplevel(),
+      )
 
   def _pause_listen(self):
     if self._listening:
@@ -611,84 +642,114 @@ class SdrView(ctk.CTkFrame):
       self.runner.stop()
 
   def _on_reading(self, reading: TelemetryReading):
-    self.after(0, lambda r=reading: self._apply_reading(r))
+    # Queue on the rtl_433 thread; one Tk after() flush handles many packets.
+    with self._pending_lock:
+      self._pending_readings.append(reading)
+      need_schedule = not self._flush_scheduled
+      if need_schedule:
+        self._flush_scheduled = True
+    if need_schedule:
+      self.after(self._UI_FLUSH_MS, self._flush_readings)
 
-  def _apply_reading(self, reading: TelemetryReading):
-    self.history.appendleft(reading)
-    self._total_readings += 1
-    self._latest = reading
-    self.live_bar.update_reading(reading)
-
-    if not reading.has_sensor_id():
-      self._update_stats()
-      self.footer_label.configure(
-        text=f"Last reading ignored for OK/NOK (no sensor ID): {reading.model} — {reading.display_pressure}"
-      )
-      self._log(f"{reading.model} | no sensor ID | skipped for detected OK/NOK")
+  def _flush_readings(self) -> None:
+    with self._pending_lock:
+      batch = list(self._pending_readings)
+      self._pending_readings.clear()
+      self._flush_scheduled = False
+    if not batch:
       return
 
-    sid = reading.sensor_id
-    first_seen = self._sensor_first_seen.setdefault(sid, reading.timestamp)
-    elapsed = max(0.0, (reading.timestamp - first_seen).total_seconds())
+    touched: Dict[str, TelemetryReading] = {}
+    footer_sid: Optional[str] = None
+    new_ids: list[str] = []
+    skipped_no_id = 0
 
-    if sid not in self._sensors:
-      merged = reading
-      if merged.qualifies_ok():
+    for reading in batch:
+      self.history.appendleft(reading)
+      self._total_readings += 1
+      self._latest = reading
+      if not reading.has_sensor_id():
+        skipped_no_id += 1
+        continue
+      sid = reading.sensor_id
+      first_seen = self._sensor_first_seen.setdefault(sid, reading.timestamp)
+      elapsed = max(0.0, (reading.timestamp - first_seen).total_seconds())
+      is_new = sid not in self._sensors
+      if is_new:
+        merged = reading
         merged.acquire_seconds = elapsed
+        self._sensors[sid] = merged
+        self._sensor_reads[sid] = 1
+        new_ids.append(sid)
       else:
-        merged.acquire_seconds = elapsed
-      self._sensors[sid] = merged
-      self._sensor_reads[sid] = 1
-      index = len(self._sensors)
+        previous = self._sensors[sid]
+        already_ok = previous.qualifies_ok()
+        frozen = previous.acquire_seconds if already_ok else None
+        merged = previous.merged_with(reading)
+        if already_ok:
+          merged.acquire_seconds = frozen
+        else:
+          merged.acquire_seconds = elapsed
+        self._sensors[sid] = merged
+        self._sensor_reads[sid] = self._sensor_reads.get(sid, 1) + 1
+      touched[sid] = merged
+      footer_sid = sid
+
+    now = time.monotonic()
+    if self._latest is not None and (now - self._last_live_bar_ts) * 1000.0 >= self._LIVE_BAR_MIN_MS:
+      self.live_bar.update_reading(self._latest)
+      self._last_live_bar_ts = now
+
+    for sid, merged in touched.items():
+      reads = self._sensor_reads.get(sid, 1)
       result = "OK" if merged.qualifies_ok() else "NOK"
-      item = self.tree.insert("", 0, values=self._row_values(index, merged, 1), tags=(result,))
-      self._sensor_items[sid] = item
-    else:
-      previous = self._sensors[sid]
-      already_ok = previous.qualifies_ok()
-      frozen = previous.acquire_seconds if already_ok else None
-      merged = previous.merged_with(reading)
-      if already_ok:
-        merged.acquire_seconds = frozen
-      elif merged.qualifies_ok():
-        merged.acquire_seconds = elapsed
-      else:
-        merged.acquire_seconds = elapsed
-      self._sensors[sid] = merged
-      self._sensor_reads[sid] = self._sensor_reads.get(sid, 1) + 1
       item = self._sensor_items.get(sid)
-      if item and self.tree.exists(item):
+      if sid in new_ids or not item or not self.tree.exists(item):
+        index = list(self._sensors.keys()).index(sid) + 1
+        item = self.tree.insert("", 0, values=self._row_values(index, merged, reads), tags=(result,))
+        self._sensor_items[sid] = item
+        if sid in new_ids:
+          # Skip flash animation — keeps SDR responsive at high packet rates.
+          self.tree.see(item)
+      else:
         try:
           index = int(self.tree.set(item, "num"))
         except (TypeError, ValueError):
           index = list(self._sensors.keys()).index(sid) + 1
-        result = "OK" if merged.qualifies_ok() else "NOK"
         self.tree.item(
           item,
-          values=self._row_values(index, merged, self._sensor_reads[sid]),
+          values=self._row_values(index, merged, reads),
           tags=(result,),
         )
-      else:
-        result = "OK" if merged.qualifies_ok() else "NOK"
-        item = self.tree.insert(
-          "", 0, values=self._row_values(len(self._sensors), merged, self._sensor_reads[sid]), tags=(result,)
+      if reads == 1 or reads % 50 == 0:
+        self._log(
+          f"{merged.display_decoder} | ID {sid} | {result} | "
+          f"{merged.display_pressure} | {merged.display_temp} | {reads} reads"
         )
-        self._sensor_items[sid] = item
 
-    result = "OK" if merged.qualifies_ok() else "NOK"
-    if item and self.tree.exists(item):
-      self._flash_row(item, result)
-      self.tree.see(item)
+    if skipped_no_id and skipped_no_id == len(batch):
+      self._log(f"{skipped_no_id} packet(s) with no sensor ID skipped for OK/NOK")
 
     self._refresh_table_count()
     self._update_stats()
-    reads = self._sensor_reads.get(sid, 1)
-    self.footer_label.configure(
-      text=f"Sensor {sid}: {result}  ·  {merged.display_pressure}  ·  {reads} read(s)"
-    )
-    self._log(
-      f"{merged.model} | ID {sid} | {result} | {merged.display_pressure} | {merged.display_temp} | {reads} reads"
-    )
+    self._autosave_dirty = True
+    if footer_sid and footer_sid in self._sensors:
+      merged = self._sensors[footer_sid]
+      reads = self._sensor_reads.get(footer_sid, 1)
+      result = "OK" if merged.qualifies_ok() else "NOK"
+      self.footer_label.configure(
+        text=(
+          f"Sensor {footer_sid}: {result}  ·  {merged.display_decoder}  ·  "
+          f"{merged.display_pressure}  ·  {reads} read(s)  ·  +{len(batch)} pkt"
+        )
+      )
+
+    with self._pending_lock:
+      more = bool(self._pending_readings)
+      if more:
+        self._flush_scheduled = True
+    if more:
+      self.after(self._UI_FLUSH_MS, self._flush_readings)
 
   def _update_stats(self):
     sensors = len(self._sensors)
@@ -778,7 +839,70 @@ class SdrView(ctk.CTkFrame):
     """Merged per-sensor readings for comparative OK/NOK analysis."""
     return dict(self._sensors)
 
+  def _autosave_tick(self) -> None:
+    try:
+      if self._autosave_dirty and self._sensors:
+        self._persist_session(force=False)
+    finally:
+      self.after(self._AUTOSAVE_MS, self._autosave_tick)
+
+  def _persist_session(self, force: bool = True) -> None:
+    if not self._sensors and not force:
+      return
+    if not self._sensors:
+      return
+    try:
+      save_session(
+        sensors=self._sensors,
+        sensor_reads=self._sensor_reads,
+        sensor_first_seen=self._sensor_first_seen,
+        total_readings=self._total_readings,
+        session_start=self._session_start,
+      )
+      self._autosave_dirty = False
+    except Exception as exc:
+      self._log(f"SDR autosave failed: {exc}")
+
+  def _restore_session_snapshot(self) -> bool:
+    data = load_session()
+    if not data:
+      return False
+    sensors: Dict[str, TelemetryReading] = data["sensors"]
+    sensor_reads: Dict[str, int] = data["sensor_reads"]
+    sensor_first_seen: Dict[str, datetime] = data["sensor_first_seen"]
+    self._sensors = sensors
+    self._sensor_reads = sensor_reads
+    self._sensor_first_seen = sensor_first_seen
+    self._total_readings = int(data.get("total_readings") or len(sensors))
+    self._session_start = data.get("session_start")
+    self._sensor_items.clear()
+    for item in self.tree.get_children():
+      self.tree.delete(item)
+    # Insert oldest-first so newest stays at top like live capture.
+    ordered = list(sensors.items())
+    for index, (sid, reading) in enumerate(ordered, start=1):
+      reads = sensor_reads.get(sid, 1)
+      result = "OK" if reading.qualifies_ok() else "NOK"
+      item = self.tree.insert(
+        "",
+        0,
+        values=self._row_values(index, reading, reads),
+        tags=(result,),
+      )
+      self._sensor_items[sid] = item
+      self.history.appendleft(reading)
+    self._latest = ordered[-1][1] if ordered else None
+    if self._latest is not None:
+      self.live_bar.update_reading(self._latest)
+    self._refresh_table_count()
+    self.footer_label.configure(
+      text=f"Restored {len(sensors)} SDR sensor(s) — press START to keep listening"
+    )
+    self._autosave_dirty = False
+    return True
+
   def _clear_session(self):
+    self._pending_readings.clear()
     for item in self.tree.get_children():
       self.tree.delete(item)
     self.history.clear()
@@ -788,6 +912,9 @@ class SdrView(ctk.CTkFrame):
     self._sensor_first_seen.clear()
     self._total_readings = 0
     self._latest = None
+    self._session_start = None
+    self._autosave_dirty = False
+    clear_session_file()
     self.live_bar.update_reading(None)
     self._refresh_table_count()
     self._update_stats()
@@ -845,5 +972,11 @@ class SdrView(ctk.CTkFrame):
     )
 
   def shutdown(self):
+    try:
+      if self._pending_readings:
+        self._flush_readings()
+    except Exception:
+      pass
     self.runner.stop()
+    self._persist_session(force=True)
     self._save_prefs()

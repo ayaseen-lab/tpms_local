@@ -52,7 +52,7 @@ from themes import (
 )
 from tpms_bench.excel_io import parse_code, stamp_board_report_info
 from tpms_bench.report import build_pdf
-from tpms_bench.runner import OUT_XLSX, BenchRunner, ManualCode, ProgressEvent, reset_session_db
+from tpms_bench.runner import OUT_XLSX, BenchRunner, ManualCode, ProgressEvent, get_out_xlsx, reset_session_db
 from tpms_bench.uart import default_port, find_serial_ports, port_device
 from widgets import StatCard
 
@@ -95,9 +95,17 @@ class TpmsView(ctk.CTkFrame):
         self._setup_styles()
         self._build_ui()
         self._reset_display()
+        restored = self._restore_session_from_db()
         self.after(150, self._drain)
         self.after(80, self._animate_badge)
         self._notify_status()
+        if restored:
+            self.after(
+                250,
+                lambda: self.status_var.set(
+                    f"Restored {restored} Board result row(s) from last session — no rerun needed"
+                ),
+            )
 
     def _toplevel(self):
         return self.winfo_toplevel()
@@ -511,8 +519,136 @@ class TpmsView(ctk.CTkFrame):
         )
 
     def get_tested_rows(self) -> list[dict]:
-        """Board rows for comparative analysis — current session only (matches live table)."""
-        return list(self._session_rows)
+        """Board rows for comparative analysis — current session, else SQLite resume."""
+        if self._session_rows:
+            return list(self._session_rows)
+        return self._hydrate_session_rows_from_db()
+
+    def _hydrate_session_rows_from_db(self) -> list[dict]:
+        """Reload Board OK/NOK rows from bench.sqlite so Compare survives a restart."""
+        try:
+            from tpms_bench.results_db import connect, fetch_all
+            from tpms_bench.runner import DB_PATH
+        except Exception:
+            return []
+        if not DB_PATH.exists():
+            return []
+        try:
+            db = connect(DB_PATH)
+            rows = fetch_all(db)
+            db.close()
+        except Exception:
+            return []
+        hydrated: list[dict] = []
+        for row in rows:
+            perf = str(row["board_performance"] or "").strip().upper()
+            if perf not in ("OK", "NOK"):
+                continue
+            sid = str(row["sensor_id"] or "").strip()
+            if sid.lower() in {"na", "n/a", "none", "-", "—"}:
+                sid = ""
+            hydrated.append(
+                {
+                    "sensor_id": sid,
+                    "board_performance": perf,
+                    "nok_reason": str(row["nok_reason"] or ""),
+                    "sdr_compare": str(row["sdr_compare"] or ""),
+                    "sdr_reason": str(row["sdr_reason"] or ""),
+                    "excel_row": int(row["excel_row"] or 0),
+                    "make": str(row["make"] or ""),
+                    "model": str(row["model"] or ""),
+                    "duration_s": row["duration_s"],
+                    "_db_row": row,
+                }
+            )
+        if hydrated and not self._session_rows:
+            # Store without the private _db_row helper for Compare consumers.
+            self._session_rows = [
+                {k: v for k, v in item.items() if k != "_db_row"} for item in hydrated
+            ]
+        return list(self._session_rows) if self._session_rows else []
+
+    def _restore_session_from_db(self) -> int:
+        """Repopulate the live Board table from SQLite after an app restart."""
+        try:
+            from tpms_bench.results_db import connect, counts, fetch_all
+            from tpms_bench.runner import DB_PATH
+        except Exception:
+            return 0
+        if not DB_PATH.exists():
+            return 0
+        try:
+            db = connect(DB_PATH)
+            rows = fetch_all(db)
+            stats = counts(db)
+            db.close()
+        except Exception:
+            return 0
+        if not rows:
+            return 0
+
+        self._session_rows.clear()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        shown = 0
+        for row in rows:
+            perf = str(row["board_performance"] or "").strip().upper()
+            if perf not in ("OK", "NOK", "SKIP"):
+                continue
+            sid = str(row["sensor_id"] or "").strip()
+            if sid.lower() in {"na", "n/a", "none", "-", "—"}:
+                sid_disp = "na"
+                sid = ""
+            else:
+                sid_disp = sid
+            make = str(row["make"] or "")
+            model = str(row["model"] or "")
+            code_a = str(row["code_a"] or "")
+            code_b = str(row["code_b"] or "")
+            code_c = str(row["code_c"] or "")
+            temp = str(row["temperature"] or "na")
+            volt = str(row["battery_voltage"] or "na")
+            reason = str(row["nok_reason"] or "")
+            excel_row = int(row["excel_row"] or 0)
+            self.tree.insert(
+                "",
+                0,
+                values=(
+                    excel_row,
+                    f"{make} {model}".strip(),
+                    f"{code_a}  {code_b}  {code_c}".strip(),
+                    perf,
+                    sid_disp,
+                    temp,
+                    volt,
+                    reason,
+                ),
+                tags=(perf,),
+            )
+            shown += 1
+            if perf in ("OK", "NOK"):
+                self._session_rows.append(
+                    {
+                        "sensor_id": sid,
+                        "board_performance": perf,
+                        "nok_reason": reason,
+                        "sdr_compare": str(row["sdr_compare"] or ""),
+                        "sdr_reason": str(row["sdr_reason"] or ""),
+                        "excel_row": excel_row,
+                        "make": make,
+                        "model": model,
+                        "duration_s": row["duration_s"],
+                    }
+                )
+            self._note_sdr_compare(str(row["sdr_compare"] or ""))
+
+        done = int(stats.get("done") or shown)
+        ok = int(stats.get("OK") or 0)
+        nok = int(stats.get("NOK") or 0)
+        self._update_stat_labels(pending=0, done=done, ok=ok, nok=nok, total=done)
+        self._refresh_table_count()
+        return shown
 
     def focus_code_fields(self) -> None:
         try:
@@ -652,9 +788,9 @@ class TpmsView(ctk.CTkFrame):
             )
             return False
 
-        reset_session_db()
-        self._clear_readings()
-        self._reset_display()
+        # Keep existing Board results — only "Reset Session" clears. Resume unfinished rows.
+        if not self._session_rows:
+            self._hydrate_session_rows_from_db()
         self.is_paused = False
         self.start_time = time.monotonic()
         self.start_btn.configure(state="disabled")
@@ -666,7 +802,7 @@ class TpmsView(ctk.CTkFrame):
         self.runner = BenchRunner(
             port=port,
             source_xlsx=self.source_xlsx,
-            resume=False,
+            resume=True,
             skip_sdr=skip_sdr,
             extra_codes=extra_codes,
             on_progress=self.queue.put,
@@ -759,7 +895,16 @@ class TpmsView(ctk.CTkFrame):
             assert self.runner is not None
             self.runner.run()
         except Exception as error:
-            self.queue.put(ProgressEvent(kind="error", message=str(error)))
+            message = str(error)
+            low = message.lower()
+            if "permission denied" in low or "[errno 13]" in low:
+                message = (
+                    "Cannot write the Board results Excel — it is open in another program "
+                    "(usually Microsoft Excel).\n\n"
+                    "Close that file, then press START again.\n\n"
+                    f"({error})"
+                )
+            self.queue.put(ProgressEvent(kind="error", message=message))
 
     def _open_file(self, path: Path) -> None:
         if not path.exists():
@@ -773,7 +918,8 @@ class TpmsView(ctk.CTkFrame):
             subprocess.run(["xdg-open", str(path)], check=False)
 
     def export_excel(self) -> None:
-        if not OUT_XLSX.exists():
+        out = get_out_xlsx() if get_out_xlsx().exists() else OUT_XLSX
+        if not out.exists():
             messagebox.showinfo("TPMS Board Report (Excel)", "No TPMS Board results yet. Run a test first.", parent=self._toplevel())
             return
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -787,8 +933,8 @@ class TpmsView(ctk.CTkFrame):
         if not dest:
             return
         try:
-            stamp_board_report_info(OUT_XLSX)
-            shutil.copy2(OUT_XLSX, dest)
+            stamp_board_report_info(out)
+            shutil.copy2(out, dest)
             self.status_var.set(f"TPMS Board Report (Excel) saved: {Path(dest).name}")
             messagebox.showinfo(
                 "TPMS Board Report (Excel)",
@@ -823,20 +969,29 @@ class TpmsView(ctk.CTkFrame):
             messagebox.showerror("TPMS Board Report (PDF)", str(error), parent=self._toplevel())
 
     def _drain(self) -> None:
+        # Cap work per tick so SDR UI timers still run while the Board is busy.
         try:
-            while True:
+            for _ in range(40):
                 self._apply(self.queue.get_nowait())
         except queue.Empty:
             pass
-        self.after(120, self._drain)
+        self.after(80, self._drain)
 
     def _flash_row(self, item_id: str, tag: str, step: int = 0) -> None:
+        # Skip animation under load — flashing every row freezes the UI (and SDR).
+        if step == 0 and len(self.queue.queue) > 5:
+            try:
+                if self.tree.exists(item_id):
+                    self.tree.item(item_id, tags=(tag,))
+            except tk.TclError:
+                pass
+            return
         if not self.tree.exists(item_id):
             return
         try:
-            if step < 3:
+            if step < 2:
                 self.tree.item(item_id, tags=("flash",))
-                self.after(70, lambda i=item_id, t=tag, s=step + 1: self._flash_row(i, t, s))
+                self.after(50, lambda i=item_id, t=tag, s=step + 1: self._flash_row(i, t, s))
             else:
                 self.tree.item(item_id, tags=(tag,))
         except tk.TclError:
@@ -849,8 +1004,9 @@ class TpmsView(ctk.CTkFrame):
         self.is_paused = False
         self._set_state_badge(label)
         try:
-            if OUT_XLSX.exists():
-                stamp_board_report_info(OUT_XLSX)
+            out = get_out_xlsx()
+            if out.exists():
+                stamp_board_report_info(out)
             build_pdf()
         except Exception:
             pass
@@ -866,6 +1022,8 @@ class TpmsView(ctk.CTkFrame):
                 self._blink_led(self.ttl_led, LED_TTL_ON)
             elif event.path == "jlink":
                 self._blink_led(self.rx_led, LED_JLINK_ON)
+            elif event.path == "excel" and event.message:
+                self.status_var.set(event.message)
             return
 
         if event.kind == "started":

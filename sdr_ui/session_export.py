@@ -236,9 +236,12 @@ def _write_readings_sheet(wb: Workbook, readings: List[TelemetryReading]) -> Non
         brands.append(label)
     count = len(group_rows)
     time_to_ok, span = _group_timing(group_rows)
+    decoders = _unique_decoders(group_rows)
     title = f"Sensor ID: {sensor_id}"
     if brands:
       title = f"{title}  —  {', '.join(brands)}"
+    if decoders and decoders != "—":
+      title = f"{title}  ·  rtl_433 Decoder: {decoders}"
     title = (
       f"{title}  ({count} reading{'s' if count != 1 else ''}"
       f" · time to OK {_format_seconds(time_to_ok)} · span {_format_seconds(span)})"

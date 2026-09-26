@@ -82,7 +82,12 @@ class LiveTelemetryBar(ctk.CTkFrame):
     if reading is None:
       self.label.configure(text="Waiting for sensor data…")
       return
-    parts = [f"ID {reading.sensor_id}", reading.display_temp, reading.display_pressure]
+    parts = [
+      reading.display_decoder,
+      f"ID {reading.sensor_id}",
+      reading.display_temp,
+      reading.display_pressure,
+    ]
     if reading.battery_ok is not None:
       parts.append("Battery OK" if reading.battery_ok else "Battery LOW")
     self.label.configure(text="  ·  ".join(parts))
@@ -151,7 +156,7 @@ class SensorCard(ctk.CTkFrame):
     self.battery_label.pack(side="right")
 
   def update_reading(self, reading: TelemetryReading):
-    self.model_label.configure(text=reading.model[:40])
+    self.model_label.configure(text=reading.display_decoder[:48])
     self.id_label.configure(text=f"Sensor ID: {reading.sensor_id}")
 
     psi = reading.psi
@@ -217,7 +222,7 @@ class SensorGrid(ctk.CTkScrollableFrame):
 
 
 class HistoryTable(ctk.CTkFrame):
-  COLUMNS = ("#", "Protocol", "Sensor ID", "Pressure", "Temp", "Battery", "Time", "Status")
+  COLUMNS = ("#", "rtl_433 Decoder", "Sensor ID", "Pressure", "Temp", "Battery", "Time", "Status")
   MAX_VISIBLE_ROWS = 200
 
   def __init__(self, master, **kwargs):
@@ -229,7 +234,7 @@ class HistoryTable(ctk.CTkFrame):
   def _build(self):
     header = ctk.CTkFrame(self, fg_color=COLOR_HEADER_BG, corner_radius=0)
     header.pack(fill="x")
-    widths = [40, 140, 110, 90, 70, 80, 70, 70]
+    widths = [40, 180, 110, 90, 70, 80, 70, 70]
     for i, (col, w) in enumerate(zip(self.COLUMNS, widths)):
       ctk.CTkLabel(
         header,
@@ -272,7 +277,7 @@ class HistoryTable(ctk.CTkFrame):
 
     values = [
       str(self._row_count),
-      reading.model[:22],
+      reading.display_decoder[:28],
       reading.sensor_id[:12],
       reading.display_pressure,
       reading.display_temp.replace(" °C", "°C"),
@@ -280,7 +285,7 @@ class HistoryTable(ctk.CTkFrame):
       reading.timestamp.strftime("%H:%M:%S"),
       status,
     ]
-    widths = [40, 140, 110, 90, 70, 80, 70, 70]
+    widths = [40, 180, 110, 90, 70, 80, 70, 70]
     status_color = COLOR_GREEN if status == "OK" else COLOR_RED if status == "LOW" else COLOR_WARN
 
     for val, w in zip(values, widths):

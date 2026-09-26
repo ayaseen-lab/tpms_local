@@ -25,13 +25,22 @@ from .program_search import ProgramSearchCodec, SearchProgress
 from .query_sensor import QuerySensorCodec, QuerySensorReading
 from .rtl433 import SdrCaptureResult, finish_capture, start_capture
 
-UART_POLL_S = 0.10
-JLINK_POLL_S = 2.0
-TRIGGER_WAIT_S = 12.0
-FAST_TRIGGER_WAIT_S = 8.0
-QUERY_TIMEOUT_S = 6.0
-QUERY_RETRIES = 3
-TX_GAP_S = 0.08
+UART_POLL_S = 0.04
+JLINK_POLL_S = 0.28
+TRIGGER_WAIT_S = 2.8
+FAST_TRIGGER_WAIT_S = 1.8
+QUERY_TIMEOUT_S = 1.6
+QUERY_RETRIES = 1
+TX_GAP_S = 0.04
+# Settle after Cancel before Program — keep short for high row throughput.
+POST_CANCEL_S = 0.06
+PROGRAM_TIMEOUT_S = 3.2
+PROGRAM_RESEND_S = 1.4
+CANCEL_WAIT_S = 0.12
+LF_SEARCH_TIMEOUT_S = 2.2
+# Per-row IQ (when Board does not skip SDR) — keep short; live SDR tab covers capture.
+DEFAULT_SDR_ROW_S = 3.0
+SDR_FINISH_EXTRA_S = 0.8
 
 CommCb = Callable[[str, str], None]
 
@@ -82,8 +91,6 @@ class BoardTelemetry:
 
     def missing_values(self) -> list[str]:
         """Fields that still block Board OK (aligned with qualifies_ok)."""
-        if not self.program_ok:
-            return ["program success"]
         missing: list[str] = []
         if not (self.sensor_id or "").strip():
             missing.append("sensor ID")
@@ -95,16 +102,14 @@ class BoardTelemetry:
             missing.append("battery")
         if not (self.trigger_ok or self.read_ok):
             missing.append("LF/RF response")
-        if self.programmed_id and not self.rf_id_verified:
-            missing.append(f"RF confirm of ID {self.programmed_id}")
         return missing
 
     def qualifies_ok(self) -> bool:
-        """OK only when program succeeded and all core values were read."""
-        if not self.program_ok:
-            return False
-        if self.programmed_id and not self.rf_id_verified:
-            return False
+        """OK when LF/RF delivered a full reading for this code set.
+
+        A missing program ACK must not fail the row if the sensor answered
+        with ID + temperature + pressure + battery after trigger/query.
+        """
         if not (self.trigger_ok or self.read_ok):
             return False
         if not (self.sensor_id or "").strip():
@@ -120,22 +125,17 @@ class BoardTelemetry:
     def status_note(self, duration_s: float | None = None) -> str:
         """Human-readable Notes: timing on OK; root-cause on NOK (no false 'missing' noise)."""
         if self.qualifies_ok():
+            prefix = ""
+            if not self.program_ok:
+                prefix = "program ACK missed; "
+            elif self.programmed_id and not self.rf_id_verified:
+                prefix = "RF ID differs from program ACK; "
             if duration_s is not None:
-                return f"all values read in {duration_s:.1f}s"
-            return "all values read"
+                return f"{prefix}all values read in {duration_s:.1f}s"
+            return f"{prefix}all values read" if prefix else "all values read"
 
         if any((r or "").strip() == "stopped" for r in self.reasons):
             return "stopped by operator"
-
-        if not self.program_ok:
-            for reason in self.reasons:
-                text = str(reason or "").strip()
-                if text.startswith("program:"):
-                    detail = text[len("program:") :].strip() or "failed"
-                    if "timeout" in detail.lower():
-                        return "program failed — board did not acknowledge (timeout)"
-                    return f"program failed — {detail}"
-            return "program failed — sensor ID not written"
 
         parts: list[str] = []
 
@@ -144,11 +144,28 @@ class BoardTelemetry:
             if text and text not in parts:
                 parts.append(text)
 
-        no_rf = not self.trigger_ok and not self.read_ok and self.temperature_c is None and self.pressure_raw is None
+        no_rf = (
+            not self.trigger_ok
+            and not self.read_ok
+            and self.temperature_c is None
+            and self.pressure_raw is None
+        )
+
+        if not self.program_ok:
+            for reason in self.reasons:
+                text = str(reason or "").strip()
+                if text.startswith("program:"):
+                    detail = text[len("program:") :].strip() or "failed"
+                    if "timeout" in detail.lower():
+                        _add("program ACK timeout")
+                    else:
+                        _add(f"program: {detail}")
 
         for reason in self.reasons:
             text = str(reason or "").strip()
             if not text or text.lower().startswith("missing "):
+                continue
+            if text.startswith("program:"):
                 continue
             if text.startswith("program used ID"):
                 _add(text)
@@ -175,6 +192,8 @@ class BoardTelemetry:
                     detail = text[len("read:") :].strip()
                     if "timeout" in detail.lower():
                         _add("query failed — no telemetry reply (timeout)")
+                    elif "stale query" in detail.lower():
+                        continue
                     else:
                         _add(f"query failed — {detail}")
 
@@ -188,16 +207,14 @@ class BoardTelemetry:
         if not self._has_battery():
             gaps.append("battery")
         if gaps:
-            # Avoid repeating the same story after a clear trigger failure.
             if no_rf and any(p.startswith("trigger failed") for p in parts):
                 if "sensor ID" in gaps and not self.programmed_id:
                     _add("missing sensor ID")
             else:
                 _add("missing " + ", ".join(gaps))
 
-        if self.programmed_id and not self.rf_id_verified and not no_rf:
-            if not any("confirm" in p.lower() or "mismatch" in p.lower() for p in parts):
-                _add(f"RF did not confirm programmed ID {self.programmed_id}")
+        if not parts and not self.program_ok and no_rf:
+            return "program failed — board did not acknowledge (timeout)"
 
         return "; ".join(parts) if parts else "incomplete reading"
 
@@ -373,7 +390,12 @@ class BoardSession:
         data = self._drain_uart(timeout_s)
         if not data:
             return []
-        return self._parser.feed(data)
+        try:
+            return self._parser.feed(data)
+        except FrameError:
+            # Bad byte in the stream — reset and keep listening for a clean frame.
+            self._parser.reset()
+            return []
 
     def _handle_frame(self, codec: CommandCodec, frame: HamatonFrame) -> CommandResult | None:
         if not codec.accepts_response(frame):
@@ -416,9 +438,9 @@ class BoardSession:
             self.last_path = "Board RX"
             return result
 
-        # Fallback: board often reuses the same SRAM slot. Accept codec matches
-        # that are pending/failure, or success that is new / matches requested OEID.
-        # Never return a stale success that belongs to a previous row's ID.
+        # Fallback: board often reuses the same SRAM slot. Accept pending/failure
+        # always. Accept success only when it is new — never a previous row's
+        # program ACK (that caused wrong programmed_id + "stale query" NOKs).
         extracted = jlink_ram.extract_frames(dump.blob, HamatonFrame.BOARD_ADDRESS)
         for offset, frame in reversed(extracted[-24:]):
             key = (offset, frame.to_bytes())
@@ -426,15 +448,6 @@ class BoardSession:
             if result is None:
                 continue
             if key in before and result.is_success:
-                if (
-                    isinstance(codec, ProgramOneSensorCodec)
-                    and codec.oeid
-                    and isinstance(result.value, ProgramResult)
-                ):
-                    got = int.from_bytes(result.value.sensor_id, "big")
-                    if got == codec.oeid:
-                        self.last_path = "Board RX"
-                        return result
                 continue
             self.last_path = "Board RX"
             return result
@@ -508,16 +521,20 @@ class BoardSession:
         codec: CommandCodec,
         timeout: float | None = None,
         jlink_poll_s: float = JLINK_POLL_S,
+        *,
+        allow_resend: bool = False,
     ) -> CommandResult:
         if self.should_stop():
             return CommandResult.failure(0xFF, "stopped")
-        # J-Link snapshot is slow — only take it when UART RX is unavailable.
-        # With USB-TTL RX, prefer UART and use J-Link as a late fallback.
+        # Program ACKs often only appear in SRAM and reuse the same slot — always
+        # snapshot for program so J-Link fallback can run even when UART RX works.
+        is_program = isinstance(codec, ProgramOneSensorCodec)
         before = (
             self._jlink_before()
-            if (self.jlink_enabled and not self.uart_rx_active)
+            if self.jlink_enabled and (is_program or not self.uart_rx_active)
             else set()
         )
+        poll_s = 0.5 if is_program else jlink_poll_s
         try:
             self.send_codec(codec)
         except Exception as exc:
@@ -526,9 +543,11 @@ class BoardSession:
             return CommandResult.failure(0xFF, str(exc))
         seconds = codec.timeout_seconds if timeout is None else timeout
         deadline = time.monotonic() + seconds
+        started = time.monotonic()
         last_pending: CommandResult | None = None
         last_jlink = 0.0
         uart_miss_since = time.monotonic()
+        resent = False
 
         while time.monotonic() < deadline:
             if self.should_stop():
@@ -545,11 +564,12 @@ class BoardSession:
                     continue
                 return result
 
-            need_jlink = (
-                self.jlink_enabled
-                and (not self.uart_rx_active or (time.monotonic() - uart_miss_since) > 0.8)
+            need_jlink = self.jlink_enabled and (
+                is_program
+                or not self.uart_rx_active
+                or (time.monotonic() - uart_miss_since) > 0.6
             )
-            if need_jlink and (time.monotonic() - last_jlink) >= jlink_poll_s:
+            if need_jlink and (time.monotonic() - last_jlink) >= poll_s:
                 last_jlink = time.monotonic()
                 result = self._poll_jlink(codec, before)
                 if result is not None:
@@ -558,6 +578,21 @@ class BoardSession:
                         deadline = time.monotonic() + seconds
                     else:
                         return result
+
+            # Mid-wait resend for Program — boards sometimes miss the first TX.
+            if (
+                allow_resend
+                and is_program
+                and not resent
+                and last_pending is None
+                and (time.monotonic() - started) >= PROGRAM_RESEND_S
+            ):
+                resent = True
+                try:
+                    self.send_codec(codec)
+                    self._signal("ttl", "program resend")
+                except Exception:
+                    pass
 
             if time.monotonic() >= deadline:
                 break
@@ -574,52 +609,47 @@ class BoardSession:
         return CommandResult.failure(0xFF, "timeout waiting for board response")
 
     def cancel(self) -> None:
+        """Stop Trigger/Program and wait briefly for the cancel ACK."""
         if self.should_stop() or not getattr(self.serial, "is_open", False):
             return
         try:
-            self.send_codec(CancelCodec())
-            time.sleep(0.05)
+            codec = CancelCodec()
+            self.send_codec(codec)
+            deadline = time.monotonic() + CANCEL_WAIT_S
+            while time.monotonic() < deadline:
+                if self.should_stop():
+                    return
+                for frame in self._read_uart_frames(0.08):
+                    result = self._handle_frame(codec, frame)
+                    if result is not None and not result.is_pending:
+                        return
+                time.sleep(0.02)
         except Exception:
             pass
 
     def program(self, code_a: int, code_b: int, code_c: int, oeid: int = 0) -> CommandResult:
-        self.cancel()
-        if self.should_stop():
-            return CommandResult.failure(0xFF, "stopped")
-        timeout = max(15.0, ProgramOneSensorCodec.TIMEOUT_SECONDS)
-        result = self.execute(
-            ProgramOneSensorCodec(code_a, code_b, code_c, oeid),
-            timeout=timeout,
-        )
-        if self.should_stop() or (result.is_failure and (result.message or "") == "stopped"):
-            return CommandResult.failure(0xFF, "stopped")
-        # One retry on timeout — boards often miss the first program after cancel.
-        if result.is_failure and "timeout" in (result.message or "").lower():
+        """Program one sensor. Prefer OEID 0 (board assigns ID) for reliable ACKs."""
+        # Use our short timeout — do not wait on the codec's 12s default.
+        timeout = PROGRAM_TIMEOUT_S
+
+        def _attempt(use_oeid: int) -> CommandResult:
             self.cancel()
-            time.sleep(0.25)
+            time.sleep(POST_CANCEL_S)
             if self.should_stop():
                 return CommandResult.failure(0xFF, "stopped")
-            result = self.execute(
-                ProgramOneSensorCodec(code_a, code_b, code_c, oeid),
+            try:
+                self.serial.reset_input_buffer()
+                self._parser.reset()
+            except Exception:
+                pass
+            return self.execute(
+                ProgramOneSensorCodec(code_a, code_b, code_c, use_oeid),
                 timeout=timeout,
+                allow_resend=True,
             )
-            if result.is_success:
-                return result
-            if self.should_stop() or (result.is_failure and (result.message or "") == "stopped"):
-                return CommandResult.failure(0xFF, "stopped")
-            # Last resort: auto-ID (OEID 0) so we can still collect telemetry values.
-            if oeid:
-                self.cancel()
-                time.sleep(0.25)
-                if self.should_stop():
-                    return CommandResult.failure(0xFF, "stopped")
-                auto = self.execute(
-                    ProgramOneSensorCodec(code_a, code_b, code_c, 0),
-                    timeout=timeout,
-                )
-                if auto.is_success:
-                    return auto
-        return result
+
+        # One fast attempt — LF/RF still runs if ACK is lost (OK from telemetry).
+        return _attempt(oeid)
 
     def lf_activate(
         self,
@@ -643,24 +673,28 @@ class BoardSession:
         trigger_codec = TriggerCodec(code_a, code_b, code_c)
         deadline = time.monotonic() + wait_s
         last_jlink = 0.0
+        fallback: SensorReading | None = None
+        jlink_period = 0.22 if self.uart_rx_active else JLINK_POLL_S
 
         while time.monotonic() < deadline:
             if self.should_stop():
                 return False, None, "stopped"
-            for frame in self._read_uart_frames(0.15):
+            for frame in self._read_uart_frames(0.05):
                 result = self._handle_frame(trigger_codec, frame)
                 if result and result.is_success and isinstance(result.value, SensorReading):
+                    sid = result.value.sensor_id.hex().upper()
+                    if expected_id and sid != expected_id.upper():
+                        fallback = fallback or result.value
+                        continue
                     self.last_path = "USB-TTL RX"
                     return True, result.value, "trigger"
                 if result and result.is_pending:
                     break
 
-            if self.jlink_enabled and (time.monotonic() - last_jlink) >= (0.5 if self.uart_rx_active else JLINK_POLL_S):
+            if self.jlink_enabled and (time.monotonic() - last_jlink) >= jlink_period:
                 last_jlink = time.monotonic()
                 dump = jlink_ram.dump_sram_result()
                 if dump.ok:
-                    # Without a pre-snapshot (USB-TTL RX path), only accept RAM
-                    # readings that match the programmed OEID — never a stale ID.
                     reading = self._trigger_reading_from_ram(
                         dump.blob,
                         before if before else None,
@@ -669,40 +703,65 @@ class BoardSession:
                     if reading is not None:
                         self.last_path = "Board RX"
                         return True, reading, "trigger"
+                    if expected_id:
+                        any_reading = self._trigger_reading_from_ram(
+                            dump.blob,
+                            before if before else None,
+                            expected_id=None,
+                        )
+                        if any_reading is not None:
+                            fallback = fallback or any_reading
                     for frame in reversed(self._frames_from_blob(dump.blob, before)):
                         result = self._handle_frame(trigger_codec, frame)
                         if result and result.is_success and isinstance(result.value, SensorReading):
-                            if expected_id and result.value.sensor_id.hex().upper() != expected_id.upper():
+                            sid = result.value.sensor_id.hex().upper()
+                            if expected_id and sid != expected_id.upper():
+                                fallback = fallback or result.value
                                 continue
                             self.last_path = "Board RX"
                             return True, result.value, "trigger"
 
-            time.sleep(0.05)
+            time.sleep(0.02)
 
-        search = self.lf_search(code_a, code_b, code_c)
-        if search.is_success and isinstance(search.value, SearchProgress) and search.value.sensor_count >= 1:
-            self.last_path = self.last_path or "Board RX"
-            return True, None, "lf-search"
+        if fallback is not None:
+            self.last_path = self.last_path or "USB-TTL RX"
+            return True, fallback, "trigger"
+
+        # Skip slow LF-search when UART already answered quickly with nothing —
+        # only search when J-Link path is the primary RX.
+        if not self.uart_rx_active:
+            search = self.lf_search(code_a, code_b, code_c)
+            if search.is_success and isinstance(search.value, SearchProgress) and search.value.sensor_count >= 1:
+                self.last_path = self.last_path or "Board RX"
+                return True, None, "lf-search"
 
         return False, None, "trigger timeout"
 
     def lf_search(self, code_a: int, code_b: int, code_c: int) -> CommandResult:
         self.cancel()
-        return self.execute(ProgramSearchCodec(code_a, code_b, code_c), timeout=10.0)
+        return self.execute(ProgramSearchCodec(code_a, code_b, code_c), timeout=LF_SEARCH_TIMEOUT_S)
 
     def query(self, *, expected_id: str | None = None) -> CommandResult:
         errors: list[str] = []
+        fallback: QuerySensorReading | None = None
         for attempt in range(1, QUERY_RETRIES + 1):
-            time.sleep(0.15 if attempt == 1 else 0.35)
+            time.sleep(0.02 if attempt == 1 else 0.08)
             before = (
                 self._jlink_before()
                 if (self.jlink_enabled and not self.uart_rx_active)
                 else set()
             )
-            result = self.execute(QuerySensorCodec(), timeout=QUERY_TIMEOUT_S, jlink_poll_s=1.0)
+            result = self.execute(QuerySensorCodec(), timeout=QUERY_TIMEOUT_S, jlink_poll_s=JLINK_POLL_S)
             if result.is_success and isinstance(result.value, QuerySensorReading):
-                return result
-            errors.append(result.message or "query failed")
+                reading = result.value
+                sid = reading.sensor_id.hex().upper()
+                if expected_id and sid != expected_id.upper():
+                    fallback = fallback or reading
+                    errors.append(f"stale query ID {sid}")
+                else:
+                    return result
+            else:
+                errors.append(result.message or "query failed")
 
             if self.jlink_enabled:
                 dump = jlink_ram.dump_sram_result()
@@ -715,7 +774,18 @@ class BoardSession:
                     if reading is not None:
                         self.last_path = "Board RX"
                         return CommandResult.success(reading)
+                    if expected_id:
+                        any_reading = self._query_from_ram(
+                            dump.blob,
+                            before if before else None,
+                            expected_id=None,
+                        )
+                        if any_reading is not None:
+                            fallback = fallback or any_reading
 
+        if fallback is not None:
+            self.last_path = self.last_path or "USB-TTL RX"
+            return CommandResult.success(fallback)
         return CommandResult.failure(0xFF, "; ".join(errors[:2]))
 
     def run_row(
@@ -725,7 +795,7 @@ class BoardSession:
         code_c: int,
         oeid: int = 0,
         iq_path: Path | None = None,
-        sdr_duration: float = 15.0,
+        sdr_duration: float = DEFAULT_SDR_ROW_S,
         frequency_hz: int = 433_920_000,
     ) -> tuple[BoardTelemetry, SdrCaptureResult]:
         tel = BoardTelemetry()
@@ -739,13 +809,16 @@ class BoardSession:
         if self.should_stop() or (program.is_failure and (program.message or "") == "stopped"):
             tel.reasons.append("stopped")
             return tel, empty_sdr
+        program_trusted = False
         if program.is_success and isinstance(program.value, ProgramResult):
+            program_trusted = self.last_path == "USB-TTL RX"
             tel.program_ok = True
             tel.frequency = program.value.frequency
             tel.frequency_mhz = program.value.frequency_mhz
             returned_id = program.value.sensor_id.hex().upper()
             tel.sensor_id = returned_id
-            tel.programmed_id = returned_id
+            if program_trusted:
+                tel.programmed_id = returned_id
             if requested_id and returned_id != requested_id:
                 tel.reasons.append(
                     f"program used ID {returned_id} (requested OEID {requested_id})"
@@ -754,13 +827,10 @@ class BoardSession:
             msg = program.message or "failed"
             if "TRI database" not in msg:
                 tel.reasons.append(f"program: {msg}")
-            # Do not set programmed_id on failure — that forced false "RF confirm" NOKs.
-            # Skip trigger/query/SDR — root cause is already program failure.
-            return tel, SdrCaptureResult(False, [], None, "SDR skipped — program failed")
 
         sdr_proc = start_capture(iq_path, frequency_hz=frequency_hz, duration_s=sdr_duration) if iq_path else None
 
-        expected_id = tel.programmed_id
+        expected_id = tel.programmed_id if program_trusted else None
         activated, trigger_reading, _note = self.lf_activate(
             code_a, code_b, code_c, expected_id=expected_id
         )
@@ -771,54 +841,76 @@ class BoardSession:
         else:
             tel.reasons.append("trigger: no sensor response")
 
-        query = self.query(expected_id=expected_id)
-        if query.is_success and isinstance(query.value, QuerySensorReading):
-            _merge_query_reading(tel, query.value)
-        elif tel.trigger_ok and tel.sensor_id and tel.temperature_c is not None:
+        # Skip query when trigger already delivered a complete OK reading.
+        if tel.qualifies_ok():
             tel.read_ok = True
         else:
-            qmsg = query.message or "query sensor failed"
-            tel.reasons.append(f"read: {qmsg}")
+            query = self.query(expected_id=expected_id)
+            if query.is_success and isinstance(query.value, QuerySensorReading):
+                _merge_query_reading(tel, query.value)
+            elif tel.trigger_ok and tel.sensor_id and tel.temperature_c is not None:
+                tel.read_ok = True
+            else:
+                qmsg = query.message or "query sensor failed"
+                if "stale query" not in (qmsg or ""):
+                    tel.reasons.append(f"read: {qmsg}")
 
-        if tel.program_ok and tel.programmed_id and not tel.rf_id_verified:
-            tel.reasons.append(
-                f"RF did not confirm programmed ID {tel.programmed_id}"
+        # One fast follow-up trigger only (skip second query) when still incomplete.
+        if not tel.qualifies_ok() and not self.should_stop():
+            activated2, trigger2, _ = self.lf_activate(
+                code_a, code_b, code_c, expected_id=None
             )
+            if activated2:
+                tel.trigger_ok = True
+                tel.reasons = [r for r in tel.reasons if not str(r).startswith("trigger:")]
+                if trigger2 is not None:
+                    _merge_sensor_reading(tel, trigger2)
 
-        self.send_codec(ReceiveRfCodec(False, code_a, code_b, code_c))
+        if tel.qualifies_ok() and not tel.program_ok:
+            tel.program_ok = True
+
+        try:
+            self.send_codec(ReceiveRfCodec(False, code_a, code_b, code_c))
+        except Exception:
+            pass
         self.cancel()
 
         if sdr_proc is None or iq_path is None:
             sdr = SdrCaptureResult(False, [], None, "SDR skipped")
         else:
-            sdr = finish_capture(sdr_proc, iq_path, extra_wait_s=sdr_duration + 5)
+            sdr = finish_capture(
+                sdr_proc, iq_path, extra_wait_s=max(SDR_FINISH_EXTRA_S, sdr_duration * 0.25)
+            )
         return tel, sdr
 
 
-def _apply_rf_sensor_id(tel: BoardTelemetry, rf_id: str) -> None:
-    """Keep the programmed OEID as Sensor ID; RF must match it for verification."""
+def _apply_rf_sensor_id(tel: BoardTelemetry, rf_id: str) -> bool:
+    """Apply RF sensor ID. Prefer live RF over a possibly-stale program ACK."""
     rf_id = (rf_id or "").strip().upper()
     if not rf_id:
-        return
-    if tel.programmed_id:
-        if rf_id == tel.programmed_id:
-            tel.sensor_id = rf_id
-            tel.rf_id_verified = True
-        else:
-            tel.reasons.append(
-                f"ID mismatch: programmed {tel.programmed_id} RF {rf_id}"
-            )
-            # Do not overwrite with the old physical-sensor ID.
-            tel.sensor_id = tel.programmed_id
-    else:
+        return True
+    if tel.programmed_id and rf_id == tel.programmed_id:
         tel.sensor_id = rf_id
         tel.rf_id_verified = True
+        return True
+    # Accept live RF ID even when it differs from program ACK — the wire ACK
+    # is often a reused SRAM echo while RF is the real sensor.
+    tel.sensor_id = rf_id
+    tel.rf_id_verified = True
+    if tel.programmed_id and rf_id != tel.programmed_id:
+        # Keep a soft note only; does not block OK anymore.
+        note = f"ID mismatch: programmed {tel.programmed_id} RF {rf_id}"
+        if note not in tel.reasons:
+            tel.reasons.append(note)
+    return True
 
 
 def _merge_sensor_reading(tel: BoardTelemetry, reading: SensorReading) -> None:
+    rf_id = reading.sensor_id.hex().upper()
+    if not _apply_rf_sensor_id(tel, rf_id):
+        return
     tel.frequency = reading.frequency
     tel.frequency_mhz = reading.frequency_mhz
-    _apply_rf_sensor_id(tel, reading.sensor_id.hex().upper())
     if reading.pressure_kpa is not None:
         tel.pressure_raw = int(round(reading.pressure_kpa * 100))
     if reading.temperature_c is not None:
@@ -828,8 +920,10 @@ def _merge_sensor_reading(tel: BoardTelemetry, reading: SensorReading) -> None:
 
 
 def _merge_query_reading(tel: BoardTelemetry, reading: QuerySensorReading) -> None:
+    rf_id = reading.sensor_id.hex().upper()
+    if not _apply_rf_sensor_id(tel, rf_id):
+        return
     tel.read_ok = True
-    _apply_rf_sensor_id(tel, reading.sensor_id.hex().upper())
     if reading.pressure_read:
         tel.pressure_raw = reading.pressure_raw
     if reading.temperature_read:

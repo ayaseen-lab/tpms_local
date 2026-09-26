@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,8 @@ from config import (
   get_rtl433_exe,
   rtl433_decoder_enablement,
   rtl433_full_decoder_flags,
+  rtl433_tpms_decoder_flags,
+  rtl433_tpms_protocol_ids,
 )
 
 try:
@@ -82,6 +85,18 @@ class TelemetryReading:
       return "OK" if self.battery_ok else "LOW"
     return "—"
 
+  # Cache TPMS protocol ids so per-packet checks stay cheap under high RF load.
+  _TPMS_PROTOCOL_IDS: Optional[set[int]] = None
+
+  @classmethod
+  def _tpms_ids(cls) -> set[int]:
+    if cls._TPMS_PROTOCOL_IDS is None:
+      try:
+        cls._TPMS_PROTOCOL_IDS = set(rtl433_tpms_protocol_ids())
+      except Exception:
+        cls._TPMS_PROTOCOL_IDS = set()
+    return cls._TPMS_PROTOCOL_IDS
+
   @property
   def is_tpms(self) -> bool:
     """Tire TPMS only — do not treat weather/oil/etc. as TPMS just because they report pressure."""
@@ -89,8 +104,14 @@ class TelemetryReading:
     m = (self.model or "").strip().upper()
     if t == "TPMS":
       return True
-    # Some decoders put TPMS in the model string instead of type.
-    return "TPMS" in m
+    if "TPMS" in m:
+      return True
+    if self.protocol_id is not None:
+      try:
+        return int(self.protocol_id) in self._tpms_ids()
+      except Exception:
+        pass
+    return False
 
   def has_sensor_id(self) -> bool:
     sid = (self.sensor_id or "").strip()
@@ -186,6 +207,35 @@ def _parse_pressure(data: Dict[str, Any]) -> tuple[Optional[float], Optional[flo
   return pressure_psi, pressure_hpa
 
 
+def _normalize_sensor_id(value: Any) -> str:
+  """Canonical 8-digit hex Sensor ID so SDR matches Board OEID formatting."""
+  if value is None:
+    return ""
+  if isinstance(value, bool):
+    return ""
+  if isinstance(value, int):
+    if value < 0:
+      return ""
+    return f"{value & 0xFFFFFFFF:08X}"
+  text = str(value).strip().replace(" ", "")
+  if not text:
+    return ""
+  lower = text.lower()
+  if lower in {"none", "unknown", "n/a", "na", "—", "-"}:
+    return ""
+  if lower.startswith("0x"):
+    text = text[2:]
+  if text.isdigit():
+    try:
+      return f"{int(text) & 0xFFFFFFFF:08X}"
+    except ValueError:
+      return text.upper()
+  try:
+    return f"{int(text, 16) & 0xFFFFFFFF:08X}"
+  except ValueError:
+    return text.upper()
+
+
 def parse_rtl433_json(line: str) -> Optional[TelemetryReading]:
   line = line.strip()
   if not line or not line.startswith("{"):
@@ -199,10 +249,12 @@ def parse_rtl433_json(line: str) -> Optional[TelemetryReading]:
   sensor_type = str(data.get("type", ""))
 
   sid = data.get("id")
-  if sid is not None:
-    sensor_id = str(sid)
-  else:
-    sensor_id = str(data.get("id_str", model))
+  if sid is None:
+    sid = data.get("ID") or data.get("sensor_id") or data.get("id_str")
+  sensor_id = _normalize_sensor_id(sid)
+  if not sensor_id and sid is not None:
+    # Fall back to raw string when value is not a numeric ID.
+    sensor_id = str(sid).strip()
 
   pressure_psi, pressure_hpa = _parse_pressure(data)
   temp_c = _first_float(data, "temperature_C", "temperature_c")
@@ -274,6 +326,8 @@ class Rtl433Runner:
     self.tpms_only = True
     self.iq_path: Optional[str] = None
     self._tpms_decode_count = 0
+    self._skip_log_count = 0
+    self._raw_log_count = 0
 
   @property
   def is_running(self) -> bool:
@@ -318,14 +372,18 @@ class Rtl433Runner:
       cmd.extend(["-p", str(ppm)])
 
     # Same sample rate for live decode and IQ write so offline replay matches live counts.
-    sample_rate = int(preset.get("sample_rate") or 1000000)
+    sample_rate = int(preset.get("sample_rate") or 1_000_000)
     cmd.extend(["-s", str(sample_rate)])
 
-    # Stronger FSK detection — default 250k + plain auto often under-decodes vs Board LF.
+    # Stronger FSK detection without the heaviest estimator — faster under dense RF.
     cmd.extend(["-Y", "autolevel", "-Y", "minmax"])
 
-    # Enable every decoder in the current rtl_433 library (queried from -R help).
-    cmd.extend(rtl433_full_decoder_flags(exe))
+    # TPMS-only mode: enable only TPMS decoders so the CPU keeps up and fewer
+    # unique Sensor IDs are dropped. Full catalog when TPMS-only is off.
+    if self.tpms_only:
+      cmd.extend(rtl433_tpms_decoder_flags(exe))
+    else:
+      cmd.extend(rtl433_full_decoder_flags(exe))
 
     if iq_path:
       path = Path(iq_path)
@@ -342,7 +400,7 @@ class Rtl433Runner:
     ppm: int = 0,
     device_index: int = 0,
     units: str = "customary",
-    record_iq: bool = True,
+    record_iq: bool = False,
   ) -> bool:
     if self._running:
       self.stop()
@@ -364,8 +422,10 @@ class Rtl433Runner:
     cmd = self.build_command(
       preset_name, custom_freq_mhz, gain, ppm, device_index, units, iq_path=iq_path
     )
-    self.on_log(rtl433_decoder_enablement(exe))
+    self.on_log(rtl433_decoder_enablement(exe, tpms_only=self.tpms_only))
     self.on_log(f"Starting: {compact_rtl433_command(cmd)}")
+    if not record_iq:
+      self.on_log("IQ recording OFF (recommended for max unique Sensor IDs)")
     if iq_path:
       self.on_log(
         f"IQ recording ON @ full sample rate → {iq_path} "
@@ -390,6 +450,30 @@ class Rtl433Runner:
       if os.name == "nt":
         popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
       self._process = subprocess.Popen(cmd, **popen_kwargs)
+      # Catch immediate device-busy / crash before the UI shows RUNNING.
+      time.sleep(0.15)
+      if self._process.poll() is not None:
+        code = self._process.returncode
+        err_tail = ""
+        try:
+          err_tail = (self._process.stderr.read() or "").strip()
+        except Exception:
+          pass
+        detail = err_tail.splitlines()[-1] if err_tail else f"exit code {code}"
+        if "usb_open" in err_tail.lower() or code in (1, 2):
+          detail = (
+            f"{detail} — dongle busy or not found. Close other SDR apps "
+            "(only one TPMS Suite window) and unplug/replug the RTL-SDR."
+          )
+        self.on_log(f"ERROR: rtl_433 exited immediately: {detail}")
+        if err_tail:
+          for line in err_tail.splitlines()[-8:]:
+            self.on_log(line)
+        self._process = None
+        self._running = False
+        self.on_state_change(False)
+        return False
+
       self._running = True
       self.on_state_change(True)
 
@@ -405,6 +489,45 @@ class Rtl433Runner:
       self.on_state_change(False)
       return False
 
+  @staticmethod
+  def _stderr_worth_logging(text: str) -> bool:
+    """Keep real problems; drop rtl_433 banner/status that looks like 'errors' in the UI."""
+    low = text.lower()
+    # Always surface device / open / decode failures.
+    if any(
+      key in low
+      for key in (
+        "usb_open",
+        "failed",
+        "error:",
+        "fatal",
+        "no supported devices",
+        "busy",
+        "cannot open",
+        "not found",
+        "permission",
+      )
+    ):
+      return True
+    # Ignore normal startup chatter (includes the '-F log … errors in the console' tip).
+    noise_prefixes = (
+      "rtl_433 version",
+      "use \"-f log\"",
+      "use '-f log'",
+      "found rafael",
+      "exact sample rate",
+      "allocating ",
+      "tuned to ",
+      "sampling at ",
+      "detaching kernel driver",
+    )
+    if any(low.startswith(p) for p in noise_prefixes):
+      return False
+    if "messages, warnings, and errors" in low:
+      return False
+    # Other stderr is usually useful (tuner notes, dwindling buffers, etc.) — keep briefly.
+    return True
+
   def _read_stderr(self) -> None:
     proc = self._process
     if not proc or not proc.stderr:
@@ -419,8 +542,13 @@ class Rtl433Runner:
             break
           continue
         text = line.strip()
-        if text:
-          self.on_log(text)
+        if text and self._stderr_worth_logging(text):
+          # Mark real failures so the Activity Terminal paints them red.
+          level_hint = text
+          if any(k in text.lower() for k in ("usb_open", "failed", "error", "fatal", "cannot open")):
+            if not text.upper().startswith("ERROR"):
+              level_hint = f"ERROR: {text}"
+          self.on_log(level_hint)
     except Exception:
       pass
 
@@ -442,11 +570,16 @@ class Rtl433Runner:
           continue
         reading = parse_rtl433_json(line)
         if reading is None:
-          self.on_log(f"RAW  {stripped}")
+          self._raw_log_count += 1
+          # Throttle noisy RAW lines so the UI thread stays responsive.
+          if self._raw_log_count <= 3 or self._raw_log_count % 50 == 0:
+            self.on_log(f"RAW  {stripped[:160]}")
           continue
         if self.tpms_only and not reading.is_tpms:
-          kind = (reading.sensor_type or "unknown").strip() or "unknown"
-          self.on_log(f"SKIP {reading.model} (non-TPMS type={kind})")
+          self._skip_log_count += 1
+          if self._skip_log_count <= 3 or self._skip_log_count % 100 == 0:
+            kind = (reading.sensor_type or "unknown").strip() or "unknown"
+            self.on_log(f"SKIP {reading.display_decoder} (non-TPMS type={kind})")
           continue
         self._tpms_decode_count += 1
         self.on_reading(reading)

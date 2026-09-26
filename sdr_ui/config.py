@@ -129,6 +129,18 @@ def format_rtl433_decoder(
   return "—"
 
 
+def rtl433_tpms_protocol_ids(exe: Path | None = None) -> tuple[int, ...]:
+  """Protocol ids whose library name contains ``TPMS``."""
+  catalog = rtl433_protocol_catalog(exe)
+  if catalog:
+    return tuple(sorted(pid for pid, name in catalog.items() if "TPMS" in name.upper()))
+  # Fallback catalog snapshot (rtl_433 25.12).
+  return (
+    59, 60, 82, 88, 89, 90, 95, 110, 123, 140, 156, 168, 180, 186,
+    201, 203, 208, 212, 225, 226, 241, 248, 252, 257, 275,
+  )
+
+
 def rtl433_full_decoder_flags(exe: Path | None = None) -> list[str]:
   """CLI flags that enable every decoder in the current rtl_433 library.
 
@@ -149,10 +161,25 @@ def rtl433_full_decoder_flags(exe: Path | None = None) -> list[str]:
   return flags
 
 
-def rtl433_decoder_enablement(exe: Path | None = None) -> str:
+def rtl433_tpms_decoder_flags(exe: Path | None = None) -> list[str]:
+  """CLI flags that enable only TPMS library decoders (faster, fewer dropped packets)."""
+  ids = rtl433_tpms_protocol_ids(exe)
+  flags: list[str] = []
+  for proto_id in ids:
+    flags.extend(["-R", str(proto_id)])
+  return flags
+
+
+def rtl433_decoder_enablement(exe: Path | None = None, *, tpms_only: bool = False) -> str:
   """Short log line: how many current-library decoders are being enabled."""
   catalog, disabled = _rtl433_protocol_info(exe)
   n_disabled = len(disabled)
+  if tpms_only:
+    tpms_ids = rtl433_tpms_protocol_ids(exe)
+    return (
+      f"rtl_433 {RTL_433_VERSION} library: enabling {len(tpms_ids)} TPMS decoders "
+      f"(TPMS-only mode for max unique Sensor IDs)"
+    )
   if catalog:
     return (
       f"rtl_433 {RTL_433_VERSION} library: enabling all {len(catalog)} decoders "
@@ -295,42 +322,45 @@ def get_config_file() -> Path:
 
 
 # Frequency presets for TPMS and ISM bands
-# 1 Msps + autolevel/minmax is recommended for FSK TPMS (default 250k often misses packets).
+# 1 Msps already spans ~±500 kHz, so stay locked on center — hopping away from
+# 433.92/315.00 drops unique TPMS IDs on dense benches.
+_DEFAULT_SAMPLE_RATE = 1_000_000
+
 FREQUENCY_PRESETS = {
   "315 MHz — US / Canada TPMS": {
     "frequencies": ["315M"],
-    "description": "North American tire pressure sensors (315 MHz ISM)",
-    "sample_rate": 1000000,
+    "description": "North American tire pressure sensors (315 MHz ISM, locked center)",
+    "sample_rate": _DEFAULT_SAMPLE_RATE,
     "hop_interval": None,
   },
   "433 MHz — EU / Asia TPMS": {
     "frequencies": ["433.92M"],
-    "description": "European and Asian TPMS (433.92 MHz ISM)",
-    "sample_rate": 1000000,
+    "description": "European and Asian TPMS (433.92 MHz locked — max unique IDs)",
+    "sample_rate": _DEFAULT_SAMPLE_RATE,
     "hop_interval": None,
   },
   "868 MHz — EU SRD": {
     "frequencies": ["868M"],
     "description": "European short-range devices band",
-    "sample_rate": 1000000,
+    "sample_rate": _DEFAULT_SAMPLE_RATE,
     "hop_interval": None,
   },
   "345 MHz — US TPMS (alt)": {
     "frequencies": ["345M"],
-    "description": "Alternate US TPMS band",
-    "sample_rate": 1000000,
+    "description": "Alternate US TPMS band (locked center)",
+    "sample_rate": _DEFAULT_SAMPLE_RATE,
     "hop_interval": None,
   },
   "Dual — 315 + 433 MHz": {
     "frequencies": ["315M", "433.92M"],
-    "description": "Hop between US and EU TPMS bands",
-    "sample_rate": 1000000,
-    "hop_interval": 8,
+    "description": "Hop between US and EU TPMS bands (use only if both bands needed)",
+    "sample_rate": _DEFAULT_SAMPLE_RATE,
+    "hop_interval": 2,
   },
   "Custom": {
     "frequencies": ["433.92M"],
     "description": "User-defined center frequency",
-    "sample_rate": 1000000,
+    "sample_rate": _DEFAULT_SAMPLE_RATE,
     "hop_interval": None,
     "custom": True,
   },

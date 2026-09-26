@@ -8,9 +8,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .board import BoardSession, BoardTelemetry, generate_unique_oeid
+from .board import BoardSession, BoardTelemetry
 from .compare import best_packet, compare
-from .excel_io import append_manual_code_row, copy_workbook, create_blank_database, load_output, parse_code, write_row
+from .excel_io import (
+    append_manual_code_row,
+    copy_workbook,
+    create_blank_database,
+    load_output,
+    parse_code,
+    save_workbook,
+    write_row,
+)
 from .paths import app_root, results_dir
 from .results_db import clear_all, completed_rows, connect, counts, upsert
 from .rtl433 import SdrCaptureResult, parse_freq_hz
@@ -20,9 +28,20 @@ ROOT = app_root()
 _RESULTS = results_dir()
 SPEC_XLSX = ROOT / "docs" / "specifications" / "Hamaton_database_20260126_1305.xlsx"
 OUT_XLSX = _RESULTS / "TPMS_Board_Validation_Results.xlsx"
+# Active workbook path for this process — may switch to a *_live_*.xlsx if Excel locks OUT_XLSX.
+ACTIVE_OUT_XLSX = OUT_XLSX
 DB_PATH = _RESULTS / "bench.sqlite"
 IQ_DIR = _RESULTS / "iq"
 PDF_PATH = _RESULTS / "TPMS_Board_Validation_Report.pdf"
+
+
+def get_out_xlsx() -> Path:
+    return ACTIVE_OUT_XLSX
+
+
+def _set_out_xlsx(path: Path) -> None:
+    global ACTIVE_OUT_XLSX
+    ACTIVE_OUT_XLSX = path
 
 
 @dataclass
@@ -64,6 +83,7 @@ class ProgressEvent:
     message: str = ""
     sdr_compare: str = ""
     sdr_reason: str = ""
+    rtl433_decoder: str = ""
     pressure: str = ""
     battery_percentage: str = ""
     duration_s: float | None = None
@@ -84,7 +104,7 @@ class BenchRunner:
         source_xlsx: Path | None = None,
         resume: bool = True,
         skip_sdr: bool = True,
-        sdr_timeout: float = 15.0,
+        sdr_timeout: float = 6.0,
         extra_codes: list[ManualCode] | None = None,
         on_progress: ProgressCb | None = None,
     ) -> None:
@@ -104,7 +124,6 @@ class BenchRunner:
         self._pause_event = threading.Event()
         self._pause_event.set()
         self.session: BoardSession | None = None
-        self._used_oeids: set[int] = set()
 
     def pause(self) -> None:
         """Pause the bench loop between rows."""
@@ -162,11 +181,23 @@ class BenchRunner:
             raise FileNotFoundError("Select an Excel database or enter custom CODE A / B / C.")
 
         if has_excel:
-            copy_workbook(Path(self.source_xlsx), OUT_XLSX, force=not self.resume)
+            out_path = copy_workbook(Path(self.source_xlsx), OUT_XLSX, force=not self.resume)
         else:
-            create_blank_database(OUT_XLSX)
+            out_path = create_blank_database(OUT_XLSX)
+        _set_out_xlsx(out_path)
+        if out_path != OUT_XLSX:
+            self._emit(
+                ProgressEvent(
+                    kind="comm",
+                    path="excel",
+                    message=(
+                        f"Results Excel is locked (close it in Excel if you can). "
+                        f"Writing to: {out_path.name}"
+                    ),
+                )
+            )
 
-        wb, ws, cols = load_output(OUT_XLSX)
+        wb, ws, cols = load_output(out_path)
         if self.extra_codes and not self.resume:
             for extra in self.extra_codes:
                 append_manual_code_row(
@@ -177,7 +208,17 @@ class BenchRunner:
                     code_c=extra.code_c,
                     label=extra.label,
                 )
-            wb.save(OUT_XLSX)
+            saved = save_workbook(wb, out_path)
+            if saved != out_path:
+                _set_out_xlsx(saved)
+                out_path = saved
+                self._emit(
+                    ProgressEvent(
+                        kind="comm",
+                        path="excel",
+                        message=f"Results Excel locked — switched to {saved.name}",
+                    )
+                )
         db = connect(DB_PATH)
         if not self.resume:
             clear_all(db)
@@ -323,7 +364,9 @@ class BenchRunner:
 
                 started = time.monotonic()
                 iq_path = None if self.skip_sdr else (IQ_DIR / f"row_{excel_row}.cu8")
-                oeid = generate_unique_oeid(self._used_oeids)
+                # OEID 0 = board auto-assigns Sensor ID (reliable ACK). Forced
+                # random OEIDs caused widespread program timeouts / ID mismatches.
+                oeid = 0
                 freq_hz = parse_freq_hz(freq_cell)
                 tel, sdr = session.run_row(
                     code_a,
@@ -368,7 +411,8 @@ class BenchRunner:
             except Exception:
                 pass
             try:
-                wb.save(OUT_XLSX)
+                saved = save_workbook(wb, get_out_xlsx())
+                _set_out_xlsx(saved)
             except Exception:
                 pass
             db.close()
@@ -433,6 +477,7 @@ class BenchRunner:
                 message=extra,
                 sdr_compare=str(values.get("SDR compare") or ""),
                 sdr_reason=str(values.get("SDR reason") or ""),
+                rtl433_decoder=str(values.get("rtl_433 Decoder") or ""),
                 pressure=str(values.get("Pressure") or ""),
                 battery_percentage=str(values.get("Battery percentage") or ""),
                 duration_s=duration_s,
@@ -544,4 +589,5 @@ def _commit(ws, cols, excel_row, values, record, db, wb) -> None:
         }
     )
     upsert(db, record)
-    wb.save(OUT_XLSX)
+    saved = save_workbook(wb, get_out_xlsx())
+    _set_out_xlsx(saved)
