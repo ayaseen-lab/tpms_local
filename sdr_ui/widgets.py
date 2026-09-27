@@ -1,5 +1,6 @@
 """Light-theme dashboard widgets for TPMS telemetry."""
 
+import tkinter as tk
 import customtkinter as ctk
 from typing import Dict, List, Optional
 
@@ -38,23 +39,35 @@ def pressure_color(psi: Optional[float]) -> str:
 
 
 class StatCard(ctk.CTkFrame):
-  """Dashboard statistic tile (HAMATON-style)."""
+  """Title on the left, number on the right — same row, always visible."""
 
   def __init__(self, master, title: str, value: str, accent: str, bg: str, compact: bool = False, **kwargs):
-    super().__init__(master, fg_color=bg, corner_radius=8, border_width=1, border_color=COLOR_BORDER, **kwargs)
-    pad_x = 10 if compact else 14
-    title_pad = (6, 0) if compact else (12, 2)
-    value_pad = (0, 6) if compact else (0, 12)
+    kwargs.setdefault("fg_color", bg)
+    kwargs.setdefault("corner_radius", 8)
+    kwargs.setdefault("border_width", 1)
+    kwargs.setdefault("border_color", COLOR_BORDER)
+    super().__init__(master, **kwargs)
+    row = ctk.CTkFrame(self, fg_color="transparent")
+    row.pack(fill="x", padx=12, pady=10)
     ctk.CTkLabel(
-      self, text=title, font=ctk.CTkFont(size=9 if compact else 10, weight="bold"), text_color=accent, anchor="w"
-    ).pack(anchor="w", padx=pad_x, pady=title_pad)
+      row,
+      text=title,
+      font=ctk.CTkFont(size=11, weight="bold"),
+      text_color=accent,
+      anchor="w",
+    ).pack(side="left")
     self.value_label = ctk.CTkLabel(
-      self, text=value, font=ctk.CTkFont(size=18 if compact else 26, weight="bold"), text_color=COLOR_TEXT, anchor="w"
+      row,
+      text=str(value),
+      font=ctk.CTkFont(size=20, weight="bold"),
+      text_color="#102226",
+      anchor="e",
+      height=28,
     )
-    self.value_label.pack(anchor="w", padx=pad_x, pady=value_pad)
+    self.value_label.pack(side="right")
 
   def set_value(self, value: str):
-    self.value_label.configure(text=value)
+    self.value_label.configure(text=str(value), text_color="#102226")
 
 
 class LiveTelemetryBar(ctk.CTkFrame):

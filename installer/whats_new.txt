@@ -1,29 +1,20 @@
-TPMS Suite 1.3.0
+TPMS Suite 2.0
 
-What's new since 1.2.0
-----------------------
-• All 284 rtl_433 25.12 library decoders enabled (queried from the bundled
-  binary — including the 31 that rtl_433 leaves off by default)
-• Decoder method labeled in SDR, Board, and comparative Excel/PDF reports
-• IQ / URH tab — open captured IQ in Universal Radio Hacker and Decode → Excel
-• Jansite TY02S [123] and Nissan TPMS [248] included with the rest of the
-  25 TPMS decoders in this library
-• Board hardware check: J-Link is optional — USB-TTL RX alone can pass
-• COM port list shows device names and prefers CH340 / USB-SERIAL over
-  J-Link CDC UART and Bluetooth virtual ports
-• IQ replay defaults: 1024k sample rate, 432.92 MHz FSK carrier
-
-Also in this line
------------------
-• Record IQ — full-rate CU8 kept after stop for IQ / URH offline replay
-• Prefer rtl_433-rtlsdr.exe for Nooelec / RTL-SDR dongles
-• Stronger FSK detection (autolevel + minmax) and 1 Msps live decode
-• Comparative Board vs SDR Excel / PDF for the current session
+What's new
+----------
+• Default Hamaton full catalog (data/Hamaton_database_*.xlsx)
+• Board USB-TTL RX first — J-Link / JTAG is optional (Windows client path)
+• SDR OK only from stock rtl_433 library telemetry (no flex / no guessing)
+• Board waits for live SDR compare before the next ABC codes
+• Related-ID matching between Board and rtl_433
+• Windows: Start TPMS Suite.bat, Setup_Windows.bat, Build_Windows_Installer.bat,
+  and TPMS_Suite.exe launcher
 
 Notes
 -----
-Comparative reports use the current session only (Board rows + SDR sensors in memory).
-SEGGER J-Link is not bundled. Install J-Link separately if you need SRAM capture.
-IQ files are written under results\iq when Record IQ is enabled.
-Universal Radio Hacker is optional; install URH on the PC to use Open in URH.
-Use the CH340/USB-TTL COM port for the Board tab (not J-Link CDC UART).
+Windows clients: plug USB board + RTL-SDR, run Setup_Windows.bat once, then
+Start TPMS Suite.bat (or TPMS_Suite.exe). J-Link is not required when the
+board replies on USB RX.
+
+To build the full packaged installer on a Windows PC:
+  Build_Windows_Installer.bat

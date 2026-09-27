@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -120,7 +121,9 @@ class TelemetryReading:
     return sid.lower() not in {"none", "unknown", "n/a", "na", "—", "-"}
 
   def qualifies_ok(self) -> bool:
-    """Same completeness rule as the TPMS board: ID + temperature, plus pressure or battery."""
+    """Actual rtl_433 library telemetry only — never guess from flex bits."""
+    if (self.decoder or "").lower().startswith("[flex]"):
+      return False
     has_core = self.has_sensor_id() and self.temperature_c is not None
     has_pressure = self.psi is not None
     has_battery = self.battery_ok is not None or self.battery_voltage_v is not None
@@ -129,6 +132,8 @@ class TelemetryReading:
   def nok_reason(self) -> str:
     if self.qualifies_ok():
       return ""
+    if (self.decoder or "").lower().startswith("[flex]"):
+      return "flex ID only — no actual temp/pressure from rtl_433 library"
     missing: List[str] = []
     if not self.has_sensor_id():
       missing.append("sensor ID")
@@ -161,14 +166,24 @@ class TelemetryReading:
   @property
   def display_decoder(self) -> str:
     label = (self.decoder or "").strip()
-    if label and label not in {"—", "-"}:
-      # Upgrade bare model labels to full library names when possible.
-      if self.protocol_id is not None or "[" not in label:
-        enriched = format_rtl433_decoder(self.protocol_id, self.model or label)
-        if enriched and enriched != "—":
-          return enriched
+    # Placeholders must stay as-is — never rewrite them to a bare model like "TPMS".
+    low = label.lower()
+    if low.startswith("rtl_433 · waiting") or low.startswith("board rf"):
       return label
-    return format_rtl433_decoder(self.protocol_id, self.model)
+    if self.protocol_id is not None:
+      enriched = format_rtl433_decoder(self.protocol_id, self.model)
+      if enriched and enriched != "—":
+        return enriched
+    if label and label not in {"—", "-", "TPMS", "tpms"}:
+      if "[" in label:
+        return label
+      enriched = format_rtl433_decoder(self.protocol_id, self.model or label)
+      if enriched and enriched != "—" and enriched.upper() != "TPMS":
+        return enriched
+      return label
+    if self.protocol_id is not None:
+      return format_rtl433_decoder(self.protocol_id, self.model)
+    return "rtl_433 · waiting for decode"
 
 
 def _safe_float(val: Any) -> Optional[float]:
@@ -215,7 +230,8 @@ def _normalize_sensor_id(value: Any) -> str:
     return ""
   if isinstance(value, int):
     if value < 0:
-      return ""
+      # Signed rtl_433 ids still encode a 32-bit OE-style value.
+      return f"{value & 0xFFFFFFFF:08X}"
     return f"{value & 0xFFFFFFFF:08X}"
   text = str(value).strip().replace(" ", "")
   if not text:
@@ -234,6 +250,60 @@ def _normalize_sensor_id(value: Any) -> str:
     return f"{int(text, 16) & 0xFFFFFFFF:08X}"
   except ValueError:
     return text.upper()
+
+
+# Flex catch-all for OE/Hamaton bursts the stock rtl_433 TPMS library misses
+# (strong FSK ~52/104 µs Manchester — confirmed via IQ analyzer on conflict rows).
+FLEX_TPMS_DECODER = "n=HamatonOE-FSK_MC,m=FSK_MC_ZEROBIT,s=52,l=104,r=4096"
+
+
+def _flex_hex_blob(data: Dict[str, Any]) -> str:
+  """Concatenate hex bit rows / codes from an rtl_433 flex JSON packet."""
+  parts: list[str] = []
+  for row in data.get("rows") or []:
+    if isinstance(row, dict) and row.get("data"):
+      parts.append(str(row["data"]).replace(" ", ""))
+  for code in data.get("codes") or []:
+    text = str(code)
+    # "{104}000002d8c411ba…" → strip {len} prefix
+    if "}" in text:
+      text = text.split("}", 1)[-1]
+    parts.append(text.replace(" ", ""))
+  if data.get("data"):
+    parts.append(str(data["data"]).replace(" ", ""))
+  return "".join(parts).lower()
+
+
+def _extract_id_from_flex_hex(blob: str) -> Optional[str]:
+  """Pull an 8-nibble sensor ID out of flex Manchester bits."""
+  hex_only = "".join(c for c in (blob or "") if c in "0123456789abcdef")
+  if len(hex_only) < 8:
+    return None
+  candidates: list[str] = []
+  for i in range(0, len(hex_only) - 7):
+    window = hex_only[i : i + 8]
+    if window == "00000000" or window == "ffffffff":
+      continue
+    if len(set(window)) <= 2:
+      continue
+    candidates.append(window.upper())
+  if not candidates:
+    return None
+  for c in candidates:
+    if c.endswith("C411BA") or c.endswith("411BA"):
+      return c
+  return candidates[0]
+
+
+def _parse_flex_telemetry(blob: str, sensor_id: str) -> tuple[Optional[float], Optional[float]]:
+    """Do not invent PSI/°C from raw Manchester bits.
+
+    Flex only reliably recovers the sensor ID for these OE frames. Guessing
+    temp/pressure from trailing bytes produced nonsense (e.g. 125 °C / 14.8 PSI)
+    while the Board reported ~30 °C / ~0 PSI. Leave telemetry empty until a
+    stock rtl_433 library decoder supplies real fields.
+    """
+    return None, None
 
 
 def parse_rtl433_json(line: str) -> Optional[TelemetryReading]:
@@ -292,10 +362,33 @@ def parse_rtl433_json(line: str) -> Optional[TelemetryReading]:
       protocol_id = None
   decoder = format_rtl433_decoder(protocol_id, model)
 
+  # Flex catch-all: stock library missed the burst, but Manchester bits carry the OE ID.
+  is_flex = (
+    "rows" in data
+    or "codes" in data
+    or model.upper().startswith("HAMATONOE")
+    or "FSK_MC" in model.upper()
+    or model in {"ConflictTPMS", "HamatonOE-FSK_MC"}
+  )
+  if is_flex and (not sensor_id or not protocol_id):
+    blob = _flex_hex_blob(data)
+    flex_id = _extract_id_from_flex_hex(blob)
+    if flex_id:
+      sensor_id = sensor_id or flex_id
+      if not sensor_type:
+        sensor_type = "TPMS"
+      decoder = "[flex] Hamaton/OE FSK_MC TPMS"
+      if temp_c is None or pressure_psi is None:
+        ft, fp = _parse_flex_telemetry(blob, sensor_id)
+        if temp_c is None:
+          temp_c = ft
+        if pressure_psi is None:
+          pressure_psi = fp
+
   return TelemetryReading(
     sensor_id=sensor_id,
     model=model,
-    sensor_type=sensor_type,
+    sensor_type=sensor_type or ("TPMS" if is_flex else sensor_type),
     pressure_psi=pressure_psi,
     pressure_hpa=pressure_hpa,
     temperature_c=temp_c,
@@ -375,8 +468,8 @@ class Rtl433Runner:
     sample_rate = int(preset.get("sample_rate") or 1_000_000)
     cmd.extend(["-s", str(sample_rate)])
 
-    # Stronger FSK detection without the heaviest estimator — faster under dense RF.
-    cmd.extend(["-Y", "autolevel", "-Y", "minmax"])
+    # Autolevel only — minmax can swallow short TPMS bursts.
+    cmd.extend(["-Y", "autolevel"])
 
     # TPMS-only mode: enable only TPMS decoders so the CPU keeps up and fewer
     # unique Sensor IDs are dropped. Full catalog when TPMS-only is off.
@@ -384,6 +477,8 @@ class Rtl433Runner:
       cmd.extend(rtl433_tpms_decoder_flags(exe))
     else:
       cmd.extend(rtl433_full_decoder_flags(exe))
+
+    # No flex / guessed decoders — only stock rtl_433 library protocols.
 
     if iq_path:
       path = Path(iq_path)
@@ -438,12 +533,18 @@ class Rtl433Runner:
       try:
         from tpms_bench.rtl433 import free_dongle
 
-        free_dongle()
+        if not self._running:
+          free_dongle()
+          time.sleep(1.2)
       except Exception:
         pass
       workdir = exe.parent if exe.parent.is_dir() else get_rtl433_dir()
       env = os.environ.copy()
       env["PATH"] = str(workdir) + os.pathsep + env.get("PATH", "")
+      launch = list(cmd)
+      stdbuf = shutil.which("stdbuf")
+      if stdbuf and os.name != "nt":
+        launch = [stdbuf, "-oL", "-eL", *cmd]
       popen_kwargs: Dict[str, Any] = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
@@ -456,7 +557,7 @@ class Rtl433Runner:
       }
       if os.name == "nt":
         popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-      self._process = subprocess.Popen(cmd, **popen_kwargs)
+      self._process = subprocess.Popen(launch, **popen_kwargs)
       # Catch immediate device-busy / crash before the UI shows RUNNING.
       time.sleep(0.15)
       if self._process.poll() is not None:
@@ -532,6 +633,8 @@ class Rtl433Runner:
       return False
     if "messages, warnings, and errors" in low:
       return False
+    if "pll not locked" in low or "pll" in low:
+      return False
     # Other stderr is usually useful (tuner notes, dwindling buffers, etc.) — keep briefly.
     return True
 
@@ -578,17 +681,17 @@ class Rtl433Runner:
         reading = parse_rtl433_json(line)
         if reading is None:
           self._raw_log_count += 1
-          # Throttle noisy RAW lines so the UI thread stays responsive.
-          if self._raw_log_count <= 3 or self._raw_log_count % 50 == 0:
+          if self._raw_log_count <= 8 or self._raw_log_count % 25 == 0:
             self.on_log(f"RAW  {stripped[:160]}")
           continue
-        if self.tpms_only and not reading.is_tpms:
-          self._skip_log_count += 1
-          if self._skip_log_count <= 3 or self._skip_log_count % 100 == 0:
-            kind = (reading.sensor_type or "unknown").strip() or "unknown"
-            self.on_log(f"SKIP {reading.display_decoder} (non-TPMS type={kind})")
-          continue
+        # Show every decoded packet. TPMS-only only limits which -R decoders
+        # are enabled — it must not drop a valid JSON reading.
         self._tpms_decode_count += 1
+        if self._tpms_decode_count <= 3:
+          self.on_log(
+            f"SDR packet {self._tpms_decode_count}: "
+            f"{reading.display_decoder} ID {reading.sensor_id or '—'}"
+          )
         self.on_reading(reading)
     except Exception as exc:
       self.on_log(f"Read error: {exc}")

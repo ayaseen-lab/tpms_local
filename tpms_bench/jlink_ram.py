@@ -6,9 +6,12 @@ Do not halt the CPU during LF/RF — savebin on a running target.
 
 from __future__ import annotations
 
+import atexit
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,12 +34,26 @@ def _hidden_kwargs() -> dict:
     return {"creationflags": flags, "startupinfo": startupinfo}
 
 RAM_ADDR = 0x20002000
-RAM_LEN = 0x10000
+# Board replies occupy roughly 0x1000..0x1500 of the window; 16 KB keeps ample
+# headroom while cutting per-poll transfer time to a quarter of a 64 KB dump.
+RAM_LEN = 0x4000
 RAM_BIN = RESULTS / "nrf_uart_window.bin"
 JLINK_SCRIPT = RESULTS / "jlink_dump_window.jlink"
 JLINK_LOG = RESULTS / "jlink_last.log"
 
 _JLINK_EXE: str | None = None
+
+JLINK_DEVICE = "NRF52840_XXAA"
+JLINK_INTERFACE = "SWD"
+JLINK_SPEED_KHZ = 4000
+
+# One long-lived J-Link Commander beats respawning it per poll: reconnecting
+# SWD for every reply costs ~0.4 s, which pushes program ACKs past their budget
+# when USB-TTL RX is absent and SRAM is the only reply path.
+_SESSION: subprocess.Popen | None = None
+_SESSION_LOCK = threading.Lock()
+_DUMP_TIMEOUT_S = 4.0
+_CONNECT_TIMEOUT_S = 12.0
 
 
 @dataclass
@@ -89,11 +106,164 @@ def _jlink_available() -> bool:
     return path.exists() or shutil.which(jlink_exe()) is not None
 
 
+def jlink_available() -> bool:
+    """True when SEGGER J-Link Commander is installed (probe may still be absent)."""
+    return _jlink_available()
+
+
 def dump_sram(addr: int = RAM_ADDR, length: int = RAM_LEN) -> bytes:
     return dump_sram_result(addr, length).blob
 
 
+def _session_alive() -> bool:
+    return _SESSION is not None and _SESSION.poll() is None
+
+
+def close_session() -> None:
+    """Drop the long-lived J-Link connection so other tools can claim the probe."""
+    global _SESSION
+    proc, _SESSION = _SESSION, None
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None and proc.stdin is not None:
+            proc.stdin.write("exit\n")
+            proc.stdin.flush()
+    except (OSError, ValueError):
+        pass
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    except Exception:
+        pass
+
+
+atexit.register(close_session)
+
+
+def _session_start() -> bool:
+    """Launch J-Link Commander once and connect to the target.
+
+    Device, interface and speed must be command-line arguments: under
+    -AutoConnect the Commander prompts for them, and piped stdin lines would be
+    swallowed as answers instead of running as commands.
+    """
+    global _SESSION
+    close_session()
+    try:
+        proc = subprocess.Popen(
+            [
+                jlink_exe(),
+                "-device",
+                JLINK_DEVICE,
+                "-if",
+                JLINK_INTERFACE,
+                "-speed",
+                str(JLINK_SPEED_KHZ),
+                "-AutoConnect",
+                "1",
+                "-NoGui",
+                "1",
+                "-ExitOnError",
+                "0",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            **_hidden_kwargs(),
+        )
+    except (OSError, ValueError):
+        return False
+    if proc.stdin is None:
+        proc.kill()
+        return False
+    _SESSION = proc
+    return True
+
+
+def _cleanup_stale_dumps() -> None:
+    """Drop leftover unique dump files so a late savebin cannot look fresh."""
+    try:
+        for path in RESULTS.glob("nrf_uart_*.bin"):
+            if path.resolve() == RAM_BIN.resolve():
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _session_dump(addr: int, length: int, timeout_s: float) -> bytes | None:
+    """savebin over the open session. None means fall back to a one-shot dump.
+
+    Each poll writes a unique file. Reusing one path made a late previous
+    savebin look like the new dump, so program ACKs were skipped as leftover.
+    """
+    proc = _SESSION
+    if proc is None or proc.poll() is not None or proc.stdin is None:
+        return None
+    dest = (RESULTS / f"nrf_uart_{time.time_ns()}.bin").resolve()
+    try:
+        proc.stdin.write(f'savebin "{dest}", 0x{addr:X}, 0x{length:X}\n')
+        proc.stdin.flush()
+    except (OSError, ValueError):
+        return None
+
+    # Poll the output file rather than stdout: J-Link Commander block-buffers
+    # when its stdout is a pipe, so the "O.K." marker can lag by seconds.
+    deadline = time.monotonic() + timeout_s
+    blob: bytes | None = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        try:
+            if dest.stat().st_size >= length:
+                data = dest.read_bytes()
+                if len(data) >= length:
+                    blob = data
+                    break
+        except OSError:
+            pass
+        time.sleep(0.01)
+    try:
+        dest.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if blob is None:
+        return None
+    try:
+        RAM_BIN.write_bytes(blob)
+    except OSError:
+        pass
+    return blob
+
+
 def dump_sram_result(addr: int = RAM_ADDR, length: int = RAM_LEN) -> DumpResult:
+    if not _jlink_available():
+        return DumpResult(b"", False, "Board SRAM reader not available on this PC")
+
+    with _SESSION_LOCK:
+        _cleanup_stale_dumps()
+        fresh = not _session_alive()
+        if fresh and not _session_start():
+            return _oneshot_dump_result(addr, length)
+        # A just-connected session still has to finish SWD bring-up.
+        timeout_s = _CONNECT_TIMEOUT_S if fresh else _DUMP_TIMEOUT_S
+        blob = _session_dump(addr, length, timeout_s)
+        if blob is None:
+            close_session()
+            return _oneshot_dump_result(addr, length)
+
+    if len(blob) < 256:
+        return DumpResult(blob, False, "Board SRAM read too small")
+    return DumpResult(blob, True, "ok")
+
+
+def _oneshot_dump_result(addr: int = RAM_ADDR, length: int = RAM_LEN) -> DumpResult:
     if not _jlink_available():
         return DumpResult(b"", False, "Board SRAM reader not available on this PC")
 
@@ -101,9 +271,9 @@ def dump_sram_result(addr: int = RAM_ADDR, length: int = RAM_LEN) -> DumpResult:
     JLINK_SCRIPT.write_text(
         "\n".join(
             [
-                "si SWD",
-                "speed 4000",
-                "device NRF52840_XXAA",
+                f"si {JLINK_INTERFACE}",
+                f"speed {JLINK_SPEED_KHZ}",
+                f"device {JLINK_DEVICE}",
                 "connect",
                 f'savebin "{ram_path}", 0x{addr:X}, 0x{length:X}',
                 "exit",

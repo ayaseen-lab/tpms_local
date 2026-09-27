@@ -1,0 +1,32 @@
+name: TPMS Suite Windows Installer
+on:
+  push:
+    branches: [TPMS2.0, main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\build_installer.ps1
+
+      - name: Upload Setup.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: TPMS_Suite_Setup_2.0.0
+          path: dist_installer/TPMS_Suite_Setup_*.exe
+
+      - name: Upload onedir app
+        uses: actions/upload-artifact@v4
+        with:
+          name: TPMS_Suite_onedir
+          path: dist/TPMS_Suite/

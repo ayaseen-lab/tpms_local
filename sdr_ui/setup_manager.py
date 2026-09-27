@@ -178,8 +178,7 @@ class SetupManager:
       combined = (probe.stdout or "") + (probe.stderr or "")
       if "No supported devices found" in combined or "Failed to open" in combined:
         return False, "RTL-SDR not detected. Install driver with Zadig (WinUSB)."
-      if "PLL not locked" in combined and "Using device" not in combined:
-        return False, "SDR found but tuner error. Try another USB port or antenna."
+      # R82xx "PLL not locked" is normal chatter — do not fail the probe.
       return True, version_line
     except subprocess.TimeoutExpired:
       return True, "SDR probe timed out (device may still work)."

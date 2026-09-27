@@ -1,89 +1,118 @@
-"""Shared suite colour palette (navy / teal / cyan)."""
+"""Fyrqom palette — from fyrqom.com: #101011 charcoal, #00d3bf teal, #fbfbfb paper."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import customtkinter as ctk
+
+_ASSETS = Path(__file__).resolve().parents[1] / "assets"
+FYRQOM_LOGOTYPE = _ASSETS / "fyrqom_logotype_white.png"
+FYRQOM_MARK = _ASSETS / "fyrqom_logo.png"
+
+COMPANY_NAME = "Fyrqom"
+PRODUCT_NAME = "Fyrqom TPMS Suite"
+UI_FONT = "Helvetica Neue" if sys.platform == "darwin" else "Segoe UI"
+
+# Brand (fyrqom.com)
+FYRQOM_BLACK = "#101011"
+FYRQOM_TEAL = "#00d3bf"
+FYRQOM_PAPER = "#FBFBFB"
+FYRQOM_DARK = "#1F1F1F"
+FYRQOM_MID = "#353535"
 
 # Header
-COLOR_HEADER_BG = "#0B1C2C"
-COLOR_HEADER_TEXT = "#ffffff"
-COLOR_HEADER_SUB = "#7DD3FC"
-COLOR_HEADER_ACCENT = "#22B8E6"
-COLOR_TAB_IDLE = "#334155"
-COLOR_TAB_IDLE_HOVER = "#1E293B"
+COLOR_HEADER_BG = FYRQOM_BLACK
+COLOR_HEADER_TEXT = FYRQOM_PAPER
+COLOR_HEADER_SUB = "#A8B5B3"
+COLOR_HEADER_ACCENT = FYRQOM_TEAL
+COLOR_TAB_BAR = "#ECEFEE"
+COLOR_TAB_IDLE = "#ECEFEE"
+COLOR_TAB_IDLE_HOVER = "#DDE6E4"
+COLOR_TAB_IDLE_TEXT = "#3A4548"
+COLOR_TAB_ACTIVE = "#FFFFFF"
+COLOR_TAB_ACTIVE_TEXT = "#007A6E"
 
 # Surfaces
-COLOR_BG = "#F4F7FB"
-COLOR_BG_CARD = "#ffffff"
-COLOR_BG_PANEL = "#F8FAFC"
-COLOR_BORDER = "#E2E8F0"
-COLOR_ROW_OK = "#ECFDF5"
-COLOR_ROW_ALT = "#F8FAFC"
+COLOR_BG = "#F3F5F4"
+COLOR_BG_CARD = FYRQOM_PAPER
+COLOR_BG_PANEL = "#F7F9F8"
+COLOR_BORDER = "#D0D9D7"
+COLOR_ROW_OK = "#E4F9F5"
+COLOR_ROW_ALT = "#F5F7F7"
 
 # Text
-COLOR_TEXT = "#1E293B"
-COLOR_TEXT_DIM = "#64748B"
-COLOR_TEXT_MUTED = "#94A3B8"
+COLOR_TEXT = FYRQOM_BLACK
+COLOR_TEXT_DIM = "#4A5557"
+COLOR_TEXT_MUTED = "#7A8785"
 
-# Status accents
-COLOR_CYAN = "#0891B2"
-COLOR_CYAN_BG = "#E0F2FE"
-COLOR_BLUE = COLOR_HEADER_ACCENT
-COLOR_BLUE_BG = COLOR_CYAN_BG
-COLOR_GREEN = "#0F9F6E"
-COLOR_GREEN_BG = "#ECFDF5"
-COLOR_RED = "#DC2626"
-COLOR_RED_BG = "#FEF2F2"
-COLOR_ORANGE = "#EA580C"
-COLOR_ORANGE_BG = "#FFF7ED"
-# Hamaton suite uses navy / teal / cyan — keep these aliases so leftover
-# "purple" tokens still land on-brand instead of the old violet.
+# Status
+COLOR_CYAN = FYRQOM_TEAL
+COLOR_CYAN_BG = "#E4F9F5"
+COLOR_BLUE = "#1A8FA8"
+COLOR_BLUE_BG = "#E7F3F7"
+COLOR_GREEN = "#149A72"
+COLOR_GREEN_BG = "#E6F6EF"
+COLOR_RED = "#C24A44"
+COLOR_RED_BG = "#FBECEC"
+COLOR_ORANGE = "#C46A2B"
+COLOR_ORANGE_BG = "#F8EFE6"
 COLOR_PURPLE = COLOR_CYAN
 COLOR_PURPLE_BG = COLOR_CYAN_BG
 
-# Controls
-COLOR_BTN_PRIMARY = "#0D9B7A"
-COLOR_BTN_PRIMARY_HOVER = "#0B7F64"
-COLOR_BTN_SECONDARY = "#334155"
-COLOR_BTN_SECONDARY_HOVER = "#1E293B"
-COLOR_BTN_STOP = "#DC2626"
-COLOR_BTN_STOP_HOVER = "#B91C1C"
-COLOR_BTN_PAUSE = "#EA580C"
-COLOR_BTN_PAUSE_HOVER = "#C2410C"
-COLOR_BTN_EXPORT = "#1A365D"
-COLOR_BTN_EXPORT_HOVER = "#12263A"
+# Controls — brand teal primary (dark label for contrast on bright teal)
+COLOR_BTN_PRIMARY = FYRQOM_TEAL
+COLOR_BTN_PRIMARY_HOVER = "#00B8A8"
+COLOR_BTN_PRIMARY_TEXT = FYRQOM_BLACK
+COLOR_BTN_SECONDARY = FYRQOM_MID
+COLOR_BTN_SECONDARY_HOVER = FYRQOM_DARK
+COLOR_BTN_STOP = "#C24A44"
+COLOR_BTN_STOP_HOVER = "#A33C37"
+COLOR_BTN_PAUSE = "#C46A2B"
+COLOR_BTN_PAUSE_HOVER = "#A35722"
+COLOR_BTN_EXPORT = FYRQOM_DARK
+COLOR_BTN_EXPORT_HOVER = FYRQOM_BLACK
+COLOR_BTN_FULL = "#1A6B7A"
+COLOR_BTN_FULL_HOVER = "#145560"
 
-# Legacy aliases used by pressure helpers
 COLOR_ACCENT = COLOR_HEADER_ACCENT
 COLOR_OK = COLOR_GREEN
 COLOR_DANGER = COLOR_RED
 COLOR_WARN = COLOR_ORANGE
-COLOR_BG_DARK = COLOR_BG
+COLOR_BG_DARK = COLOR_HEADER_BG
+
+
+def ui_font(size: int = 13, weight: str = "normal") -> ctk.CTkFont:
+    return ctk.CTkFont(family=UI_FONT, size=size, weight=weight)
 
 
 def combo_colors() -> dict:
-  # Light field + bright cyan arrow button so the chevron stays readable
-  return {
-    "fg_color": COLOR_BG_CARD,
-    "border_color": COLOR_BORDER,
-    "button_color": COLOR_HEADER_ACCENT,
-    "button_hover_color": "#0891B2",
-    "dropdown_fg_color": COLOR_BG_CARD,
-    "dropdown_hover_color": COLOR_CYAN_BG,
-    "dropdown_text_color": COLOR_TEXT,
-    "text_color": COLOR_TEXT,
-  }
+    return {
+        "fg_color": COLOR_BG_CARD,
+        "border_color": COLOR_BORDER,
+        "button_color": COLOR_BTN_PRIMARY,
+        "button_hover_color": COLOR_BTN_PRIMARY_HOVER,
+        "dropdown_fg_color": COLOR_BG_CARD,
+        "dropdown_hover_color": COLOR_CYAN_BG,
+        "dropdown_text_color": COLOR_TEXT,
+        "text_color": COLOR_TEXT,
+    }
 
 
 def entry_colors() -> dict:
-  return {
-    "fg_color": COLOR_BG_CARD,
-    "border_color": COLOR_BORDER,
-    "text_color": COLOR_TEXT,
-    "placeholder_text_color": COLOR_TEXT_MUTED,
-  }
+    return {
+        "fg_color": COLOR_BG_CARD,
+        "border_color": COLOR_BORDER,
+        "text_color": COLOR_TEXT,
+        "placeholder_text_color": COLOR_TEXT_MUTED,
+    }
 
 
 def switch_colors() -> dict:
-  return {
-    "fg_color": COLOR_BORDER,
-    "progress_color": COLOR_BTN_PRIMARY,
-    "button_color": COLOR_BG_CARD,
-    "button_hover_color": COLOR_CYAN_BG,
-  }
+    return {
+        "fg_color": COLOR_BORDER,
+        "progress_color": COLOR_BTN_PRIMARY,
+        "button_color": COLOR_BG_CARD,
+        "button_hover_color": COLOR_CYAN_BG,
+    }

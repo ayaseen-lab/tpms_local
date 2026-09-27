@@ -22,7 +22,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from tpms_bench.compare import norm_id
+from tpms_bench.compare import ids_related, norm_id
 
 REPORT_KIND = "Comparative Analysis Report"
 REPORT_SUBTITLE = (
@@ -37,15 +37,15 @@ REPORT_DISCLAIMER = (
     "first packet for that ID until OK (or until the latest packet if still NOK)."
 )
 
-HEADER_FILL = PatternFill("solid", fgColor="1A365D")
+HEADER_FILL = PatternFill("solid", fgColor="101011")
 HEADER_FONT = Font(bold=True, color="FFFFFF")
 OK_FILL = PatternFill("solid", fgColor="ECFDF5")
 LOW_FILL = PatternFill("solid", fgColor="FEF2F2")
 WARN_FILL = PatternFill("solid", fgColor="FFF7ED")
 NEUTRAL_FILL = PatternFill("solid", fgColor="F8FAFC")
 
-NAVY = colors.HexColor("#0A1F33")
-ORANGE = colors.HexColor("#D9782A")
+NAVY = colors.HexColor("#101011")
+ORANGE = colors.HexColor("#00D3BF")
 LIGHT = colors.HexColor("#EEF1F5")
 OK_BG = colors.HexColor("#E6F6EC")
 FAIL_BG = colors.HexColor("#FEE2E2")
@@ -128,6 +128,8 @@ class ComparisonResult:
     sdr_only: int = 0
     board_rows: int = 0
     sdr_ids: int = 0
+    # Board rows that had an SDR side (agree + disagree) — not unique sensor IDs.
+    sdr_matches: int = 0
     generated_at: datetime = field(default_factory=datetime.now)
 
     @property
@@ -226,9 +228,17 @@ def build_comparison(
         key = norm_id(str(sid or ""))
         if not key:
             continue
+        protocol = _sdr_protocol(reading)
+        # Ignore Board-mirrored placeholders — only real rtl_433 library rows.
+        if "waiting for decode" in protocol.lower() or protocol.lower().startswith("board rf"):
+            continue
+        if not protocol.startswith("["):
+            # Still allow typed OK/NOK snapshots without a library tag.
+            model = str(getattr(reading, "model", "") or "")
+            if not model or model.upper() == "TPMS":
+                continue
         result, reason = _sdr_side(reading)
         display = str(getattr(reading, "sensor_id", None) or sid or key)
-        protocol = _sdr_protocol(reading)
         acquire = _sdr_acquire_seconds(reading)
         sdr_map[key] = (display, result, reason, protocol, acquire)
 
@@ -252,13 +262,24 @@ def build_comparison(
         sdr_reason = ""
         sdr_time = None
         sdr_decoder = ""
+        sdr_key = ""
         if key:
             board_seen_keys.add(key)
-            if key in sdr_map:
-                display_sdr, sdr_res, sdr_reason, sdr_decoder, sdr_time = sdr_map[key]
+            hit = sdr_map.get(key)
+            if hit is None:
+                for cand_key, cand in sdr_map.items():
+                    if ids_related(sid, cand[0]) or ids_related(sid, cand_key):
+                        hit = cand
+                        sdr_key = cand_key
+                        break
+            else:
+                sdr_key = key
+            if hit is not None:
+                display_sdr, sdr_res, sdr_reason, sdr_decoder, sdr_time = hit
                 display = display or display_sdr
+                board_seen_keys.add(sdr_key)
 
-        if key and key in sdr_map:
+        if key and sdr_res:
             seen_by = "Both"
             verdict = "AGREE" if board_res == sdr_res else "DISAGREE"
         else:
@@ -307,6 +328,7 @@ def build_comparison(
             )
         )
 
+    out.sdr_matches = out.agree + out.disagree
     return out
 
 

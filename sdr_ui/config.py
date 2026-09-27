@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-APP_NAME = "TPMS Suite"
+APP_NAME = "Fyrqom TPMS Suite"
 APP_VERSION = "1.3.0"
 APP_VENDOR = "Xynovix"
 

@@ -1,4 +1,4 @@
-"""Detect USB-TTL, J-Link (SWD), and RTL-SDR so the suite uses the right path for each."""
+"""Detect USB-TTL, optional J-Link (SWD), and RTL-SDR so the suite picks the right path."""
 
 from __future__ import annotations
 
@@ -26,19 +26,23 @@ class HardwareTrio:
     sdr: PathStatus
 
     @property
+    def board_ready(self) -> bool:
+        """Board path is ready when USB-TTL is present. J-Link is optional."""
+        return self.usb_ttl.ok
+
+    @property
     def all_ok(self) -> bool:
-        return self.usb_ttl.ok and self.jlink.ok and self.sdr.ok
+        # J-Link is NOT required: Windows client boards reply on USB-TTL RX.
+        return self.usb_ttl.ok and self.sdr.ok
 
     def summary_lines(self) -> list[str]:
-        def mark(p: PathStatus) -> str:
-            return "OK" if p.ok else "MISSING"
-
+        jlink_mark = "OK" if self.jlink.ok else "OPTIONAL"
         return [
-            f"USB-TTL  [{mark(self.usb_ttl)}]  {self.usb_ttl.label}"
+            f"USB-TTL  [{'OK' if self.usb_ttl.ok else 'MISSING'}]  {self.usb_ttl.label}"
             + (f" — {self.usb_ttl.detail}" if self.usb_ttl.detail else ""),
-            f"J-Link   [{mark(self.jlink)}]  {self.jlink.label}"
+            f"J-Link   [{jlink_mark}]  {self.jlink.label}"
             + (f" — {self.jlink.detail}" if self.jlink.detail else ""),
-            f"SDR      [{mark(self.sdr)}]  {self.sdr.label}"
+            f"SDR      [{'OK' if self.sdr.ok else 'MISSING'}]  {self.sdr.label}"
             + (f" — {self.sdr.detail}" if self.sdr.detail else ""),
         ]
 
@@ -49,11 +53,27 @@ def _ttl_status() -> PathStatus:
         text = label.upper()
         if any(h in text for h in ("JLINK", "SEGGER", "BLUETOOTH")):
             continue
-        if any(h in text for h in ("USB SERIAL", "USB-SERIAL", "CH340", "CP210", "FTDI", "SLAB", "UART")):
+        if any(
+            h in text
+            for h in (
+                "USB SERIAL",
+                "USB-SERIAL",
+                "CH340",
+                "CP210",
+                "FTDI",
+                "SLAB",
+                "UART",
+                "SILICON LABS",
+                "PROLIFIC",
+            )
+        ):
             return PathStatus(True, device, label.split("—", 1)[-1].strip() if "—" in label else "USB-TTL")
         if device.startswith("/dev/cu.usbserial"):
             return PathStatus(True, device, "USB-TTL serial")
-    # Fallback: first non-J-Link cu.* port
+        # Windows client: any non-J-Link COM port is a candidate board adapter.
+        if device.upper().startswith("COM"):
+            return PathStatus(True, device, label.split("—", 1)[-1].strip() if "—" in label else "USB serial")
+    # Fallback: first non-J-Link cu.* / COM port
     for device, label in choices:
         if "JLINK" in label.upper() or "SEGGER" in label.upper():
             continue
@@ -63,6 +83,7 @@ def _ttl_status() -> PathStatus:
 
 
 def _jlink_status() -> PathStatus:
+    """J-Link is optional. Missing probe is not a hardware failure."""
     usb = False
     for p in serial.tools.list_ports.comports():
         text = f"{p.device} {p.description} {p.manufacturer} {p.hwid}".upper()
@@ -72,6 +93,12 @@ def _jlink_status() -> PathStatus:
     try:
         from . import jlink_ram
 
+        if not jlink_ram.jlink_available():
+            return PathStatus(
+                False,
+                "—",
+                "optional — not required when board USB RX works",
+            )
         exe = jlink_ram.jlink_exe()
         dump = jlink_ram.dump_sram_result()
         if dump.ok:
@@ -80,13 +107,15 @@ def _jlink_status() -> PathStatus:
             return PathStatus(
                 False,
                 exe,
-                dump.message or "USB present but SWD not connected to nRF52840",
+                "optional — USB present but SWD not connected (USB RX path still OK)",
             )
-        return PathStatus(False, exe if exe else "JLinkExe", dump.message or "not found")
+        return PathStatus(
+            False,
+            exe if exe else "JLinkExe",
+            "optional — not required when board USB RX works",
+        )
     except Exception as exc:
-        if usb:
-            return PathStatus(False, "J-Link USB", str(exc))
-        return PathStatus(False, "—", str(exc))
+        return PathStatus(False, "—", f"optional — {exc}")
 
 
 def _sdr_status() -> PathStatus:
@@ -130,7 +159,7 @@ def _sdr_status() -> PathStatus:
         except Exception as exc:
             return PathStatus(False, path, str(exc))
 
-    # Fall back to app resolver.
+    # Fall back to app resolver (Windows bundled vendor rtl_433).
     try:
         from config import get_rtl433_exe
 
@@ -143,7 +172,7 @@ def _sdr_status() -> PathStatus:
 
 
 def check_hardware_trio() -> HardwareTrio:
-    """Probe USB-TTL (board TX), J-Link SWD (board RX fallback), and RTL-SDR."""
+    """Probe USB-TTL (required), J-Link (optional fallback), and RTL-SDR."""
     return HardwareTrio(usb_ttl=_ttl_status(), jlink=_jlink_status(), sdr=_sdr_status())
 
 

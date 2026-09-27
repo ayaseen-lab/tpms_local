@@ -73,6 +73,13 @@ def clear_all(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def clear_from_row(conn: sqlite3.Connection, excel_row: int) -> int:
+    """Drop saved results from excel_row onward so a chunk can be retested."""
+    cur = conn.execute("DELETE FROM runs WHERE excel_row >= ?", (int(excel_row),))
+    conn.commit()
+    return int(cur.rowcount or 0)
+
+
 def fetch_all(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
     return list(

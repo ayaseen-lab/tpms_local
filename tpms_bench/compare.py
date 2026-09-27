@@ -22,20 +22,73 @@ def norm_id(value: str | None) -> str:
 _norm_id = norm_id
 
 
+def related_ids(value: str | None) -> set[str]:
+    """Board OEID and rtl_433 often disagree by bit-shift; keep a family of candidates."""
+    raw = str(value or "").replace(" ", "").replace("0x", "").replace("0X", "").upper()
+    if not raw or raw in {"NA", "N/A", "NONE", "-", "—"}:
+        return set()
+    out: set[str] = {raw, norm_id(raw)}
+    try:
+        num = int(raw, 16) & 0xFFFFFFFF
+    except ValueError:
+        return {x for x in out if x}
+    for shift in range(0, 8):
+        out.add(f"{(num << shift) & 0xFFFFFFFF:08X}")
+        out.add(f"{(num >> shift) & 0xFFFFFFFF:08X}")
+    out.add(f"{num & 0x0FFFFFFF:08X}")
+    out.add(f"{num & 0x00FFFFFF:08X}")
+    out.add(f"{(num << 4) & 0xFFFFFFFF:08X}")
+    out.add(f"{(num >> 4) & 0xFFFFFFFF:08X}")
+    return {norm_id(x) for x in out if x}
+
+
+def ids_related(a: str | None, b: str | None) -> bool:
+    """True when two IDs are the same sensor under different rtl_433 / Board views."""
+    left = str(a or "").replace(" ", "").replace("0x", "").replace("0X", "").upper()
+    right = str(b or "").replace(" ", "").replace("0x", "").replace("0X", "").upper()
+    if not left or not right:
+        return False
+    if related_ids(left) & related_ids(right):
+        return True
+    # Shared hex tail — Board OEID often drops/changes high nibbles vs OTA
+    # (e.g. Board 004211BA vs rtl/flex D8C411BA → both end in 11BA).
+    for n in (6, 5, 4):
+        if len(left) >= n and len(right) >= n and left[-n:] == right[-n:]:
+            return True
+    # Low 16/24-bit equality on parsed ints (high byte OE/protocol prefix differs).
+    try:
+        la = int(left, 16) & 0xFFFFFFFF
+        rb = int(right, 16) & 0xFFFFFFFF
+    except ValueError:
+        return False
+    if (la & 0xFFFF) == (rb & 0xFFFF) and (la & 0xFFFF) != 0:
+        return True
+    if (la & 0xFFFFFF) == (rb & 0xFFFFFF) and (la & 0xFFFFFF) != 0:
+        return True
+    return False
+
+
 def best_packet(capture: SdrCaptureResult, expected_id: str | None) -> SdrPacket | None:
     if not capture.packets:
         return None
     want = norm_id(expected_id)
-    for packet in capture.packets:
-        if want and norm_id(packet.sensor_id) == want:
-            return packet
+    if want:
+        for packet in capture.packets:
+            if norm_id(packet.sensor_id) == want:
+                return packet
+        for packet in capture.packets:
+            if ids_related(expected_id, packet.sensor_id):
+                return packet
     return capture.packets[0]
 
 
 def packet_result(packet: SdrPacket | None) -> tuple[str, str]:
-    """Map an SDR packet to OK/NOK using the same completeness rule as the SDR UI."""
+    """Map an SDR packet to OK/NOK — actual telemetry only, never flex/ID guesses."""
     if packet is None:
         return "NOK", "SDR did not decode matching ID"
+    proto = (packet.protocol or "").strip().lower()
+    if proto.startswith("[flex]") or "waiting for" in proto:
+        return "NOK", "flex/ID guess only — no actual rtl_433 library reading"
     sid = (packet.sensor_id or "").strip()
     if not sid or sid.lower() in {"none", "unknown", "n/a", "na", "-", "—"}:
         return "NOK", "missing sensor ID"
@@ -43,6 +96,12 @@ def packet_result(packet: SdrPacket | None) -> tuple[str, str]:
     has_pressure = packet.pressure is not None
     has_battery = packet.battery is not None and str(packet.battery).strip() != ""
     if sid and has_temp and (has_pressure or has_battery):
+        # Library protocol id required when present in the label.
+        label = (packet.protocol or "").strip()
+        if label.startswith("[") and "]" in label:
+            mid = label[1 : label.index("]")].strip()
+            if mid.lower() == "flex" or not mid.isdigit():
+                return "NOK", "not a stock rtl_433 library decoder"
         return "OK", ""
     missing: list[str] = []
     if not has_temp:
@@ -68,16 +127,28 @@ def compare(board: BoardTelemetry, capture: SdrCaptureResult) -> tuple[str, str]
     b_ok, b_reason = board_result(board)
 
     if not capture.available:
-        return "FAIL", capture.error or "SDR unavailable"
+        return "na", capture.error or "SDR unavailable"
     if capture.error and not capture.packets:
-        return "FAIL", capture.error
+        err = capture.error or ""
+        low = err.lower()
+        # Explicit post-Board wait timeout → SDR FAIL (Board may still be OK).
+        if "sdr fail" in low or "no rtl_433" in low or "decode timeout" in low:
+            return "FAIL", err
+        # Live Receiver still warming up after a replug — do not fail the row.
+        if "no packets" in low and "warming" in low:
+            return "na", err
+        if "has no sensors yet" in low:
+            return "na", err
+        return "FAIL", err or "SDR heard no rtl_433 decode"
 
     packet = best_packet(capture, board.sensor_id)
     if packet is None:
         return "FAIL", f"DISAGREE: board={b_ok} sdr=NOK (no TPMS packet decoded)"
 
     if board.sensor_id and packet.sensor_id:
-        if norm_id(board.sensor_id) != norm_id(packet.sensor_id):
+        if norm_id(board.sensor_id) != norm_id(packet.sensor_id) and not ids_related(
+            board.sensor_id, packet.sensor_id
+        ):
             return (
                 "FAIL",
                 f"DISAGREE: ID mismatch board={board.sensor_id} sdr={packet.sensor_id}",

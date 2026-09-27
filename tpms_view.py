@@ -31,6 +31,7 @@ from themes import (
     COLOR_BTN_PAUSE_HOVER,
     COLOR_BTN_PRIMARY,
     COLOR_BTN_PRIMARY_HOVER,
+    COLOR_BTN_PRIMARY_TEXT,
     COLOR_BTN_SECONDARY,
     COLOR_BTN_SECONDARY_HOVER,
     COLOR_BTN_STOP,
@@ -51,37 +52,47 @@ from themes import (
     entry_colors,
 )
 from tpms_bench.excel_io import parse_code, stamp_board_report_info
+from tpms_bench.paths import app_root
 from tpms_bench.report import build_pdf
-from tpms_bench.runner import OUT_XLSX, BenchRunner, ManualCode, ProgressEvent, get_out_xlsx, reset_session_db
+from tpms_bench.runner import OUT_XLSX, SPEC_XLSX, BenchRunner, ManualCode, ProgressEvent, get_out_xlsx, reset_session_db
 from tpms_bench.uart import default_port, find_serial_ports, port_device
+from charts import ResultCharts
 from widgets import StatCard
 
-CODE_A_BG = "#E0F2FE"
-CODE_A_FG = "#0369A1"
-CODE_B_BG = "#FEF3C7"
-CODE_B_FG = "#B45309"
-CODE_C_BG = "#CCFBF1"
-CODE_C_FG = "#0F766E"
-TELEMETRY_BG = "#ECFDF5"
-TELEMETRY_FG = "#059669"
+CODE_A_BG = "#E7F4F7"
+CODE_A_FG = "#1B5F70"
+CODE_B_BG = "#F8EFE6"
+CODE_B_FG = "#8A4A1C"
+CODE_C_BG = "#E8F7F4"
+CODE_C_FG = "#14685E"
+TELEMETRY_BG = "#E7F6EF"
+TELEMETRY_FG = "#1A8F6E"
 LED_IDLE = "#64748B"
 LED_TTL_ON = "#34D399"
 LED_JLINK_ON = "#FBBF24"
 
-# Hamaton database preselected on startup when it is present.
-DEFAULT_HAMATON_XLSX = Path(
-    "/Users/mr.macbook/Downloads/hamaton-sdk-python-fix-uart-transport-timing"
-    "/Hamaton_database_20260126_1305.xlsx"
-)
+# In-repo Hamaton catalog — always loaded from data/ (tracked in git).
+DEFAULT_HAMATON_XLSX = SPEC_XLSX if SPEC_XLSX.is_file() else (app_root() / "data" / "Hamaton_database_20260126_1305.xlsx")
 
 
 class TpmsView(ctk.CTkFrame):
     """Board validation UI. Switching away from this frame does not stop the bench."""
 
-    def __init__(self, master, on_status_change: Optional[Callable[[bool, str], None]] = None, **kwargs):
+    def __init__(
+        self,
+        master,
+        on_status_change: Optional[Callable[[bool, str], None]] = None,
+        on_chunk_complete: Optional[Callable[[str], None]] = None,
+        chunk_var: Optional[tk.StringVar] = None,
+        **kwargs,
+    ):
         kwargs.setdefault("fg_color", COLOR_BG)
         super().__init__(master, **kwargs)
         self.on_status_change = on_status_change or (lambda _running, _label: None)
+        self.on_chunk_complete = on_chunk_complete or (lambda _msg: None)
+        self.on_board_rf: Callable | None = None
+        self.on_sdr_finalize: Callable | None = None
+        self.chunk_var = chunk_var or tk.StringVar(value="100")
 
         self.queue: queue.Queue[ProgressEvent] = queue.Queue()
         self.runner: BenchRunner | None = None
@@ -105,7 +116,9 @@ class TpmsView(ctk.CTkFrame):
         self._autoload_default_excel()
         self.after(150, self._drain)
         self.after(80, self._animate_badge)
+        self.after(900, self._poll_live_sdr)
         self._notify_status()
+        self.live_sdr_get = None
         if restored:
             self.after(
                 250,
@@ -140,7 +153,7 @@ class TpmsView(ctk.CTkFrame):
         )
         style.map(
             "Combined.Treeview.Heading",
-            background=[("active", "#12263A")],
+            background=[("active", "#2C3538")],
             foreground=[("active", "#ffffff")],
         )
         style.map(
@@ -177,7 +190,7 @@ class TpmsView(ctk.CTkFrame):
         ).pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.ttl_led = ctk.CTkLabel(footer, text="● TTL", font=ctk.CTkFont(size=10, weight="bold"), text_color=LED_IDLE)
         self.ttl_led.pack(side="right", padx=(0, 4))
-        self.rx_led = ctk.CTkLabel(footer, text="● Board", font=ctk.CTkFont(size=10, weight="bold"), text_color=LED_IDLE)
+        self.rx_led = ctk.CTkLabel(footer, text="● Board RX", font=ctk.CTkFont(size=10, weight="bold"), text_color=LED_IDLE)
         self.rx_led.pack(side="right", padx=(8, 4))
 
         results = tk.Frame(self, bg=COLOR_BG, highlightbackground=COLOR_BORDER, highlightthickness=1)
@@ -261,7 +274,7 @@ class TpmsView(ctk.CTkFrame):
 
         title_row = ctk.CTkFrame(top_inner, fg_color="transparent")
         title_row.pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(title_row, text="TPMS Board", font=ctk.CTkFont(size=14, weight="bold"), text_color=COLOR_TEXT).pack(side="left")
+        ctk.CTkLabel(title_row, text="Fyrqom Board", font=ctk.CTkFont(size=14, weight="bold"), text_color=COLOR_TEXT).pack(side="left")
         self.state_badge = ctk.CTkLabel(
             title_row, text="● IDLE", font=ctk.CTkFont(size=12, weight="bold"), text_color=COLOR_TEXT_DIM
         )
@@ -274,10 +287,29 @@ class TpmsView(ctk.CTkFrame):
         actions_inner = ctk.CTkFrame(top_inner, fg_color="transparent")
         actions_inner.pack(fill="x", pady=(0, 6))
         self.start_btn = ctk.CTkButton(
-            actions_inner, text="START TEST", width=130, height=34, font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color=COLOR_BTN_PRIMARY, hover_color=COLOR_BTN_PRIMARY_HOVER, command=self.start_test,
+            actions_inner, text="RUN CHUNK", width=120, height=34, font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color=COLOR_BTN_PRIMARY, hover_color=COLOR_BTN_PRIMARY_HOVER,
+            text_color=COLOR_BTN_PRIMARY_TEXT, command=self.start_test,
         )
         self.start_btn.pack(side="left", padx=(0, 6))
+        self.full_btn = ctk.CTkButton(
+            actions_inner, text="RUN FULL", width=110, height=34, font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#2F5D72", hover_color="#244859", command=lambda: self.start_test(run_full=True),
+        )
+        self.full_btn.pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(
+            actions_inner, text="Chunk", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_TEXT_DIM
+        ).pack(side="left", padx=(8, 4))
+        self.chunk_combo = ctk.CTkComboBox(
+            actions_inner,
+            values=["10", "25", "50", "100", "200", "500"],
+            width=72,
+            height=30,
+            variable=self.chunk_var,
+            **combo_colors(),
+        )
+        self.chunk_combo.set(self.chunk_var.get() or "100")
+        self.chunk_combo.pack(side="left", padx=(0, 10))
         self.pause_btn = ctk.CTkButton(
             actions_inner, text="PAUSE", width=90, height=34, font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=COLOR_BTN_PAUSE, hover_color=COLOR_BTN_PAUSE_HOVER, state="disabled", command=self.toggle_pause,
@@ -445,6 +477,9 @@ class TpmsView(ctk.CTkFrame):
         self.progress.pack(fill="x", pady=(2, 6))
         self.progress.set(0)
 
+        self.charts = ResultCharts(self, height=100, title="Board results")
+        self.charts.pack(fill="x", pady=(0, 6))
+
     def _refresh_ports(self) -> None:
         ports = find_serial_ports() or [default_port()]
         self.port_combo.configure(values=ports)
@@ -491,6 +526,8 @@ class TpmsView(ctk.CTkFrame):
 
     def _note_sdr_compare(self, sdr_compare: str) -> None:
         cmp = (sdr_compare or "").strip().upper()
+        if cmp in {"", "PENDING", "NA", "N/A"}:
+            return
         if cmp == "SUCCESS":
             self._sdr_agree += 1
         elif cmp == "FAIL":
@@ -503,6 +540,8 @@ class TpmsView(ctk.CTkFrame):
         self._sdr_disagree = 0
         self._session_rows.clear()
         self._refresh_table_count()
+        if hasattr(self, "charts"):
+            self.charts.reset()
 
     def _record_session_row(self, event: ProgressEvent) -> None:
         perf = str(event.performance or "").strip().upper()
@@ -655,6 +694,9 @@ class TpmsView(ctk.CTkFrame):
         nok = int(stats.get("NOK") or 0)
         self._update_stat_labels(pending=0, done=done, ok=ok, nok=nok, total=done)
         self._refresh_table_count()
+        if hasattr(self, "charts"):
+            history = [str(r.get("board_performance") or "") for r in self._session_rows]
+            self.charts.set_counts(ok, nok, history)
         return shown
 
     def focus_code_fields(self) -> None:
@@ -765,10 +807,19 @@ class TpmsView(ctk.CTkFrame):
         self.status_var.set(f"Database loaded: {self.source_xlsx.name} — add custom codes if needed, then Start Test")
 
     def _autoload_default_excel(self) -> None:
-        """Preselect the Hamaton database so a run can start without browsing."""
-        if self.source_xlsx or not DEFAULT_HAMATON_XLSX.is_file():
+        """Preselect Hamaton catalog (or FYRQOM_SOURCE_XLSX override) so a run can start."""
+        if self.source_xlsx:
             return
-        self._load_excel(DEFAULT_HAMATON_XLSX)
+        override = os.environ.get("FYRQOM_SOURCE_XLSX", "").strip()
+        if override:
+            path = Path(override).expanduser()
+            if not path.is_absolute():
+                path = app_root() / path
+            if path.is_file():
+                self._load_excel(path)
+                return
+        if DEFAULT_HAMATON_XLSX.is_file():
+            self._load_excel(DEFAULT_HAMATON_XLSX)
 
     def reset_session(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -781,7 +832,13 @@ class TpmsView(ctk.CTkFrame):
         self._reset_display()
         self._set_state_badge("IDLE")
 
-    def start_test(self, *, skip_sdr: bool = False) -> bool:
+    def selected_chunk_size(self) -> int:
+        try:
+            return max(1, int(self.chunk_var.get()))
+        except (TypeError, ValueError):
+            return 100
+
+    def start_test(self, *, skip_sdr: bool = True, chunk_size: int | None = None, run_full: bool = False) -> bool:
         """Start the Board bench. Returns False if start was blocked (e.g. no Excel/codes)."""
         if self.worker and self.worker.is_alive():
             if self.is_paused and self.runner:
@@ -810,18 +867,27 @@ class TpmsView(ctk.CTkFrame):
         self.is_paused = False
         self.start_time = time.monotonic()
         self.start_btn.configure(state="disabled")
+        if hasattr(self, "full_btn"):
+            self.full_btn.configure(state="disabled")
         self.pause_btn.configure(state="normal", text="PAUSE")
         self.stop_btn.configure(state="normal")
         self._set_state_badge("RUNNING")
 
+        size = 0 if run_full else (chunk_size if chunk_size is not None else self.selected_chunk_size())
         port = port_device(self.port_combo.get()) or port_device(default_port())
         self.runner = BenchRunner(
             port=port,
             source_xlsx=self.source_xlsx,
             resume=True,
             skip_sdr=skip_sdr,
+            sdr_timeout=float(__import__("os").environ.get("FYRQOM_SDR_TIMEOUT", "20")),
             extra_codes=extra_codes,
             on_progress=self.queue.put,
+            chunk_size=size,
+            retest_from=None,
+            require_agree=False,
+            agree_retries=1,
+            live_sdr_get=self.live_sdr_get,
         )
         if skip_sdr:
             self.status_var.set(
@@ -869,6 +935,8 @@ class TpmsView(ctk.CTkFrame):
             return
         if self.start_btn.cget("state") == "disabled":
             self.start_btn.configure(state="normal")
+            if hasattr(self, "full_btn"):
+                self.full_btn.configure(state="normal")
             self.pause_btn.configure(state="disabled", text="PAUSE")
             self.stop_btn.configure(state="disabled")
             self.is_paused = False
@@ -900,11 +968,39 @@ class TpmsView(ctk.CTkFrame):
     def is_running(self) -> bool:
         return bool(self.worker and self.worker.is_alive())
 
+    def _poll_live_sdr(self) -> None:
+        """Show SDR packets on the telemetry bar so a silent Board still looks alive."""
+        try:
+            snap = self.live_sdr_get() if self.live_sdr_get else None
+        except Exception:
+            snap = None
+        if snap:
+            latest = None
+            for reading in snap.values():
+                ts = getattr(reading, "timestamp", None)
+                if latest is None or (ts and getattr(latest, "timestamp", None) and ts > latest.timestamp):
+                    latest = reading
+            if latest is None:
+                latest = next(iter(snap.values()), None)
+            if latest is not None:
+                sid = getattr(latest, "sensor_id", None) or "—"
+                temp = getattr(latest, "display_temp", None) or "—"
+                psi = getattr(latest, "display_pressure", None) or "—"
+                self.reading_var.set(f"SDR  {sid}  ·  {temp}  ·  {psi}  ·  {len(snap)} ID(s) live")
+        self.after(1000, self._poll_live_sdr)
+
     def _animate_badge(self) -> None:
         if self._state_label == "RUNNING":
-            self._anim_step = (self._anim_step + 1) % 16
-            self.state_badge.configure(text_color=COLOR_GREEN if self._anim_step < 8 else "#86EFAC")
-        self.after(120, self._animate_badge)
+            self._anim_step = (self._anim_step + 1) % 20
+            pulse = abs(10 - (self._anim_step % 20))
+            green = "#1A8A6C" if pulse > 4 else "#3EC9A5"
+            self.state_badge.configure(text_color=green)
+            if hasattr(self, "progress"):
+                try:
+                    self.progress.configure(progress_color=green)
+                except Exception:
+                    pass
+        self.after(90, self._animate_badge)
 
     def _run_safe(self) -> None:
         try:
@@ -1015,6 +1111,8 @@ class TpmsView(ctk.CTkFrame):
 
     def _end_session(self, label: str, message: str) -> None:
         self.start_btn.configure(state="normal")
+        if hasattr(self, "full_btn"):
+            self.full_btn.configure(state="normal")
         self.pause_btn.configure(state="disabled", text="PAUSE")
         self.stop_btn.configure(state="disabled")
         self.is_paused = False
@@ -1036,9 +1134,14 @@ class TpmsView(ctk.CTkFrame):
         if event.kind == "comm":
             if event.path == "ttl":
                 self._blink_led(self.ttl_led, LED_TTL_ON)
-            elif event.path == "jlink":
-                self._blink_led(self.rx_led, LED_JLINK_ON)
-            elif event.path == "excel" and event.message:
+            elif event.path in ("uart", "jlink"):
+                if event.path == "uart":
+                    self.rx_led.configure(text="● USB RX")
+                    self._blink_led(self.rx_led, LED_TTL_ON)
+                else:
+                    self.rx_led.configure(text="● J-Link")
+                    self._blink_led(self.rx_led, LED_JLINK_ON)
+            elif event.message:
                 self.status_var.set(event.message)
             return
 
@@ -1047,6 +1150,13 @@ class TpmsView(ctk.CTkFrame):
             self._set_state_badge("RUNNING")
             if event.transport:
                 self.transport_var.set(event.transport)
+                t = event.transport.upper()
+                if "USB-TTL TX/RX" in t or "USB-TTL RX" in t:
+                    self.rx_led.configure(text="● USB RX")
+                elif "J-LINK" in t:
+                    self.rx_led.configure(text="● J-Link")
+                else:
+                    self.rx_led.configure(text="● Board RX")
             self._update_stat_labels(event.pending, event.done, event.ok, event.nok, event.total)
             self.status_var.set(event.message)
 
@@ -1059,6 +1169,35 @@ class TpmsView(ctk.CTkFrame):
             self.code_vars["C"].set(event.code_c or "—")
             self._update_stat_labels(event.pending, event.done, event.ok, event.nok, event.total)
             self.status_var.set(f"Testing row {event.excel_row}: {event.make} {event.model} · {event.pending} pending")
+
+        elif event.kind == "board_ok":
+            # Board ABC finished — show reading now; SDR decode may still be in flight.
+            if event.sensor_id and event.sensor_id != "na":
+                self.reading_var.set(
+                    f"ID  {event.sensor_id}  ·  {event.temperature} °C  ·  {event.voltage} V"
+                )
+            perf = (event.performance or "").upper()
+            self.status_var.set(
+                event.message
+                or (
+                    f"Row {event.excel_row} Board {perf or '—'} — "
+                    "waiting rtl_433 before next ABC…"
+                )
+            )
+            self._note_sdr_compare("PENDING")
+            if self.on_board_rf and event.sensor_id and str(event.sensor_id).lower() not in {"na", "n/a"}:
+                try:
+                    self.on_board_rf(
+                        event.sensor_id,
+                        excel_row=event.excel_row,
+                        vehicle=f"{event.make} {event.model}".strip(),
+                        temperature=event.temperature,
+                        voltage=event.voltage,
+                        pressure=event.pressure,
+                        board_result=event.performance or "OK",
+                    )
+                except Exception:
+                    pass
 
         elif event.kind == "row_done":
             self._update_stat_labels(event.pending, event.done, event.ok, event.nok, event.total)
@@ -1086,10 +1225,43 @@ class TpmsView(ctk.CTkFrame):
             self._record_session_row(event)
             self._note_sdr_compare(event.sdr_compare)
             self._refresh_table_count()
+            if hasattr(self, "charts"):
+                self.charts.add_result(event.performance or "")
+            self._note_sdr_compare(event.sdr_compare)
+            self._refresh_table_count()
+            if hasattr(self, "charts"):
+                self.charts.add_result(event.performance or "")
+            # Stamp final rtl_433 library decoder (or SDR FAIL) onto the Board match row.
+            finalize = getattr(self.sdr_view if hasattr(self, "sdr_view") else None, "finalize_board_match", None)
+            # Combined shell wires on_board_rf; finalize via optional callback.
+            finalize_cb = getattr(self, "on_sdr_finalize", None)
+            if callable(finalize_cb):
+                try:
+                    finalize_cb(
+                        excel_row=event.excel_row,
+                        sensor_id=event.sensor_id,
+                        decoder=event.rtl433_decoder,
+                        sdr_compare=event.sdr_compare,
+                        sdr_reason=event.sdr_reason,
+                    )
+                except Exception:
+                    pass
+            sdr = (event.sdr_compare or "").upper()
+            self.status_var.set(
+                f"Row {event.excel_row} Board {event.performance or '—'} · SDR {sdr or '—'} "
+                f"— next ABC…"
+            )
 
         elif event.kind == "stopping":
             self._set_state_badge("STOPPED")
             self.status_var.set(event.message or "Stopping…")
+
+        elif event.kind == "chunk_complete":
+            self.is_paused = True
+            self.pause_btn.configure(text="RESUME")
+            self._set_state_badge("PAUSED")
+            self.status_var.set(event.message or "Chunk complete — review Comparison")
+            self.after(80, lambda: self.on_chunk_complete(event.message or ""))
 
         elif event.kind == "finished":
             self._end_session("COMPLETED", event.message)
@@ -1103,6 +1275,8 @@ class TpmsView(ctk.CTkFrame):
                 self._end_session("STOPPED", event.message or "Stopped")
             else:
                 self.start_btn.configure(state="normal")
+                if hasattr(self, "full_btn"):
+                    self.full_btn.configure(state="normal")
                 self.pause_btn.configure(state="disabled", text="PAUSE")
                 self.stop_btn.configure(state="disabled")
                 self.is_paused = False

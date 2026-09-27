@@ -1,3 +1,6 @@
+data/TPMS_Board_Validation_Results.xlsx
+data/*_live_*.xlsx
+
 .venv/
 __pycache__/
 *.pyc

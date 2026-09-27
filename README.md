@@ -4,12 +4,23 @@ Combined desktop app with **SDR Receiver** (RTL-SDR / rtl_433) and **TPMS Board*
 
 Switching tabs only changes the view. SDR listening and board tests keep running in the background.
 
-## Run from source
+## Windows (client laptop)
+
+**Quick start (source checkout):**
+1. Install Python 3.11+ (add to PATH)
+2. Double-click `Setup_Windows.bat` once (venv + deps + rtl_433/Zadig)
+3. Next times: double-click `Start TPMS Suite.bat` or `TPMS_Suite.exe`
+
+**Packaged installer (full .exe app):** on a Windows PC run `Build_Windows_Installer.bat`, or download the CI artifact from the `windows-installer` GitHub Action. That produces `dist_installer\TPMS_Suite_Setup_2.0.0.exe`.
+
+Board USB RX works without J-Link / JTAG. Plug the Hamaton USB board + RTL-SDR and start.
+
+## Run from source (macOS / Linux / Windows)
 
 ```powershell
-cd D:\Xynovix\Combined_App
 python -m venv .venv
-.venv\Scripts\activate
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 python main.py
 ```
@@ -54,6 +65,8 @@ A manual triple is tested in addition to Excel rows. If no Excel file is selecte
 
 - SDR tab: RTL-SDR dongle (WinUSB via Zadig). Bundled rtl_433 is under `sdr_ui/vendor/rtl_433`.
 - Board tab: USB-TTL adapter on the Hamaton board. Select the COM port, then Start Test.
+- **Windows client (typical):** the board replies on USB-TTL RX. J-Link / JTAG is **not** required — if USB RX works, the suite uses that path automatically.
+- **Lab fallback:** when USB-TTL is TX-only, replies are read from board SRAM via SEGGER J-Link SWD (optional). Set `FYRQOM_FORCE_JTAG_RX=1` only to force that path.
 
 ## Windows installer
 
@@ -61,8 +74,10 @@ A manual triple is tested in addition to Excel rows. If no Excel file is selecte
 powershell -ExecutionPolicy Bypass -File .\build_installer.ps1
 ```
 
-That script downloads official **rtl_433** (MSVC x64 25.12) and **Zadig 2.9**, builds a folder-based (not one-file) app, then compiles `dist_installer\TPMS_Suite_Setup_1.3.0.exe`.
+That script downloads official **rtl_433** (MSVC x64 25.12) and **Zadig 2.9**, builds a folder-based (not one-file) app, then compiles `dist_installer\TPMS_Suite_Setup_2.0.0.exe`.
 
-SEGGER J-Link is **not** bundled (separate vendor license). Install J-Link on the PC if you need SRAM capture on the board tab.
+Or double-click `Build_Windows_Installer.bat`.
+
+SEGGER J-Link is **not** bundled (separate vendor license). It is only needed as a lab fallback when the board does not reply on USB-TTL RX. Windows client machines with working USB RX do not need J-Link.
 
 Unsigned installers can still show SmartScreen (“Windows protected your PC”). A paid Authenticode code-signing certificate is what removes that warning; the build is set up so you can sign with `signtool` once you have a cert. Do not disable Defender to hide the warning.

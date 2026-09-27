@@ -20,14 +20,14 @@ from .excel_io import (
     write_row,
 )
 from .paths import app_root, results_dir
-from .results_db import clear_all, completed_rows, connect, counts, upsert
-from .rtl433 import SdrCaptureResult, parse_freq_hz
+from .results_db import clear_all, clear_from_row, completed_rows, connect, counts, upsert
+from .rtl433 import SdrCaptureResult, SdrPacket, parse_freq_hz
 from .uart import default_port, open_uart
 
 ROOT = app_root()
 _RESULTS = results_dir()
-SPEC_XLSX = ROOT / "docs" / "specifications" / "Hamaton_database_20260126_1305.xlsx"
-OUT_XLSX = _RESULTS / "TPMS_Board_Validation_Results.xlsx"
+SPEC_XLSX = ROOT / "data" / "Hamaton_database_20260126_1305.xlsx"
+OUT_XLSX = ROOT / "data" / "TPMS_Board_Validation_Results.xlsx"
 # Active workbook path for this process — may switch to a *_live_*.xlsx if Excel locks OUT_XLSX.
 ACTIVE_OUT_XLSX = OUT_XLSX
 DB_PATH = _RESULTS / "bench.sqlite"
@@ -103,10 +103,15 @@ class BenchRunner:
         port: str | None = None,
         source_xlsx: Path | None = None,
         resume: bool = True,
-        skip_sdr: bool = True,
-        sdr_timeout: float = 6.0,
+        skip_sdr: bool = False,
+        sdr_timeout: float = 8.0,
         extra_codes: list[ManualCode] | None = None,
         on_progress: ProgressCb | None = None,
+        chunk_size: int = 100,
+        retest_from: int | None = None,
+        require_agree: bool = True,
+        agree_retries: int = 2,
+        live_sdr_get: Callable | None = None,
     ) -> None:
         self.port = port or default_port()
         self.extra_codes = extra_codes or []
@@ -119,6 +124,12 @@ class BenchRunner:
         self.resume = resume
         self.skip_sdr = skip_sdr
         self.sdr_timeout = sdr_timeout
+        # 0 = run the full catalog without pausing for Comparison.
+        self.chunk_size = max(0, int(chunk_size))
+        self.retest_from = retest_from
+        self.require_agree = require_agree
+        self.agree_retries = max(1, int(agree_retries))
+        self.live_sdr_get = live_sdr_get
         self.on_progress = on_progress or (lambda _event: None)
         self.stop_flag = False
         self._pause_event = threading.Event()
@@ -151,6 +162,144 @@ class BenchRunner:
 
     def _emit(self, event: ProgressEvent) -> None:
         self.on_progress(event)
+
+    @staticmethod
+    def _reading_decoder_label(reading) -> str:
+        """Prefer rtl_433 library display label over raw decoder/model fields."""
+        for attr in ("display_decoder", "decoder", "model"):
+            label = str(getattr(reading, attr, None) or "").strip()
+            if label:
+                return label
+        return ""
+
+    @staticmethod
+    def _is_rtl_library_label(label: str) -> bool:
+        text = str(label or "").strip()
+        low = text.lower()
+        if not text or text in {"—", "-", "na", "TPMS", "tpms"}:
+            return False
+        if low.startswith("board rf") or "waiting for" in low or low.startswith("[flex]"):
+            return False
+        if not (text.startswith("[") and "]" in text):
+            return False
+        proto = text[1 : text.index("]")].strip()
+        return proto.isdigit()
+
+    @staticmethod
+    def _packet_has_actual_telemetry(packet) -> bool:
+        """Require real temp + (pressure or battery) — never treat ID-only as success."""
+        has_temp = getattr(packet, "temperature", None) is not None
+        has_pressure = getattr(packet, "pressure", None) is not None
+        batt = getattr(packet, "battery", None)
+        has_battery = batt is not None and str(batt).strip() != ""
+        sid = str(getattr(packet, "sensor_id", None) or "").strip()
+        if not sid or sid.lower() in {"na", "n/a", "none", "-", "—"}:
+            return False
+        return bool(has_temp and (has_pressure or has_battery))
+
+    def _live_sdr_capture(
+        self,
+        *,
+        since: float,
+        expected_id: str | None = None,
+        require_telemetry: bool = True,
+    ) -> SdrCaptureResult:
+        """Real rtl_433 library packets the live Receiver heard since this row started."""
+        from .compare import ids_related
+
+        try:
+            snap = self.live_sdr_get() if self.live_sdr_get else None
+        except Exception as exc:
+            return SdrCaptureResult(False, [], None, str(exc))
+        if not snap:
+            return SdrCaptureResult(True, [], None, "SDR Receiver has no sensors yet")
+        packets: list[SdrPacket] = []
+        for key, reading in snap.items():
+            ts = getattr(reading, "timestamp", None)
+            if ts is not None:
+                try:
+                    if float(ts.timestamp()) < (since - 2.5):
+                        continue
+                except Exception:
+                    pass
+            decoder = self._reading_decoder_label(reading)
+            # Stock library only — flex bit guesses are not actual readings.
+            if not self._is_rtl_library_label(decoder):
+                continue
+            # Prefer readings that already qualify OK on the SDR side.
+            if require_telemetry and hasattr(reading, "qualifies_ok") and not reading.qualifies_ok():
+                continue
+            sid = str(getattr(reading, "sensor_id", None) or key or "")
+            if expected_id and sid and not ids_related(expected_id, sid):
+                continue
+            packets.append(
+                SdrPacket(
+                    protocol=decoder,
+                    sensor_id=sid,
+                    pressure=getattr(reading, "pressure_psi", None),
+                    temperature=getattr(reading, "temperature_c", None),
+                    battery="" if getattr(reading, "battery_ok", None) is None else str(reading.battery_ok),
+                )
+            )
+        if require_telemetry:
+            packets = [p for p in packets if self._packet_has_actual_telemetry(p)]
+        if not packets:
+            return SdrCaptureResult(True, [], None, "SDR heard no rtl_433 decode for this row")
+        return SdrCaptureResult(True, packets, None, None)
+
+    def _wait_live_sdr(
+        self,
+        *,
+        since: float,
+        expected_id: str | None,
+        wait_s: float,
+        excel_row: int,
+    ) -> SdrCaptureResult:
+        """After Board has a reading, poll until an actual rtl_433 library decode or timeout.
+
+        Flex / ID-only guesses do not count. On timeout → SDR FAIL, Board result kept.
+        """
+        deadline = time.monotonic() + max(0.5, float(wait_s))
+        last_emit = 0.0
+        while True:
+            if self.stop_flag:
+                return SdrCaptureResult(True, [], None, "stopped before SDR decode")
+            hit = self._live_sdr_capture(since=since, expected_id=expected_id, require_telemetry=True)
+            if hit.packets:
+                return hit
+            soft = self._live_sdr_capture(since=since, expected_id=None, require_telemetry=True)
+            if soft.packets and expected_id:
+                from .compare import ids_related
+
+                related = [
+                    p for p in soft.packets if ids_related(expected_id, p.sensor_id)
+                ]
+                if related:
+                    return SdrCaptureResult(True, related, None, None)
+            now = time.monotonic()
+            if now >= deadline:
+                break
+            if now - last_emit >= 1.0:
+                left = max(0.0, deadline - now)
+                self._emit(
+                    ProgressEvent(
+                        kind="comm",
+                        excel_row=excel_row,
+                        path="sdr",
+                        message=(
+                            f"Row {excel_row} Board done — waiting rtl_433 library decode "
+                            f"({left:.0f}s left)…"
+                        ),
+                    )
+                )
+                last_emit = now
+            time.sleep(0.2)
+        return SdrCaptureResult(
+            True,
+            [],
+            None,
+            "SDR FAIL: no actual rtl_433 library reading (temp+pressure/battery)",
+        )
 
     def _open_uart_interruptible(self):
         """Open COM without blocking Stop forever when the port hangs."""
@@ -222,6 +371,16 @@ class BenchRunner:
         db = connect(DB_PATH)
         if not self.resume:
             clear_all(db)
+        elif self.retest_from:
+            cleared = clear_from_row(db, int(self.retest_from))
+            if cleared:
+                self._emit(
+                    ProgressEvent(
+                        kind="comm",
+                        path="resume",
+                        message=f"Kept rows before {self.retest_from}; retesting from row {self.retest_from} ({cleared} cleared)",
+                    )
+                )
         done = completed_rows(db) if self.resume else set()
         stats = counts(db)
         if self.stop_flag:
@@ -245,8 +404,8 @@ class BenchRunner:
             self._emit(ProgressEvent(kind="stopped", message="Stopped by operator"))
             db.close()
             return 0
-        ok, hw_msg = session.verify_hardware()
-        if self.stop_flag or hw_msg == "stopped":
+        _ok, hw_msg = session.verify_hardware()
+        if self.stop_flag:
             try:
                 ser.close()
             except Exception:
@@ -254,17 +413,12 @@ class BenchRunner:
             self._emit(ProgressEvent(kind="stopped", message="Stopped by operator"))
             db.close()
             return 0
-        if not ok:
-            try:
-                ser.close()
-            except Exception:
-                pass
-            raise RuntimeError(f"Hardware check failed: {hw_msg}")
         session.detect_transport()
         max_row = ws.max_row
         total_data = max(0, max_row - 1)
         pending = total_data - len(done)
 
+        chunk_note = "full catalog" if self.chunk_size <= 0 else f"chunk {self.chunk_size}"
         self._emit(
             ProgressEvent(
                 kind="started",
@@ -275,7 +429,7 @@ class BenchRunner:
                 nok=stats["NOK"],
                 skip=stats["SKIP"],
                 transport=session.transport_mode,
-                message=f"Hardware OK · {hw_msg} · {total_data} vehicles loaded",
+                message=f"{hw_msg} · {chunk_note} · from row {self.retest_from or 2} · {total_data} vehicles",
             )
         )
 
@@ -299,6 +453,8 @@ class BenchRunner:
                     break
 
                 if excel_row in done:
+                    continue
+                if self.retest_from and excel_row < int(self.retest_from):
                     continue
 
                 make = str(ws.cell(excel_row, cols.get("Make", 1)).value or "")
@@ -363,11 +519,20 @@ class BenchRunner:
                     continue
 
                 started = time.monotonic()
-                iq_path = None if self.skip_sdr else (IQ_DIR / f"row_{excel_row}.cu8")
-                # OEID 0 = board auto-assigns Sensor ID (reliable ACK). Forced
-                # random OEIDs caused widespread program timeouts / ID mismatches.
+                row_wall = time.time()
+                # Live Receiver owns the dongle — never spawn a second rtl_433 per row.
+                use_live = self.live_sdr_get is not None
+                iq_path = None if (self.skip_sdr or use_live) else (IQ_DIR / f"row_{excel_row}.cu8")
                 oeid = 0
                 freq_hz = parse_freq_hz(freq_cell)
+                tel = BoardTelemetry()
+                sdr = SdrCaptureResult(False, [], None, "not run")
+                values: dict = {}
+                # One Board ABC program/trigger. Then wait for rtl_433 (or timeout) before
+                # advancing — do not re-run ABC just because SDR missed the burst.
+                if self.stop_flag:
+                    stopped = True
+                    break
                 tel, sdr = session.run_row(
                     code_a,
                     code_b,
@@ -381,9 +546,58 @@ class BenchRunner:
                     stopped = True
                     self._emit(ProgressEvent(kind="stopped", message="Stopped by operator"))
                     break
+
+                # Show Board result immediately; SDR may still be decoding.
+                board_values = _telemetry_values(
+                    tel,
+                    SdrCaptureResult(True, [], None, "waiting for rtl_433"),
+                    skip_sdr=False if use_live else self.skip_sdr,
+                    duration_s=time.monotonic() - started,
+                )
+                self._board_partial_event(
+                    excel_row,
+                    total_data,
+                    make,
+                    model,
+                    year,
+                    oe,
+                    supplier,
+                    code_a_s,
+                    code_b_s,
+                    code_c_s,
+                    freq_cell,
+                    board_values,
+                    session,
+                )
+
+                if use_live:
+                    wait_s = float(self.sdr_timeout)
+                    if not tel.qualifies_ok() or not (tel.sensor_id or "").strip():
+                        # Board failed — brief sniff only, then advance to next ABC.
+                        wait_s = min(wait_s, 2.0)
+                    sdr = self._wait_live_sdr(
+                        since=row_wall,
+                        expected_id=tel.sensor_id,
+                        wait_s=wait_s,
+                        excel_row=excel_row,
+                    )
+                elif not self.skip_sdr:
+                    # Per-row rtl_433 already finished inside run_row.
+                    pass
+                else:
+                    sdr = SdrCaptureResult(False, [], None, "SDR skipped")
+
+                if self.stop_flag:
+                    stopped = True
+                    self._emit(ProgressEvent(kind="stopped", message="Stopped by operator"))
+                    break
+
                 elapsed = time.monotonic() - started
                 values = _telemetry_values(
-                    tel, sdr, skip_sdr=self.skip_sdr, duration_s=elapsed
+                    tel,
+                    sdr,
+                    skip_sdr=False if (use_live or not self.skip_sdr) else True,
+                    duration_s=elapsed,
                 )
                 _commit(ws, cols, excel_row, values, record, db, wb)
                 self._result_event(
@@ -405,6 +619,19 @@ class BenchRunner:
                     duration_s=elapsed,
                 )
                 processed += 1
+                if self.chunk_size and processed > 0 and processed % self.chunk_size == 0:
+                    self._emit(
+                        ProgressEvent(
+                            kind="chunk_complete",
+                            excel_row=excel_row,
+                            total=total_data,
+                            done=counts(db)["done"],
+                            ok=counts(db)["OK"],
+                            nok=counts(db)["NOK"],
+                            message=f"Chunk of {self.chunk_size} rows done — review Comparison",
+                        )
+                    )
+                    self.pause()
         finally:
             try:
                 ser.close()
@@ -421,6 +648,53 @@ class BenchRunner:
             elif not stopped and not self.stop_flag:
                 self._emit(ProgressEvent(kind="finished", message="All vehicles tested"))
         return 0
+
+    def _board_partial_event(
+        self,
+        excel_row: int,
+        total: int,
+        make: str,
+        model: str,
+        year: str,
+        oe: str,
+        supplier: str,
+        code_a: str,
+        code_b: str,
+        code_c: str,
+        freq: str,
+        values: dict,
+        session: BoardSession,
+    ) -> None:
+        """Publish Board ABC result immediately while SDR is still trying to decode."""
+        self._emit(
+            ProgressEvent(
+                kind="board_ok",
+                excel_row=excel_row,
+                total=total,
+                make=make,
+                model=model,
+                year=year,
+                oe=oe,
+                supplier=supplier,
+                code_a=code_a,
+                code_b=code_b,
+                code_c=code_c,
+                freq=freq,
+                performance=str(values.get("Board performance") or ""),
+                reason=str(values.get("NOK reason") or ""),
+                sensor_id=str(values.get("Sensor ID") or ""),
+                temperature=str(values.get("Temperature") or ""),
+                voltage=str(values.get("Baterry voltage") or ""),
+                transport=session.transport_mode,
+                path=session.last_path,
+                message="Board result ready — waiting for rtl_433 decode…",
+                sdr_compare="pending",
+                sdr_reason="waiting for rtl_433",
+                rtl433_decoder="rtl_433 · waiting for decode",
+                pressure=str(values.get("Pressure") or ""),
+                battery_percentage=str(values.get("Battery percentage") or ""),
+            )
+        )
 
     def _result_event(
         self,
@@ -536,7 +810,7 @@ def _telemetry_values(
     tel: BoardTelemetry,
     sdr: SdrCaptureResult | None = None,
     *,
-    skip_sdr: bool = True,
+    skip_sdr: bool = False,
     duration_s: float | None = None,
 ) -> dict:
     ok = tel.qualifies_ok()

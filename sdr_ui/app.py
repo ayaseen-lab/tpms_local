@@ -28,6 +28,7 @@ from themes import (
   COLOR_BTN_EXPORT_HOVER,
   COLOR_BTN_PRIMARY,
   COLOR_BTN_PRIMARY_HOVER,
+  COLOR_BTN_PRIMARY_TEXT,
   COLOR_BTN_SECONDARY,
   COLOR_BTN_SECONDARY_HOVER,
   COLOR_BTN_STOP,
@@ -69,6 +70,8 @@ class SdrView(ctk.CTkFrame):
     self._sensor_items: Dict[str, str] = {}
     self._sensor_reads: Dict[str, int] = {}
     self._sensor_first_seen: Dict[str, datetime] = {}
+    # One entry per Board row that produced an RF ID — so MATCHES tracks Board rows, not unique IDs.
+    self._row_matches: list[dict] = []
     self._listening = False
     self._sdr_paused = False
     self._total_readings = 0
@@ -79,6 +82,7 @@ class SdrView(ctk.CTkFrame):
     self._pending_readings: Deque[TelemetryReading] = deque()
     self._pending_lock = threading.Lock()
     self._flush_scheduled = False
+    self._quiet_restarted = False
     self._autosave_dirty = False
     self._last_live_bar_ts = 0.0
     self._UI_FLUSH_MS = 200
@@ -98,6 +102,7 @@ class SdrView(ctk.CTkFrame):
     self._update_stats()
     self._notify_status()
     self.after(self._AUTOSAVE_MS, self._autosave_tick)
+    self.after(self._UI_FLUSH_MS, self._flush_readings_tick)
     if restored:
       self.after(200, lambda: self._log(
         f"Restored {len(self._sensors)} SDR sensor(s) from last session — press START to resume RF."
@@ -174,7 +179,7 @@ class SdrView(ctk.CTkFrame):
     table_header = tk.Frame(results, bg=COLOR_BG_PANEL)
     table_header.pack(fill="x")
     tk.Label(
-      table_header, text="Detected sensors — OK / NOK", bg=COLOR_BG_PANEL, fg=COLOR_TEXT, font=("Segoe UI", 10, "bold")
+      table_header, text="SDR matches — one row per Board test (same ID can repeat)", bg=COLOR_BG_PANEL, fg=COLOR_TEXT, font=("Segoe UI", 10, "bold")
     ).pack(side="left", padx=8, pady=4)
     self.table_count_label = tk.Label(
       table_header, text="0 sensors", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_DIM, font=("Segoe UI", 9)
@@ -227,6 +232,7 @@ class SdrView(ctk.CTkFrame):
     scroll_y.grid(row=0, column=1, sticky="ns")
     self.tree.tag_configure("OK", background=COLOR_GREEN_BG, foreground="#047857")
     self.tree.tag_configure("NOK", background=COLOR_RED_BG, foreground="#B91C1C")
+    self.tree.tag_configure("WAIT", background=COLOR_CYAN_BG, foreground="#0F766E")
     self.tree.tag_configure("flash", background=COLOR_CYAN_BG)
     self.tree.bind("<Configure>", self._fit_tree_columns, add="+")
     self.after(50, self._fit_tree_columns)
@@ -254,7 +260,8 @@ class SdrView(ctk.CTkFrame):
     actions_inner.pack(fill="x", pady=(0, 6))
     self.start_btn = ctk.CTkButton(
       actions_inner, text="START", width=130, height=34, font=ctk.CTkFont(size=12, weight="bold"),
-      fg_color=COLOR_BTN_PRIMARY, hover_color=COLOR_BTN_PRIMARY_HOVER, command=self._start_listen,
+      fg_color=COLOR_BTN_PRIMARY, hover_color=COLOR_BTN_PRIMARY_HOVER,
+      text_color=COLOR_BTN_PRIMARY_TEXT, command=self._start_listen,
     )
     self.start_btn.pack(side="left", padx=(0, 6))
     self.pause_btn = ctk.CTkButton(
@@ -306,7 +313,7 @@ class SdrView(ctk.CTkFrame):
     self.gain_combo = ctk.CTkComboBox(
       settings_row, values=["auto", "0", "20", "30", "40", "49.6"], width=72, height=28, **combo_colors()
     )
-    self.gain_combo.set("49.6")
+    self.gain_combo.set("auto")
     self.gain_combo.pack(side="left", padx=(0, 8))
     ctk.CTkLabel(settings_row, text="PPM", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_TEXT_DIM).pack(
       side="left", padx=(0, 4)
@@ -376,9 +383,9 @@ class SdrView(ctk.CTkFrame):
     stats_row.pack(fill="x", pady=(0, 4))
     for i in range(5):
       stats_row.grid_columnconfigure(i, weight=1)
-    self.stat_sensors = StatCard(stats_row, "DETECTED", "0", COLOR_BLUE, COLOR_BLUE_BG, compact=True)
+    self.stat_sensors = StatCard(stats_row, "ROW MATCHES", "0", COLOR_BLUE, COLOR_BLUE_BG, compact=True)
     self.stat_sensors.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-    self.stat_readings = StatCard(stats_row, "READINGS", "0", COLOR_ORANGE, COLOR_ORANGE_BG, compact=True)
+    self.stat_readings = StatCard(stats_row, "UNIQUE IDs", "0", COLOR_ORANGE, COLOR_ORANGE_BG, compact=True)
     self.stat_readings.grid(row=0, column=1, sticky="nsew", padx=4)
     self.stat_ok = StatCard(stats_row, "PASSED (OK)", "0", COLOR_GREEN, COLOR_GREEN_BG, compact=True)
     self.stat_ok.grid(row=0, column=2, sticky="nsew", padx=4)
@@ -427,12 +434,71 @@ class SdrView(ctk.CTkFrame):
       self.tree.column(col, width=max(36, int(usable * (weight / total_w))))
 
   def _refresh_table_count(self) -> None:
-    n = len(self._sensors)
-    self.table_count_label.configure(text=f"{n} sensor{'s' if n != 1 else ''}")
+    matches = len(self._row_matches)
+    unique = len(self._sensors)
+    if matches:
+      self.table_count_label.configure(
+        text=f"{matches} match{'es' if matches != 1 else ''}  ·  {unique} unique ID{'s' if unique != 1 else ''}"
+      )
+    else:
+      self.table_count_label.configure(text=f"{unique} sensor{'s' if unique != 1 else ''}")
 
   def _sensor_counts(self) -> tuple[int, int]:
-    ok = sum(1 for reading in self._sensors.values() if reading.qualifies_ok())
-    return ok, len(self._sensors) - ok
+    # SDR OK/NOK only — never count Board-mirrored placeholders as passed.
+    if self._row_matches:
+      ok = sum(1 for row in self._row_matches if str(row.get("result") or "").upper() == "OK")
+      nok = sum(1 for row in self._row_matches if str(row.get("result") or "").upper() == "NOK")
+      return ok, nok
+    ok = sum(
+      1
+      for reading in self._sensors.values()
+      if self._is_rtl_decoder(reading.display_decoder) and reading.qualifies_ok()
+    )
+    nok = sum(
+      1
+      for reading in self._sensors.values()
+      if self._is_rtl_decoder(reading.display_decoder) and not reading.qualifies_ok()
+    )
+    return ok, nok
+
+  def _unique_rtl_ids(self) -> int:
+    if self._row_matches:
+      ids = {
+        str(row.get("rtl_id") or row.get("sensor_id") or "").upper()
+        for row in self._row_matches
+        if self._is_rtl_decoder(row.get("decoder"))
+      }
+      return len({i for i in ids if i})
+    return sum(1 for r in self._sensors.values() if self._is_rtl_decoder(r.display_decoder))
+
+  def _update_stats(self):
+    matches = len(self._row_matches)
+    unique = self._unique_rtl_ids() if matches else len(self._sensors)
+    ok, nok = self._sensor_counts()
+    # ROW MATCHES = Board rows waiting on / resolved by rtl_433.
+    self.stat_sensors.set_value(str(matches if matches else self._total_readings))
+    self.stat_readings.set_value(str(unique))
+    self.stat_ok.set_value(str(ok))
+    self.stat_nok.set_value(str(nok))
+    decided = ok + nok
+    if decided > 0:
+      rate = (ok / decided) * 100
+      self.stat_rate.set_value(f"{rate:.1f}%")
+      self.progress.set(ok / decided)
+    else:
+      self.stat_rate.set_value("0.0%")
+      self.progress.set(0)
+    wait = matches - decided if matches else 0
+    self.progress_label.configure(
+      text=(
+        f"Session: {matches if matches else self._total_readings} row match(es) · "
+        f"{unique} rtl Sensor ID(s) · {self._total_readings} packet(s)"
+        + (f" · {wait} waiting rtl_433" if wait else "")
+        + " · OK only when rtl_433 library decoded"
+      )
+    )
+    self._update_export_button()
+    self._refresh_table_count()
 
   def _row_values(self, index: int, reading: TelemetryReading, reads: int) -> tuple:
     result = "OK" if reading.qualifies_ok() else "NOK"
@@ -567,6 +633,20 @@ class SdrView(ctk.CTkFrame):
     """Public entry used by the combined Start Both control."""
     self._start_listen()
 
+  def restart_listen(self) -> None:
+    """Stop then start so a replugged RTL-SDR is reopened cleanly."""
+    try:
+      from tpms_bench.rtl433 import free_dongle
+      free_dongle()
+    except Exception:
+      pass
+    if self._listening:
+      self._stop_listen()
+      self._log("Reclaiming RTL-SDR after stop/replug…")
+      self.after(1500, self._start_listen)
+      return
+    self.after(400, self._start_listen)
+
   def _start_listen(self):
     if self._listening:
       return
@@ -591,7 +671,8 @@ class SdrView(ctk.CTkFrame):
       self._log("Invalid PPM offset or device index.")
       return
 
-    self.runner.tpms_only = self.tpms_only_switch.get() == 1
+    # Honor the UI switch (do not force TPMS-only on).
+    self.runner.tpms_only = bool(self.tpms_only_switch.get() == 1)
     if not get_rtl433_exe().is_file():
       self._log("rtl_433 decoder missing — installing…")
       installed = SetupManager(on_progress=lambda msg, _pct: self._log(msg)).run_full_setup()
@@ -601,6 +682,13 @@ class SdrView(ctk.CTkFrame):
         return
     self._sdr_paused = False
     record_iq = self.record_iq_switch.get() == 1
+    # Extra settle so a just-replugged dongle is claimable before rtl_433 opens it.
+    try:
+      from tpms_bench.rtl433 import free_dongle
+      free_dongle()
+      time.sleep(1.0)
+    except Exception:
+      pass
     ok = self.runner.start(
       preset_name=preset,
       custom_freq_mhz=custom_mhz,
@@ -616,6 +704,7 @@ class SdrView(ctk.CTkFrame):
       self._update_export_button()
       iq_note = " · IQ recording (full rate, kept)" if record_iq else ""
       self.footer_label.configure(text=f"Listening on {preset}{iq_note}…")
+      self.after(10000, self._sdr_quiet_watchdog)
     else:
       self.footer_label.configure(text="SDR failed to start — see Activity Terminal")
       if hasattr(self, "activity_terminal"):
@@ -642,14 +731,16 @@ class SdrView(ctk.CTkFrame):
       self.runner.stop()
 
   def _on_reading(self, reading: TelemetryReading):
-    # Queue on the rtl_433 thread; one Tk after() flush handles many packets.
+    # rtl_433 thread — only queue. Tk after() from this thread drops packets on macOS.
     with self._pending_lock:
       self._pending_readings.append(reading)
-      need_schedule = not self._flush_scheduled
-      if need_schedule:
-        self._flush_scheduled = True
-    if need_schedule:
-      self.after(self._UI_FLUSH_MS, self._flush_readings)
+
+  def _flush_readings_tick(self) -> None:
+    self._flush_readings()
+    try:
+      self.after(self._UI_FLUSH_MS, self._flush_readings_tick)
+    except Exception:
+      pass
 
   def _flush_readings(self) -> None:
     with self._pending_lock:
@@ -694,6 +785,7 @@ class SdrView(ctk.CTkFrame):
         self._sensor_reads[sid] = self._sensor_reads.get(sid, 1) + 1
       touched[sid] = merged
       footer_sid = sid
+      self._apply_rtl_decoder_to_matches(sid, merged)
 
     now = time.monotonic()
     if self._latest is not None and (now - self._last_live_bar_ts) * 1000.0 >= self._LIVE_BAR_MIN_MS:
@@ -703,13 +795,20 @@ class SdrView(ctk.CTkFrame):
     for sid, merged in touched.items():
       reads = self._sensor_reads.get(sid, 1)
       result = "OK" if merged.qualifies_ok() else "NOK"
+      # While Board is feeding per-row matches, keep the table as one line per Board row.
+      if self._row_matches:
+        if reads == 1 or reads % 50 == 0:
+          self._log(
+            f"{merged.display_decoder} | ID {sid} | {result} | "
+            f"{merged.display_pressure} | {merged.display_temp} | {reads} reads"
+          )
+        continue
       item = self._sensor_items.get(sid)
       if sid in new_ids or not item or not self.tree.exists(item):
         index = list(self._sensors.keys()).index(sid) + 1
         item = self.tree.insert("", 0, values=self._row_values(index, merged, reads), tags=(result,))
         self._sensor_items[sid] = item
         if sid in new_ids:
-          # Skip flash animation — keeps SDR responsive at high packet rates.
           self.tree.see(item)
       else:
         try:
@@ -750,28 +849,6 @@ class SdrView(ctk.CTkFrame):
         self._flush_scheduled = True
     if more:
       self.after(self._UI_FLUSH_MS, self._flush_readings)
-
-  def _update_stats(self):
-    sensors = len(self._sensors)
-    ok, nok = self._sensor_counts()
-    self.stat_sensors.set_value(str(sensors))
-    self.stat_readings.set_value(str(self._total_readings))
-    self.stat_ok.set_value(str(ok))
-    self.stat_nok.set_value(str(nok))
-    if sensors > 0:
-      rate = (ok / sensors) * 100
-      self.stat_rate.set_value(f"{rate:.1f}%")
-      self.progress.set(ok / sensors)
-    else:
-      self.stat_rate.set_value("0.0%")
-      self.progress.set(0)
-    self.progress_label.configure(
-      text=(
-        f"Session: {self._total_readings} readings from {sensors} detected sensors  ·  "
-        f"OK/NOK is per sensor (values merged across packets)"
-      )
-    )
-    self._update_export_button()
 
   def _on_log(self, message: str):
     self.after(0, lambda m=message: self._log(m))
@@ -822,6 +899,26 @@ class SdrView(ctk.CTkFrame):
   def is_running(self) -> bool:
     return self._listening or self._sdr_paused
 
+  def _sdr_quiet_watchdog(self) -> None:
+    if not self._listening:
+      return
+    # Only count real rtl_433 library packets, not Board WAIT placeholders.
+    rtl_packets = sum(
+      1 for r in self._sensors.values() if self._is_rtl_decoder(r.display_decoder)
+    )
+    if rtl_packets == 0 and self._total_readings == 0 and not getattr(self, "_quiet_restarted", False):
+      self._quiet_restarted = True
+      self._log(
+        "SDR quiet after open — restarting rtl_433 once (common after dongle replug)…"
+      )
+      self.restart_listen()
+      return
+    if rtl_packets == 0:
+      self._log(
+        "SDR is open and listening — no JSON packets yet. "
+        "R82xx PLL messages are ignored. Trigger a sensor or wait for a live ID."
+      )
+
   def _log(self, message: str, level: str = "info"):
     if message.startswith("ERROR") or "Failed" in message:
       level = "error"
@@ -838,6 +935,332 @@ class SdrView(ctk.CTkFrame):
   def get_sensor_snapshot(self) -> Dict[str, Any]:
     """Merged per-sensor readings for comparative OK/NOK analysis."""
     return dict(self._sensors)
+
+  def _is_rtl_decoder(self, label: str | None) -> bool:
+    """True only for stock rtl_433 library labels like '[60] Schrader' — not flex guesses."""
+    text = str(label or "").strip()
+    low = text.lower()
+    if not text or text in {"—", "-", "na", "TPMS", "tpms"}:
+      return False
+    if low.startswith("board rf") or "waiting for" in low:
+      return False
+    if low.startswith("[flex]"):
+      return False
+    # Real library: "[252] BMW Gen4-Gen5 TPMS…"
+    if not (text.startswith("[") and "]" in text):
+      return False
+    proto = text[1 : text.index("]")].strip()
+    return proto.isdigit()
+
+  def _rtl_decoder_for(self, sensor_id: str) -> str:
+    """Best rtl_433 library decoder for this Sensor ID (exact or bit-shifted family)."""
+    from tpms_bench.compare import ids_related
+
+    sid = str(sensor_id or "").strip()
+    # Prefer exact ID first.
+    reading = self._sensors.get(sid)
+    if reading is not None and self._is_rtl_decoder(reading.display_decoder):
+      return reading.display_decoder
+    # rtl_433 often reports a bit-shifted ID for the same RF burst.
+    best = None
+    best_score = -1
+    for other_id, other in self._sensors.items():
+      if not self._is_rtl_decoder(other.display_decoder):
+        continue
+      if not ids_related(sid, other_id):
+        continue
+      label = other.display_decoder
+      score = self._sensor_reads.get(other_id, 1)
+      # Prefer OEM-looking library names for this sensor family.
+      low = label.lower()
+      if "abarth" in low:
+        score += 1000
+      elif "schrader" in low:
+        score += 800
+      elif "continental" in low or "huf" in low or "beru" in low:
+        score += 700
+      elif "bmw" in low:
+        score += 400
+      if score > best_score:
+        best_score = score
+        best = label
+    if best:
+      return best
+    for match in reversed(self._row_matches):
+      if not ids_related(sid, str(match.get("sensor_id") or "")):
+        continue
+      label = str(match.get("decoder") or "")
+      if self._is_rtl_decoder(label):
+        return label
+    # Recent live history (even if not yet merged into _sensors uniquely).
+    from datetime import datetime, timedelta
+    cutoff = datetime.now() - timedelta(seconds=12)
+    for reading in list(self.history)[:80]:
+      if reading.timestamp < cutoff:
+        continue
+      if not self._is_rtl_decoder(reading.display_decoder):
+        continue
+      if ids_related(sid, reading.sensor_id):
+        return reading.display_decoder
+    return "rtl_433 · waiting for decode"
+
+  def _apply_rtl_decoder_to_matches(self, sensor_id: str, reading: TelemetryReading) -> None:
+    """Stamp a stock rtl_433 library decode with actual telemetry onto Board match rows."""
+    from tpms_bench.compare import ids_related
+
+    if not self._is_rtl_decoder(reading.display_decoder):
+      return
+    if not reading.qualifies_ok():
+      # Have a library name but incomplete fields — do not mark OK / invent values.
+      return
+    sid = str(sensor_id or "").strip()
+    label = reading.display_decoder
+    updated = 0
+    for match in self._row_matches:
+      if str(match.get("result") or "").upper() == "OK" and self._is_rtl_decoder(match.get("decoder")):
+        if match.get("rtl_id") == sid:
+          continue
+      board_sid = str(match.get("board_sensor_id") or match.get("sensor_id") or "")
+      if board_sid and sid and board_sid != sid and not ids_related(board_sid, sid):
+        continue
+      prev = str(match.get("result") or "").upper()
+      if prev == "OK" and self._is_rtl_decoder(match.get("decoder")):
+        continue
+      match["decoder"] = label
+      match["rtl_id"] = sid
+      match["sensor_id"] = sid
+      match["result"] = "OK"
+      match["reading"] = reading
+      match["temperature"] = reading.temperature_c
+      match["pressure"] = reading.pressure_psi
+      match["voltage"] = reading.battery_voltage_v
+      item = match.get("tree_item")
+      if item and self.tree.exists(item):
+        vals = list(self.tree.item(item, "values"))
+        while len(vals) < 10:
+          vals.append("")
+        vals[1] = label
+        vals[2] = sid
+        vals[3] = "OK"
+        vals[4] = reading.display_pressure
+        vals[5] = reading.display_temp
+        vals[6] = reading.display_battery
+        note = str(vals[9] or "")
+        note = note.replace(" · waiting for rtl_433", "").replace(" · SDR FAIL — no rtl_433 decoder", "")
+        note = note.replace("SDR FAIL: no rtl_433 library decoder for this Board trigger", "")
+        note = note.replace("SDR FAIL: no actual rtl_433 library reading (temp+pressure/battery)", "")
+        if board_sid and board_sid.upper() != sid.upper():
+          if f"board ID {board_sid}" not in note:
+            note = f"{note} · board ID {board_sid}".strip(" ·")
+        vals[9] = note.strip(" ·")
+        self.tree.item(item, values=tuple(vals), tags=("OK",))
+        updated += 1
+    if updated:
+      self._log(f"rtl_433 {label} → {updated} SDR match(es) OK (ID {sid})")
+      self._update_stats()
+
+  def ingest_board_reading(
+    self,
+    sensor_id: str,
+    *,
+    excel_row: int | None = None,
+    vehicle: str = "",
+    temperature: str | float | None = None,
+    voltage: str | float | None = None,
+    pressure: str | float | None = None,
+    board_result: str = "OK",
+  ) -> None:
+    """Open an SDR match slot for this Board row — values come only from rtl_433."""
+    sid = str(sensor_id or "").strip()
+    if not sid or sid.lower() in {"na", "n/a", "none", "-", "—"}:
+      return
+
+    row_no = int(excel_row or 0)
+    note = f"Board row {row_no}" if row_no else "SDR match"
+    if vehicle:
+      note = f"{note} · {vehicle}"
+
+    # If rtl_433 already decoded a related ID, resolve immediately with SDR data only.
+    known = self._rtl_decoder_for(sid)
+    rtl_reading = None
+    if self._is_rtl_decoder(known):
+      from tpms_bench.compare import ids_related
+      for other_id, other in self._sensors.items():
+        if self._is_rtl_decoder(other.display_decoder) and (
+          other_id == sid or ids_related(sid, other_id)
+        ):
+          rtl_reading = other
+          break
+
+    if rtl_reading is not None:
+      decoder = rtl_reading.display_decoder
+      result = "OK"
+      show_id = rtl_reading.sensor_id or sid
+      pressure_s = rtl_reading.display_pressure
+      temp_s = rtl_reading.display_temp
+      batt_s = rtl_reading.display_battery
+      note = note  # no waiting
+    else:
+      decoder = "rtl_433 · waiting for decode"
+      result = "WAIT"
+      show_id = "—"  # do not show Board ID as an SDR decode
+      pressure_s = "—"
+      temp_s = "—"
+      batt_s = "—"
+      note = f"{note} · waiting for rtl_433"
+
+    # Do NOT inject Board telemetry into _sensors — SDR sensors are rtl_433 only.
+
+    if not self._row_matches and self._sensor_items:
+      for item in list(self._sensor_items.values()):
+        try:
+          if self.tree.exists(item):
+            self.tree.delete(item)
+        except tk.TclError:
+          pass
+      self._sensor_items.clear()
+
+    def _write_tree(item, index: int) -> None:
+      self.tree.item(
+        item,
+        values=(
+          index,
+          decoder,
+          show_id,
+          result,
+          pressure_s,
+          temp_s,
+          batt_s,
+          index,
+          datetime.now().strftime("%H:%M:%S"),
+          note,
+        ),
+        tags=(result,),
+      )
+
+    if row_no:
+      for existing_match in self._row_matches:
+        if int(existing_match.get("excel_row") or 0) != row_no:
+          continue
+        # Never overwrite a settled rtl OK with a Board WAIT.
+        if str(existing_match.get("result") or "").upper() == "OK" and self._is_rtl_decoder(
+          existing_match.get("decoder")
+        ):
+          return
+        existing_match["board_sensor_id"] = sid
+        existing_match["board_result"] = str(board_result or "")
+        existing_match["sensor_id"] = show_id if result == "OK" else sid
+        existing_match["result"] = result
+        existing_match["decoder"] = decoder
+        if rtl_reading is not None:
+          existing_match["rtl_id"] = rtl_reading.sensor_id
+          existing_match["reading"] = rtl_reading
+        item = existing_match.get("tree_item")
+        if item and self.tree.exists(item):
+          try:
+            index = int(self.tree.set(item, "num"))
+          except (TypeError, ValueError):
+            index = self._row_matches.index(existing_match) + 1
+          _write_tree(item, index)
+        self._update_stats()
+        return
+
+    index = len(self._row_matches) + 1
+    item = self.tree.insert("", 0, values=("",) * 10, tags=(result,))
+    _write_tree(item, index)
+    match = {
+      "excel_row": row_no,
+      "vehicle": (vehicle or "").strip() or "—",
+      "board_sensor_id": sid,
+      "board_result": str(board_result or ""),
+      "sensor_id": show_id if result == "OK" else sid,
+      "rtl_id": (rtl_reading.sensor_id if rtl_reading is not None else ""),
+      "result": result,
+      "decoder": decoder,
+      "reading": rtl_reading,
+      "tree_item": item,
+    }
+    self._row_matches.append(match)
+    self.tree.see(item)
+    self._log(
+      f"MATCH #{index} | {decoder} | Board row {row_no or '—'} | "
+      f"board ID {sid} | SDR {result}"
+    )
+    self._autosave_dirty = True
+    self._refresh_table_count()
+    self._update_stats()
+
+  def finalize_board_match(
+    self,
+    *,
+    excel_row: int | None = None,
+    sensor_id: str | None = None,
+    decoder: str | None = None,
+    sdr_compare: str | None = None,
+    sdr_reason: str | None = None,
+  ) -> None:
+    """End of SDR wait: OK only with actual rtl_433 library telemetry; else NOK."""
+    from tpms_bench.compare import ids_related
+
+    row_no = int(excel_row or 0)
+    sid = str(sensor_id or "").strip()
+    label = str(decoder or "").strip()
+    reason = str(sdr_reason or "").strip()
+    cmp = str(sdr_compare or "").strip().upper()
+
+    # Only SUCCESS with a numbered library decoder + a live reading that qualifies_ok.
+    reading = None
+    if self._is_rtl_decoder(label) and cmp == "SUCCESS":
+      for other_id, other in self._sensors.items():
+        if not self._is_rtl_decoder(other.display_decoder):
+          continue
+        if not other.qualifies_ok():
+          continue
+        if (not sid) or other_id == sid or ids_related(sid, other_id):
+          reading = other
+          break
+      if reading is not None:
+        self._apply_rtl_decoder_to_matches(sid or reading.sensor_id, reading)
+        self._log(f"SDR OK row {row_no or '—'} · {reading.display_decoder}")
+        self._update_stats()
+        return
+
+    # No actual library reading → SDR NOK (Board may still be OK on its tab).
+    for match in self._row_matches:
+      if row_no and int(match.get("excel_row") or 0) != row_no:
+        continue
+      board_sid = str(match.get("board_sensor_id") or match.get("sensor_id") or "")
+      if sid and board_sid and board_sid.upper() != sid.upper() and not ids_related(sid, board_sid):
+        continue
+      if (
+        str(match.get("result") or "").upper() == "OK"
+        and self._is_rtl_decoder(match.get("decoder"))
+      ):
+        # Keep a prior real OK if somehow already stamped.
+        continue
+      item = match.get("tree_item")
+      if not item or not self.tree.exists(item):
+        continue
+      vals = list(self.tree.item(item, "values"))
+      while len(vals) < 10:
+        vals.append("")
+      vals[1] = "rtl_433 · no decode"
+      vals[2] = "—"
+      vals[3] = "NOK"
+      vals[4] = "—"
+      vals[5] = "—"
+      vals[6] = "—"
+      note = str(vals[9] or "").replace(" · waiting for rtl_433", "")
+      fail_bit = reason or "SDR FAIL — no actual rtl_433 library reading"
+      if "SDR FAIL" not in note:
+        note = f"{note} · {fail_bit}".strip(" ·")
+      vals[9] = note
+      self.tree.item(item, values=tuple(vals), tags=("NOK",))
+      match["decoder"] = vals[1]
+      match["result"] = "NOK"
+      match["sensor_id"] = board_sid
+      self._log(f"SDR NOK row {row_no or '—'} · no actual library reading · next ABC")
+    self._update_stats()
 
   def _autosave_tick(self) -> None:
     try:
@@ -910,6 +1333,7 @@ class SdrView(ctk.CTkFrame):
     self._sensor_items.clear()
     self._sensor_reads.clear()
     self._sensor_first_seen.clear()
+    self._row_matches.clear()
     self._total_readings = 0
     self._latest = None
     self._session_start = None
