@@ -9,7 +9,7 @@ Switching tabs only changes the view. SDR listening and board tests keep running
 **Quick start (source checkout):**
 1. Install Python 3.11+ (add to PATH)
 2. Double-click `Setup_Windows.bat` once (venv + deps + rtl_433/Zadig)
-3. Next times: double-click `Start TPMS Suite.bat` or `TPMS_Suite.exe`
+3. Next times: double-click `TPMS_Suite.exe` or `Start TPMS Suite.bat`
 
 **Packaged installer (full .exe app):** on a Windows PC run `Build_Windows_Installer.bat`, or download the CI artifact from the `windows-installer` GitHub Action. That produces `dist_installer\TPMS_Suite_Setup_2.0.0.exe`.
 

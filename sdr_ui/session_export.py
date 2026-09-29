@@ -31,8 +31,10 @@ READING_HEADERS = [
   "Brand/Type",
   "Result",
   "Pressure (PSI)",
+  "Pressure (bar)",
   "Temperature (°C)",
   "Battery",
+  "RSSI (dB)",
   "Seconds since first",
   "NOK reason",
 ]
@@ -44,6 +46,7 @@ AVERAGE_HEADERS = [
   "Readings",
   "Result",
   "Avg Pressure (PSI)",
+  "Avg Pressure (bar)",
   "Avg Temperature (°C)",
   "Min Pressure (PSI)",
   "Max Pressure (PSI)",
@@ -58,7 +61,17 @@ AVERAGE_HEADERS = [
 def _format_seconds(seconds: Optional[float]) -> str:
   if seconds is None:
     return "—"
-  value = max(0.0, float(seconds))
+  if isinstance(seconds, str):
+    text = seconds.strip()
+    if not text or text in {"—", "-"}:
+      return "—"
+    try:
+      value = float(text)
+    except ValueError:
+      return text
+  else:
+    value = float(seconds)
+  value = max(0.0, value)
   if value < 60:
     return f"{value:.1f}"
   mins, rem = divmod(int(round(value)), 60)
@@ -180,6 +193,7 @@ def _average_rows(readings: List[TelemetryReading]) -> List[List[Any]]:
     time_to_ok, span = _group_timing(group_rows)
     merged = _merged_sensor(group_rows)
     result = _result_status(merged)
+    avg_psi = _round(fmean(psis), 2) if psis else None
     rows.append(
       [
         sensor_id,
@@ -187,7 +201,8 @@ def _average_rows(readings: List[TelemetryReading]) -> List[List[Any]]:
         ", ".join(brands),
         len(group_rows),
         result,
-        _round(fmean(psis), 2) if psis else None,
+        avg_psi,
+        _round(avg_psi / 14.503773773, 3) if avg_psi is not None else None,
         _round(fmean(temps), 1) if temps else None,
         _round(min(psis), 2) if psis else None,
         _round(max(psis), 2) if psis else None,
@@ -214,12 +229,12 @@ def _write_averages_sheet(wb: Workbook, readings: List[TelemetryReading]) -> Non
   _set_widths(
     ws,
     {
-      1: 16, 2: 36, 3: 28, 4: 12, 5: 12, 6: 18, 7: 18, 8: 16, 9: 16,
-      10: 22, 11: 22, 12: 14, 13: 12, 14: 36,
+      1: 16, 2: 36, 3: 28, 4: 12, 5: 12, 6: 18, 7: 18, 8: 18, 9: 16,
+      10: 16, 11: 22, 12: 22, 13: 14, 14: 12, 15: 36,
     },
   )
   ws.freeze_panes = "A2"
-  ws.auto_filter.ref = f"A1:N{max(ws.max_row, 1)}"
+  ws.auto_filter.ref = f"A1:O{max(ws.max_row, 1)}"
 
 
 def _write_readings_sheet(wb: Workbook, readings: List[TelemetryReading]) -> None:
@@ -266,8 +281,10 @@ def _write_readings_sheet(wb: Workbook, readings: List[TelemetryReading]) -> Non
         _brand_type(reading),
         result,
         _round(reading.psi, 2),
+        _round(reading.pressure_bar, 3),
         _round(reading.temperature_c, 1),
         reading.display_battery,
+        _round(reading.rssi_db, 1) if reading.rssi_db is not None else reading.display_rssi,
         _round(since_first, 1),
         reading.nok_reason(),
       ]
@@ -278,7 +295,7 @@ def _write_readings_sheet(wb: Workbook, readings: List[TelemetryReading]) -> Non
 
   _set_widths(
     ws,
-    {1: 18, 2: 22, 3: 36, 4: 28, 5: 10, 6: 16, 7: 16, 8: 14, 9: 18, 10: 36},
+    {1: 18, 2: 22, 3: 36, 4: 28, 5: 10, 6: 14, 7: 14, 8: 16, 9: 14, 10: 12, 11: 18, 12: 36},
   )
   ws.freeze_panes = "A2"
 
@@ -435,10 +452,10 @@ def export_session_pdf(
         cell(row[3]),
         cell(row[4]),
         cell("" if row[5] is None else f"{row[5]:.2f}"),
-        cell("" if row[6] is None else f"{row[6]:.1f}"),
-        cell(_format_seconds(row[11])),
+        cell("" if row[7] is None else f"{row[7]:.1f}"),
         cell(_format_seconds(row[12])),
-        cell(row[13] or ""),
+        cell(_format_seconds(row[13])),
+        cell(row[14] or ""),
       ]
     )
   if len(table_data) == 1:

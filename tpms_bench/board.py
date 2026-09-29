@@ -46,8 +46,8 @@ FORCE_JTAG_RX = _env_force_jtag_rx()
 PROGRAM_POLL_S = 0.12
 TRIGGER_WAIT_S = 2.8
 FAST_TRIGGER_WAIT_S = 1.8
-QUERY_TIMEOUT_S = 1.6
-QUERY_RETRIES = 1
+QUERY_TIMEOUT_S = 2.2
+QUERY_RETRIES = 2
 TX_GAP_S = 0.04
 # Settle after Cancel before Program — keep short for high row throughput.
 POST_CANCEL_S = 0.06
@@ -95,6 +95,7 @@ class BoardTelemetry:
     battery_percentage: int | None = None
     battery_voltage_v: float | None = None
     battery_ok: bool | None = None
+    rssi: int | None = None
     program_ok: bool = False
     trigger_ok: bool = False
     read_ok: bool = False
@@ -102,10 +103,66 @@ class BoardTelemetry:
 
     def _has_battery(self) -> bool:
         return (
-            self.battery_percentage is not None
-            or self.battery_voltage_v is not None
+            self.battery_voltage_v is not None
+            or (self.battery_percentage is not None and 1 <= int(self.battery_percentage) <= 100)
             or self.battery_ok is not None
         )
+
+    def battery_display(self) -> str:
+        """Human battery for UI / Excel — prefer volts, then %, then OK/LOW."""
+        if self.battery_voltage_v is not None:
+            return f"{self.battery_voltage_v:.2f}"
+        pct = self.battery_percentage
+        if pct is not None:
+            try:
+                n = int(pct)
+            except (TypeError, ValueError):
+                n = -1
+            if 1 <= n <= 100:
+                return f"{n}%"
+        if self.battery_ok is True:
+            return "OK"
+        if self.battery_ok is False:
+            return "LOW"
+        return "na"
+
+    def battery_percentage_export(self) -> str:
+        """Excel Battery percentage — never write misleading 0%."""
+        pct = self.battery_percentage
+        if pct is None:
+            return "na"
+        try:
+            n = int(pct)
+        except (TypeError, ValueError):
+            return "na"
+        if 1 <= n <= 100:
+            return str(n)
+        return "na"
+
+    def pressure_kpa(self) -> float | None:
+        """Hamaton stores pressure as centi-kPa (raw 10132 → 101.32 kPa)."""
+        if self.pressure_raw is None:
+            return None
+        try:
+            return float(self.pressure_raw) / 100.0
+        except (TypeError, ValueError):
+            return None
+
+    def pressure_display(self) -> str:
+        kpa = self.pressure_kpa()
+        if kpa is None:
+            return "na"
+        psi = kpa * 0.1450377377
+        bar = kpa / 100.0
+        return f"{psi:.2f} PSI / {bar:.3f} bar / {kpa:.2f} kPa"
+
+    def rssi_display(self) -> str:
+        if self.rssi is None:
+            return "na"
+        try:
+            return str(int(self.rssi))
+        except (TypeError, ValueError):
+            return str(self.rssi)
 
     def missing_values(self) -> list[str]:
         """Fields that still block Board OK (aligned with qualifies_ok)."""
@@ -385,34 +442,48 @@ class BoardSession:
         if self.should_stop() or not getattr(self.serial, "is_open", False):
             raise RuntimeError("stopped")
         raw = codec.build_request()
-        self.serial.reset_input_buffer()
+        try:
+            self.serial.reset_input_buffer()
+        except Exception:
+            pass
         self._parser.reset()
         written = self.serial.write(raw)
         self.serial.flush()
         self._signal("ttl", f"TX {written}B")
         time.sleep(TX_GAP_S)
 
+    def _tx_now(self, codec: CommandCodec) -> None:
+        """Write a command without resetting the COM driver (safe after an RF flood)."""
+        if not getattr(self.serial, "is_open", False):
+            raise RuntimeError("stopped")
+        raw = codec.build_request()
+        written = self.serial.write(raw)
+        self.serial.flush()
+        self._signal("ttl", f"TX {written}B")
+        time.sleep(TX_GAP_S)
+
     def _drain_uart(self, timeout_s: float) -> bytes:
-        old = self.serial.timeout
+        """Read only bytes already in the driver buffer — never block on serial.read().
+
+        A blocking read(1) is how Windows COM gets stuck after an RF flood
+        (sensor walked out of LF range while Trigger/Receive RF was still armed).
+        """
         chunks: list[bytes] = []
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
         try:
-            self.serial.timeout = max(0.03, timeout_s)
-            deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:
-                waiting = self.serial.in_waiting or 0
+                if self.should_stop() or not getattr(self.serial, "is_open", False):
+                    break
+                waiting = int(getattr(self.serial, "in_waiting", 0) or 0)
                 if waiting:
                     chunks.append(self.serial.read(waiting))
-                else:
-                    byte = self.serial.read(1)
-                    if byte:
-                        chunks.append(byte)
-                    elif chunks:
-                        break
+                    continue
+                if chunks:
+                    break
+                time.sleep(0.01)
             return b"".join(chunks)
         except Exception:
             return b"".join(chunks)
-        finally:
-            self.serial.timeout = old
 
     def _read_uart_frames(self, timeout_s: float) -> list[HamatonFrame]:
         data = self._drain_uart(timeout_s)
@@ -659,22 +730,42 @@ class BoardSession:
             return CommandResult.success(last_pending.value)
         return CommandResult.failure(0xFF, "timeout waiting for board response")
 
-    def cancel(self) -> None:
+    def cancel(self, wait_s: float | None = None) -> None:
         """Stop Trigger/Program and wait briefly for the cancel ACK."""
         if self.should_stop() or not getattr(self.serial, "is_open", False):
             return
         try:
             codec = CancelCodec()
             self.send_codec(codec)
-            deadline = time.monotonic() + CANCEL_WAIT_S
+            deadline = time.monotonic() + (CANCEL_WAIT_S if wait_s is None else max(0.05, float(wait_s)))
             while time.monotonic() < deadline:
                 if self.should_stop():
                     return
-                for frame in self._read_uart_frames(0.08):
+                for frame in self._read_uart_frames(0.05):
                     result = self._handle_frame(codec, frame)
                     if result is not None and not result.is_pending:
                         return
-                time.sleep(0.02)
+                time.sleep(0.01)
+        except Exception:
+            pass
+
+    def recover_link(self, code_a: int = 0, code_b: int = 0, code_c: int = 0) -> None:
+        """Disarm leftover Trigger/Receive-RF so the next row is not wedged after a miss."""
+        if not getattr(self.serial, "is_open", False):
+            return
+        try:
+            self._tx_now(ReceiveRfCodec(False, code_a, code_b, code_c))
+        except Exception:
+            pass
+        try:
+            self._tx_now(CancelCodec())
+        except Exception:
+            pass
+        try:
+            self._drain_uart(0.15)
+            self._parser.reset()
+            if getattr(self.serial, "is_open", False):
+                self.serial.reset_input_buffer()
         except Exception:
             pass
 
@@ -710,83 +801,94 @@ class BoardSession:
         *,
         expected_id: str | None = None,
     ) -> tuple[bool, SensorReading | None, str]:
-        self.cancel()
-        wait_s = FAST_TRIGGER_WAIT_S if self.uart_rx_active else TRIGGER_WAIT_S
-        before = (
-            self._jlink_before()
-            if (self.jlink_enabled and not self.uart_rx_active)
-            else set()
-        )
+        try:
+            self.cancel()
+            wait_s = FAST_TRIGGER_WAIT_S if self.uart_rx_active else TRIGGER_WAIT_S
+            before = (
+                self._jlink_before()
+                if (self.jlink_enabled and not self.uart_rx_active)
+                else set()
+            )
 
-        self.send_codec(ReceiveRfCodec(True, code_a, code_b, code_c))
-        self.send_codec(TriggerCodec(code_a, code_b, code_c))
+            self.send_codec(ReceiveRfCodec(True, code_a, code_b, code_c))
+            self.send_codec(TriggerCodec(code_a, code_b, code_c))
 
-        trigger_codec = TriggerCodec(code_a, code_b, code_c)
-        deadline = time.monotonic() + wait_s
-        last_jlink = 0.0
-        fallback: SensorReading | None = None
-        jlink_period = 0.22 if self.uart_rx_active else JLINK_POLL_S
+            trigger_codec = TriggerCodec(code_a, code_b, code_c)
+            deadline = time.monotonic() + wait_s
+            last_jlink = 0.0
+            fallback: SensorReading | None = None
+            jlink_period = 0.22 if self.uart_rx_active else JLINK_POLL_S
 
-        while time.monotonic() < deadline:
-            if self.should_stop():
-                return False, None, "stopped"
-            for frame in self._read_uart_frames(0.05):
-                result = self._handle_frame(trigger_codec, frame)
-                if result and result.is_success and isinstance(result.value, SensorReading):
-                    sid = result.value.sensor_id.hex().upper()
-                    if expected_id and sid != expected_id.upper():
-                        fallback = fallback or result.value
-                        continue
-                    self.last_path = "USB-TTL RX"
-                    return True, result.value, "trigger"
-                if result and result.is_pending:
-                    break
+            while time.monotonic() < deadline:
+                if self.should_stop():
+                    return False, None, "stopped"
+                for frame in self._read_uart_frames(0.05):
+                    result = self._handle_frame(trigger_codec, frame)
+                    if result and result.is_success and isinstance(result.value, SensorReading):
+                        sid = result.value.sensor_id.hex().upper()
+                        if expected_id and sid != expected_id.upper():
+                            fallback = fallback or result.value
+                            continue
+                        self.last_path = "USB-TTL RX"
+                        return True, result.value, "trigger"
+                    if result and result.is_pending:
+                        break
 
-            if self.jlink_enabled and (time.monotonic() - last_jlink) >= jlink_period:
-                last_jlink = time.monotonic()
-                dump = jlink_ram.dump_sram_result()
-                if dump.ok:
-                    reading = self._trigger_reading_from_ram(
-                        dump.blob,
-                        before if before else None,
-                        expected_id=expected_id,
-                    )
-                    if reading is not None:
-                        self.last_path = "J-Link RX"
-                        return True, reading, "trigger"
-                    if expected_id:
-                        any_reading = self._trigger_reading_from_ram(
+                if self.jlink_enabled and (time.monotonic() - last_jlink) >= jlink_period:
+                    last_jlink = time.monotonic()
+                    dump = jlink_ram.dump_sram_result()
+                    if dump.ok:
+                        reading = self._trigger_reading_from_ram(
                             dump.blob,
                             before if before else None,
-                            expected_id=None,
+                            expected_id=expected_id,
                         )
-                        if any_reading is not None:
-                            fallback = fallback or any_reading
-                    for frame in reversed(self._frames_from_blob(dump.blob, before)):
-                        result = self._handle_frame(trigger_codec, frame)
-                        if result and result.is_success and isinstance(result.value, SensorReading):
-                            sid = result.value.sensor_id.hex().upper()
-                            if expected_id and sid != expected_id.upper():
-                                fallback = fallback or result.value
-                                continue
+                        if reading is not None:
                             self.last_path = "J-Link RX"
-                            return True, result.value, "trigger"
+                            return True, reading, "trigger"
+                        if expected_id:
+                            any_reading = self._trigger_reading_from_ram(
+                                dump.blob,
+                                before if before else None,
+                                expected_id=None,
+                            )
+                            if any_reading is not None:
+                                fallback = fallback or any_reading
+                        for frame in reversed(self._frames_from_blob(dump.blob, before)):
+                            result = self._handle_frame(trigger_codec, frame)
+                            if result and result.is_success and isinstance(result.value, SensorReading):
+                                sid = result.value.sensor_id.hex().upper()
+                                if expected_id and sid != expected_id.upper():
+                                    fallback = fallback or result.value
+                                    continue
+                                self.last_path = "J-Link RX"
+                                return True, result.value, "trigger"
 
-            time.sleep(0.02)
+                time.sleep(0.02)
 
-        if fallback is not None:
-            self.last_path = self.last_path or "USB-TTL RX"
-            return True, fallback, "trigger"
+            if fallback is not None:
+                self.last_path = self.last_path or "USB-TTL RX"
+                return True, fallback, "trigger"
 
-        # Skip slow LF-search when UART already answered quickly with nothing —
-        # only search when J-Link path is the primary RX.
-        if not self.uart_rx_active:
-            search = self.lf_search(code_a, code_b, code_c)
-            if search.is_success and isinstance(search.value, SearchProgress) and search.value.sensor_count >= 1:
-                self.last_path = self.last_path or "J-Link RX"
-                return True, None, "lf-search"
+            # Skip slow LF-search when UART already answered quickly with nothing —
+            # only search when J-Link path is the primary RX.
+            if not self.uart_rx_active:
+                search = self.lf_search(code_a, code_b, code_c)
+                if search.is_success and isinstance(search.value, SearchProgress) and search.value.sensor_count >= 1:
+                    self.last_path = self.last_path or "J-Link RX"
+                    return True, None, "lf-search"
 
-        return False, None, "trigger timeout"
+            return False, None, "trigger timeout"
+        except Exception:
+            if self.should_stop():
+                return False, None, "stopped"
+            raise
+        finally:
+            # Always disarm RX — leftover Receive-RF after a miss wedges the next row.
+            try:
+                self.recover_link(code_a, code_b, code_c)
+            except Exception:
+                pass
 
     def lf_search(self, code_a: int, code_b: int, code_c: int) -> CommandResult:
         self.cancel()
@@ -895,13 +997,20 @@ class BoardSession:
         else:
             tel.reasons.append("trigger: no sensor response")
 
-        # Skip query when trigger already delivered a complete OK reading.
-        if tel.qualifies_ok():
+        heard = bool(tel.trigger_ok)
+        trigger_complete = tel.qualifies_ok()
+        # Query only when the sensor actually answered. Query-while-idle after an
+        # out-of-range miss is what wedged the board until the next restart.
+        if trigger_complete and tel.battery_voltage_v is not None:
             tel.read_ok = True
-        else:
+        elif heard:
             query = self.query(expected_id=expected_id)
             if query.is_success and isinstance(query.value, QuerySensorReading):
                 _merge_query_reading(tel, query.value)
+                if tel.qualifies_ok():
+                    tel.read_ok = True
+            elif trigger_complete:
+                tel.read_ok = True
             elif tel.trigger_ok and tel.sensor_id and tel.temperature_c is not None:
                 tel.read_ok = True
             else:
@@ -909,8 +1018,8 @@ class BoardSession:
                 if "stale query" not in (qmsg or ""):
                     tel.reasons.append(f"read: {qmsg}")
 
-        # One fast follow-up trigger only (skip second query) when still incomplete.
-        if not tel.qualifies_ok() and not self.should_stop():
+        # One follow-up trigger only when we already heard the sensor (partial read).
+        if not tel.qualifies_ok() and heard and not self.should_stop():
             activated2, trigger2, _ = self.lf_activate(
                 code_a, code_b, code_c, expected_id=None
             )
@@ -923,11 +1032,7 @@ class BoardSession:
         if tel.qualifies_ok() and not tel.program_ok:
             tel.program_ok = True
 
-        try:
-            self.send_codec(ReceiveRfCodec(False, code_a, code_b, code_c))
-        except Exception:
-            pass
-        self.cancel()
+        self.recover_link(code_a, code_b, code_c)
 
         if sdr_proc is None or iq_path is None:
             sdr = SdrCaptureResult(False, [], None, "SDR skipped")
@@ -971,6 +1076,17 @@ def _merge_sensor_reading(tel: BoardTelemetry, reading: SensorReading) -> None:
         tel.temperature_c = reading.temperature_c
     tel.battery_percentage = reading.battery_percentage
     tel.battery_ok = reading.battery_ok
+    # Never keep a bogus 0% — Hamaton uses 0x00 as "OK flag", not zero percent.
+    if tel.battery_percentage is not None:
+        try:
+            if not (1 <= int(tel.battery_percentage) <= 100):
+                tel.battery_percentage = None
+        except (TypeError, ValueError):
+            tel.battery_percentage = None
+    try:
+        tel.rssi = int(reading.rssi)
+    except (TypeError, ValueError, AttributeError):
+        pass
 
 
 def _merge_query_reading(tel: BoardTelemetry, reading: QuerySensorReading) -> None:
@@ -982,8 +1098,13 @@ def _merge_query_reading(tel: BoardTelemetry, reading: QuerySensorReading) -> No
         tel.pressure_raw = reading.pressure_raw
     if reading.temperature_read:
         tel.temperature_c = reading.temperature_c
-    tel.battery_voltage_v = reading.battery_voltage_v
-    if reading.battery_voltage_v is None and reading.status != 0:
+    volts = reading.battery_voltage_v
+    if volts is not None:
+        tel.battery_voltage_v = volts
+        tel.battery_ok = volts >= 2.5
+    elif reading.battery_status_read and tel.battery_ok is None:
+        # Status bit says battery was read, but raw units were unrecognized —
+        # keep OK so the row is not failed only for a unit quirk.
+        tel.battery_ok = True if reading.status != 0 else tel.battery_ok
+    elif volts is None and reading.status != 0 and tel.battery_voltage_v is None:
         tel.battery_ok = True
-    elif reading.battery_voltage_v is not None:
-        tel.battery_ok = reading.battery_voltage_v >= 2.5

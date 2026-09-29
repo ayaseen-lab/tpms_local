@@ -8,7 +8,7 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import ttk
 
-from charts import CompareCharts
+from charts import CompareCharts, TelemetryCharts
 from comparative_report import build_comparison
 from themes import (
     COLOR_BG,
@@ -112,8 +112,15 @@ class ComparisonView(ctk.CTkFrame):
         for card in (self.agree_card, self.disagree_card, self.rate_card, self.board_card, self.sdr_card):
             card.pack(side="left", expand=True, fill="x", padx=4)
 
-        self.charts = CompareCharts(self, height=220)
+        self.charts = CompareCharts(self, height=240)
         self.charts.pack(fill="x", pady=(0, 8))
+        self.telemetry_charts = TelemetryCharts(
+            self,
+            height=110,
+            title="Comparison live mix",
+            series_titles=("Agree", "Disagree", "Board+SDR"),
+        )
+        self.telemetry_charts.pack(fill="x", pady=(0, 8))
 
         table = ctk.CTkFrame(self, fg_color=COLOR_BG_CARD, corner_radius=10, border_width=1, border_color=COLOR_BORDER)
         table.pack(fill="both", expand=True)
@@ -198,6 +205,12 @@ class ComparisonView(ctk.CTkFrame):
             board_only=comparison.board_only,
             sdr_only=comparison.sdr_only,
         )
+        if hasattr(self, "telemetry_charts"):
+            self.telemetry_charts.push(
+                a=float(comparison.agree),
+                b=float(comparison.disagree),
+                c=float(comparison.agree + comparison.disagree),
+            )
 
     def _auto_refresh(self) -> None:
         try:

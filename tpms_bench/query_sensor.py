@@ -37,10 +37,22 @@ class QuerySensorReading:
 
     @property
     def battery_voltage_v(self) -> float | None:
+        """Decode Query Sensor voltage_raw into volts.
+
+        Hamaton frames usually send millivolts (1500–4500). Some firmwares
+        use 10 mV / centivolt units (150–450 → 1.50–4.50 V). Treat 0 / 0xFFFF
+        as not present — never invent 0.000 V.
+        """
         if self.voltage_raw in (0, 0xFFFF):
             return None
-        if 1500 <= self.voltage_raw <= 4500:
-            return round(self.voltage_raw / 1000.0, 3)
+        raw = int(self.voltage_raw)
+        if 1500 <= raw <= 4500:
+            return round(raw / 1000.0, 3)
+        if 150 <= raw <= 450:
+            return round(raw / 100.0, 3)
+        # Tenths of a volt (e.g. 29 → 2.9 V) — rare but seen on some OE sensors.
+        if 15 <= raw <= 45:
+            return round(raw / 10.0, 3)
         return None
 
     @property

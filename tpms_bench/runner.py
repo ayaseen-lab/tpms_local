@@ -14,6 +14,7 @@ from .excel_io import (
     append_manual_code_row,
     copy_workbook,
     create_blank_database,
+    needs_catalog_refresh,
     load_output,
     parse_code,
     save_workbook,
@@ -86,6 +87,7 @@ class ProgressEvent:
     rtl433_decoder: str = ""
     pressure: str = ""
     battery_percentage: str = ""
+    rssi: str = ""
     duration_s: float | None = None
     extras: dict = field(default_factory=dict)
 
@@ -239,6 +241,7 @@ class BenchRunner:
                     pressure=getattr(reading, "pressure_psi", None),
                     temperature=getattr(reading, "temperature_c", None),
                     battery="" if getattr(reading, "battery_ok", None) is None else str(reading.battery_ok),
+                    rssi=getattr(reading, "rssi_db", None),
                 )
             )
         if require_telemetry:
@@ -330,7 +333,18 @@ class BenchRunner:
             raise FileNotFoundError("Select an Excel database or enter custom CODE A / B / C.")
 
         if has_excel:
-            out_path = copy_workbook(Path(self.source_xlsx), OUT_XLSX, force=not self.resume)
+            source = Path(self.source_xlsx)
+            force_copy = not self.resume
+            if not force_copy and needs_catalog_refresh(source, OUT_XLSX):
+                force_copy = True
+                self._emit(
+                    ProgressEvent(
+                        kind="comm",
+                        path="excel",
+                        message=f"Results workbook was empty — copying catalog from {source.name}…",
+                    )
+                )
+            out_path = copy_workbook(source, OUT_XLSX, force=force_copy)
         else:
             out_path = create_blank_database(OUT_XLSX)
         _set_out_xlsx(out_path)
@@ -417,6 +431,23 @@ class BenchRunner:
         max_row = ws.max_row
         total_data = max(0, max_row - 1)
         pending = total_data - len(done)
+
+        if total_data == 0:
+            self._emit(
+                ProgressEvent(
+                    kind="error",
+                    message=(
+                        "No vehicle rows in the results workbook. "
+                        "Reload the Hamaton Excel on the Board tab, or Reset Session, then Run again."
+                    ),
+                )
+            )
+            try:
+                ser.close()
+            except Exception:
+                pass
+            db.close()
+            return 0
 
         chunk_note = "full catalog" if self.chunk_size <= 0 else f"chunk {self.chunk_size}"
         self._emit(
@@ -571,16 +602,21 @@ class BenchRunner:
                 )
 
                 if use_live:
-                    wait_s = float(self.sdr_timeout)
-                    if not tel.qualifies_ok() or not (tel.sensor_id or "").strip():
-                        # Board failed — brief sniff only, then advance to next ABC.
-                        wait_s = min(wait_s, 2.0)
-                    sdr = self._wait_live_sdr(
-                        since=row_wall,
-                        expected_id=tel.sensor_id,
-                        wait_s=wait_s,
-                        excel_row=excel_row,
-                    )
+                    heard_sensor = bool(tel.trigger_ok or tel.read_ok)
+                    if not heard_sensor:
+                        sdr = SdrCaptureResult(
+                            True, [], None, "SDR skipped — board heard no sensor"
+                        )
+                    else:
+                        wait_s = float(self.sdr_timeout)
+                        if not tel.qualifies_ok() or not (tel.sensor_id or "").strip():
+                            wait_s = min(wait_s, 2.0)
+                        sdr = self._wait_live_sdr(
+                            since=row_wall,
+                            expected_id=tel.sensor_id,
+                            wait_s=wait_s,
+                            excel_row=excel_row,
+                        )
                 elif not self.skip_sdr:
                     # Per-row rtl_433 already finished inside run_row.
                     pass
@@ -619,6 +655,11 @@ class BenchRunner:
                     duration_s=elapsed,
                 )
                 processed += 1
+                if not tel.qualifies_ok():
+                    try:
+                        session.recover_link(code_a, code_b, code_c)
+                    except Exception:
+                        pass
                 if self.chunk_size and processed > 0 and processed % self.chunk_size == 0:
                     self._emit(
                         ProgressEvent(
@@ -693,6 +734,7 @@ class BenchRunner:
                 rtl433_decoder="rtl_433 · waiting for decode",
                 pressure=str(values.get("Pressure") or ""),
                 battery_percentage=str(values.get("Battery percentage") or ""),
+                rssi=str(values.get("RSSI") or ""),
             )
         )
 
@@ -754,6 +796,7 @@ class BenchRunner:
                 rtl433_decoder=str(values.get("rtl_433 Decoder") or ""),
                 pressure=str(values.get("Pressure") or ""),
                 battery_percentage=str(values.get("Battery percentage") or ""),
+                rssi=str(values.get("RSSI") or ""),
                 duration_s=duration_s,
             )
         )
@@ -802,6 +845,7 @@ def _blank_result(performance: str, reason: str) -> dict:
         "Frequency": "na",
         "Pressure": "na",
         "Temperature": "na",
+        "RSSI": "na",
         "Duration s": "na",
     }
 
@@ -826,21 +870,61 @@ def _telemetry_values(
             if sdr.iq_path not in (sdr_reason or ""):
                 sdr_reason = f"{sdr_reason}; IQ {sdr.iq_path}".strip("; ")
     note = tel.status_note(duration_s)
+    batt_pct = tel.battery_percentage_export()
+    batt_v = tel.battery_display()
+    # Keep dedicated voltage column numeric when we have volts; otherwise mirror display.
+    if tel.battery_voltage_v is not None:
+        batt_v_col = f"{tel.battery_voltage_v:.3f}"
+    else:
+        batt_v_col = batt_v
     return {
         "Board performance": "OK" if ok else "NOK",
         "NOK reason": note,
-        "Battery percentage": na(tel.battery_percentage),
-        "Baterry voltage": "na" if tel.battery_voltage_v is None else f"{tel.battery_voltage_v:.3f}",
+        "Battery percentage": batt_pct,
+        "Baterry voltage": batt_v_col,
         "SDR compare": sdr_compare,
         "SDR reason": sdr_reason,
         "rtl_433 Decoder": decoder,
         "IQ file": iq_file,
         "Sensor ID": na(tel.sensor_id),
         "Frequency": na(tel.frequency_mhz),
-        "Pressure": na(tel.pressure_raw),
+        "Pressure": tel.pressure_display(),
         "Temperature": na(tel.temperature_c),
+        "RSSI": _rssi_export(tel, sdr),
         "Duration s": "na" if duration_s is None else f"{duration_s:.1f}",
     }
+
+
+def _rssi_export(tel: BoardTelemetry, sdr: SdrCaptureResult | None) -> str:
+    parts: list[str] = []
+    board = tel.rssi_display()
+    if board != "na":
+        parts.append(f"board {board}")
+    sdr_rssi = None
+    if sdr is not None:
+        for packet in sdr.packets or []:
+            raw = getattr(packet, "rssi", None)
+            if raw is not None:
+                try:
+                    sdr_rssi = float(raw)
+                    break
+                except (TypeError, ValueError):
+                    pass
+            blob = getattr(packet, "raw_json", None) or {}
+            if isinstance(blob, dict):
+                for key in ("rssi", "RSSI", "rssi_db"):
+                    if blob.get(key) in (None, ""):
+                        continue
+                    try:
+                        sdr_rssi = float(blob[key])
+                        break
+                    except (TypeError, ValueError):
+                        continue
+                if sdr_rssi is not None:
+                    break
+    if sdr_rssi is not None:
+        parts.append(f"{sdr_rssi:.1f} dB SDR")
+    return " · ".join(parts) if parts else "na"
 
 
 def _commit(ws, cols, excel_row, values, record, db, wb) -> None:
@@ -859,6 +943,7 @@ def _commit(ws, cols, excel_row, values, record, db, wb) -> None:
             "frequency": values["Frequency"],
             "pressure": values["Pressure"],
             "temperature": values["Temperature"],
+            "rssi": values.get("RSSI", "na"),
             "duration_s": values.get("Duration s", "na"),
         }
     )

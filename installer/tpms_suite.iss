@@ -1,7 +1,7 @@
-#define MyAppName "TPMS Suite"
+#define MyAppName "Fyrqom TPMS Suite"
 #define MyAppVersion "2.0.0"
 #define MyAppPublisher "Fyrqom"
-#define MyAppExeName "TPMS_Suite.exe"
+#define MyAppExeName "Fyrqom_TPMS_Suite.exe"
 
 [Setup]
 AppId={{A7C4E2B1-9F31-4D8A-8C2E-7B6A5C4D3E21}

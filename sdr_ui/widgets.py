@@ -39,32 +39,76 @@ def pressure_color(psi: Optional[float]) -> str:
 
 
 class StatCard(ctk.CTkFrame):
-  """Title on the left, number on the right — same row, always visible."""
+  """Stacked title + value; optional click + hover for interactive cards."""
 
-  def __init__(self, master, title: str, value: str, accent: str, bg: str, compact: bool = False, **kwargs):
+  def __init__(
+    self,
+    master,
+    title: str,
+    value: str,
+    accent: str,
+    bg: str,
+    compact: bool = False,
+    on_click=None,
+    hover_bg: str | None = None,
+    **kwargs,
+  ):
     kwargs.setdefault("fg_color", bg)
     kwargs.setdefault("corner_radius", 8)
     kwargs.setdefault("border_width", 1)
     kwargs.setdefault("border_color", COLOR_BORDER)
     super().__init__(master, **kwargs)
-    row = ctk.CTkFrame(self, fg_color="transparent")
-    row.pack(fill="x", padx=12, pady=10)
-    ctk.CTkLabel(
-      row,
+    self._accent = accent
+    self._bg = bg
+    self._hover_bg = hover_bg or bg
+    self._on_click = on_click
+    pad_x = 10 if compact else 12
+    pad_y = 8 if compact else 10
+    body = ctk.CTkFrame(self, fg_color="transparent")
+    body.pack(fill="both", expand=True, padx=pad_x, pady=pad_y)
+    self.title_label = ctk.CTkLabel(
+      body,
       text=title,
-      font=ctk.CTkFont(size=11, weight="bold"),
+      font=ctk.CTkFont(size=10 if compact else 11, weight="bold"),
       text_color=accent,
       anchor="w",
-    ).pack(side="left")
-    self.value_label = ctk.CTkLabel(
-      row,
-      text=str(value),
-      font=ctk.CTkFont(size=20, weight="bold"),
-      text_color="#102226",
-      anchor="e",
-      height=28,
     )
-    self.value_label.pack(side="right")
+    self.title_label.pack(fill="x")
+    self.value_label = ctk.CTkLabel(
+      body,
+      text=str(value),
+      font=ctk.CTkFont(size=18 if compact else 22, weight="bold"),
+      text_color="#102226",
+      anchor="w",
+    )
+    self.value_label.pack(fill="x", pady=(2, 0))
+    if on_click is not None:
+      self.configure(cursor="hand2")
+      for widget in (self, body, self.title_label, self.value_label):
+        widget.bind("<Button-1>", self._handle_click)
+        widget.bind("<Enter>", self._on_enter)
+        widget.bind("<Leave>", self._on_leave)
+
+  def _on_enter(self, _event=None):
+    self.configure(fg_color=self._hover_bg, border_color=self._accent)
+
+  def _on_leave(self, _event=None):
+    # Leave can fire when moving onto a child; keep hover if pointer is still inside.
+    try:
+      x, y = self.winfo_pointerxy()
+      left = self.winfo_rootx()
+      top = self.winfo_rooty()
+      right = left + self.winfo_width()
+      bottom = top + self.winfo_height()
+      if left <= x < right and top <= y < bottom:
+        return
+    except tk.TclError:
+      pass
+    self.configure(fg_color=self._bg, border_color=COLOR_BORDER)
+
+  def _handle_click(self, _event=None):
+    if callable(self._on_click):
+      self._on_click()
 
   def set_value(self, value: str):
     self.value_label.configure(text=str(value), text_color="#102226")
@@ -100,9 +144,13 @@ class LiveTelemetryBar(ctk.CTkFrame):
       f"ID {reading.sensor_id}",
       reading.display_temp,
       reading.display_pressure,
+      reading.display_pressure_bar,
     ]
-    if reading.battery_ok is not None:
-      parts.append("Battery OK" if reading.battery_ok else "Battery LOW")
+    batt = reading.display_battery
+    if batt and batt != "—":
+      parts.append(f"Batt {batt}")
+    if reading.display_rssi != "—":
+      parts.append(f"RSSI {reading.display_rssi} dB")
     self.label.configure(text="  ·  ".join(parts))
 
 
@@ -145,7 +193,11 @@ class SensorCard(ctk.CTkFrame):
     self.pressure_label = ctk.CTkLabel(
       p_frame, text="—", font=ctk.CTkFont(size=24, weight="bold"), text_color=COLOR_HEADER_ACCENT
     )
-    self.pressure_label.pack(anchor="w", padx=12, pady=(2, 10))
+    self.pressure_label.pack(anchor="w", padx=12, pady=(2, 0))
+    self.pressure_bar_label = ctk.CTkLabel(
+      p_frame, text="— bar", font=ctk.CTkFont(size=12, weight="bold"), text_color=COLOR_TEXT_DIM
+    )
+    self.pressure_bar_label.pack(anchor="w", padx=12, pady=(0, 10))
 
     t_frame = ctk.CTkFrame(metrics, fg_color=COLOR_BG_PANEL, corner_radius=6)
     t_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
@@ -176,18 +228,21 @@ class SensorCard(ctk.CTkFrame):
 
     color = pressure_color(psi)
     self.pressure_label.configure(text=reading.display_pressure, text_color=color)
+    self.pressure_bar_label.configure(text=reading.display_pressure_bar, text_color=color)
     self.temp_label.configure(text=reading.display_temp)
     self.status_dot.configure(text_color=color)
 
     ts = reading.timestamp.strftime("%H:%M:%S")
     self.time_label.configure(text=f"Last received {ts}")
 
-    if reading.battery_ok is not None:
-      bat = "Battery OK" if reading.battery_ok else "Battery LOW"
-      bat_color = COLOR_OK if reading.battery_ok else COLOR_WARN
-      self.battery_label.configure(text=bat, text_color=bat_color)
+    batt = reading.display_battery
+    if batt and batt not in {"—", "-"}:
+      bat_color = COLOR_OK if reading.battery_ok is not False else COLOR_WARN
+      if batt == "n/a":
+        bat_color = COLOR_TEXT_MUTED
+      self.battery_label.configure(text=f"Battery {batt}", text_color=bat_color)
     else:
-      self.battery_label.configure(text="")
+      self.battery_label.configure(text="Battery n/a", text_color=COLOR_TEXT_MUTED)
 
 
 class SensorGrid(ctk.CTkScrollableFrame):
@@ -235,7 +290,7 @@ class SensorGrid(ctk.CTkScrollableFrame):
 
 
 class HistoryTable(ctk.CTkFrame):
-  COLUMNS = ("#", "rtl_433 Decoder", "Sensor ID", "Pressure", "Temp", "Battery", "Time", "Status")
+  COLUMNS = ("#", "rtl_433 Decoder", "Sensor ID", "PSI", "bar", "Temp", "Battery", "RSSI", "Time", "Status")
   MAX_VISIBLE_ROWS = 200
 
   def __init__(self, master, **kwargs):
@@ -247,7 +302,7 @@ class HistoryTable(ctk.CTkFrame):
   def _build(self):
     header = ctk.CTkFrame(self, fg_color=COLOR_HEADER_BG, corner_radius=0)
     header.pack(fill="x")
-    widths = [40, 180, 110, 90, 70, 80, 70, 70]
+    widths = [40, 160, 100, 70, 70, 55, 70, 60, 70, 60]
     for i, (col, w) in enumerate(zip(self.COLUMNS, widths)):
       ctk.CTkLabel(
         header,
@@ -284,21 +339,19 @@ class HistoryTable(ctk.CTkFrame):
         old.destroy()
       self._row_widgets = self._row_widgets[extra:]
 
-    battery = "—"
-    if reading.battery_ok is not None:
-      battery = "OK" if reading.battery_ok else "LOW"
-
     values = [
       str(self._row_count),
       reading.display_decoder[:28],
       reading.sensor_id[:12],
       reading.display_pressure,
+      reading.display_pressure_bar,
       reading.display_temp.replace(" °C", "°C"),
-      battery,
+      reading.display_battery,
+      reading.display_rssi,
       reading.timestamp.strftime("%H:%M:%S"),
       status,
     ]
-    widths = [40, 180, 110, 90, 70, 80, 70, 70]
+    widths = [40, 160, 100, 70, 70, 55, 70, 60, 70, 60]
     status_color = COLOR_GREEN if status == "OK" else COLOR_RED if status == "LOW" else COLOR_WARN
 
     for val, w in zip(values, widths):

@@ -42,7 +42,7 @@ Write-Host "Bundled decoder: $($rtl.FullName)"
 Write-Host "Building onedir app (no UPX)…"
 & $Python -m PyInstaller --noconfirm --clean TPMS_Suite.spec
 
-$appExe = "dist\TPMS_Suite\TPMS_Suite.exe"
+$appExe = "dist\TPMS_Suite\Fyrqom_TPMS_Suite.exe"
 if (-not (Test-Path $appExe)) { throw "PyInstaller did not produce $appExe" }
 
 $internalRtl = Get-ChildItem "dist\TPMS_Suite" -Recurse -Include "rtl_433-rtlsdr.exe","rtl_433.exe" -File | Select-Object -First 1

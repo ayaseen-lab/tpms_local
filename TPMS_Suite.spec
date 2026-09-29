@@ -82,7 +82,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="TPMS_Suite",
+    name="Fyrqom_TPMS_Suite",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

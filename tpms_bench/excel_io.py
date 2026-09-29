@@ -24,6 +24,7 @@ RESULT_COLUMNS = [
     "Frequency",
     "Pressure",
     "Temperature",
+    "RSSI",
     "Duration s",
 ]
 
@@ -59,6 +60,22 @@ def _is_permission_error(exc: BaseException) -> bool:
     return "permission denied" in text or "being used by another process" in text
 
 
+def is_valid_xlsx(path: Path) -> bool:
+    """True when path is a readable OOXML workbook (ZIP-based .xlsx)."""
+    try:
+        if not path.is_file() or path.stat().st_size < 64:
+            return False
+        with path.open("rb") as fh:
+            sig = fh.read(4)
+        # ZIP local file header — all real .xlsx files start with PK\x03\x04
+        if sig != b"PK\x03\x04":
+            return False
+        load_workbook(path)
+        return True
+    except Exception:
+        return False
+
+
 def alternate_workbook_path(preferred: Path) -> Path:
     """Unlocked sibling path when Excel (or another app) holds the preferred file."""
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -81,12 +98,21 @@ def save_workbook(wb: Workbook, path: Path) -> Path:
 
 def copy_workbook(source: Path, dest: Path, *, force: bool = False) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if force or not dest.exists():
+    # Corrupt / truncated results files look like .xlsx but are not ZIP —
+    # openpyxl then raises "File is not a zip file". Recreate from source.
+    need_copy = force or not dest.exists() or not is_valid_xlsx(dest)
+    if need_copy:
         try:
             shutil.copy2(source, dest)
+            if not is_valid_xlsx(dest):
+                raise RuntimeError(f"Copied workbook is unreadable: {dest}")
             return dest
         except Exception as exc:
             if not _is_permission_error(exc):
+                if dest.exists() and not is_valid_xlsx(dest):
+                    alt = alternate_workbook_path(dest)
+                    shutil.copy2(source, alt)
+                    return alt
                 raise
             alt = alternate_workbook_path(dest)
             shutil.copy2(source, alt)
@@ -100,8 +126,31 @@ def copy_workbook(source: Path, dest: Path, *, force: bool = False) -> Path:
         if not _is_permission_error(exc):
             raise
         alt = alternate_workbook_path(dest)
-        shutil.copy2(dest, alt)
+        shutil.copy2(source, alt)
         return alt
+
+
+def vehicle_row_count(path: Path) -> int:
+    """Number of catalog/data rows (header excluded)."""
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+        ws = wb.active
+        n = max(0, int(ws.max_row or 1) - 1)
+        wb.close()
+        return n
+    except Exception:
+        return 0
+
+
+def needs_catalog_refresh(source: Path, dest: Path) -> bool:
+    """True when results workbook is empty but the selected catalog is full."""
+    if not source.is_file() or not dest.is_file():
+        return False
+    src_n = vehicle_row_count(source)
+    if src_n < 5:
+        return False
+    dest_n = vehicle_row_count(dest)
+    return dest_n < 5
 
 
 def create_blank_database(dest: Path) -> Path:
@@ -175,6 +224,11 @@ def parse_code(value) -> int | None:
 
 
 def load_output(path: Path) -> tuple[Workbook, Worksheet, dict[str, int]]:
+    if not is_valid_xlsx(path):
+        raise RuntimeError(
+            f"Results Excel is damaged or not a real .xlsx file:\n{path}\n\n"
+            "Close Excel if it is open, then Start again — a fresh copy will be created."
+        )
     wb = load_workbook(path)
     ws = wb[wb.sheetnames[0]]
     cols = ensure_result_columns(ws)
@@ -183,6 +237,8 @@ def load_output(path: Path) -> tuple[Workbook, Worksheet, dict[str, int]]:
 
 def stamp_board_report_info(path: Path) -> None:
     """Mark the workbook as a TPMS Board report so it is not confused with SDR exports."""
+    if not is_valid_xlsx(path):
+        return
     wb = load_workbook(path)
     if "Report Info" in wb.sheetnames:
         ws = wb["Report Info"]
@@ -199,5 +255,12 @@ def stamp_board_report_info(path: Path) -> None:
 
 
 def write_row(ws: Worksheet, cols: dict[str, int], row: int, values: dict[str, object]) -> None:
+    # Auto-append any new result keys (e.g. RSSI) so write never KeyErrors.
+    last = max(cols.values()) if cols else 1
+    for name in values:
+        if name not in cols:
+            last += 1
+            ws.cell(1, last, name)
+            cols[name] = last
     for name, value in values.items():
         ws.cell(row, cols[name], value)

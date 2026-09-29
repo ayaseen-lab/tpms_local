@@ -267,6 +267,7 @@ def decode_iq_with_rtl433(
                     check=False,
                     cwd=str(binary.parent),
                     env=env,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
                 err_f.write(f"\nexit={proc.returncode}\n")
             except subprocess.TimeoutExpired:

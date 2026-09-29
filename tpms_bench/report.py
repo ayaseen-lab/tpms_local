@@ -159,6 +159,7 @@ def build_pdf(dest: Path | None = None) -> Path:
                 f"<b>Frequency</b> {first['frequency']} MHz &nbsp; "
                 f"<b>Temperature</b> {first['temperature']} °C &nbsp; "
                 f"<b>Pressure</b> {first['pressure']} &nbsp; "
+                f"<b>RSSI</b> {first['rssi'] if 'rssi' in first.keys() else 'na'} &nbsp; "
                 f"<b>Battery</b> {first['battery_voltage']} V",
                 styles["body"],
             )

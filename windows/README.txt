@@ -1,8 +1,10 @@
 Windows helpers for TPMS Suite 2.0
 =================================
 
-Repo-root TPMS_Suite.exe — double-click launcher (calls Start TPMS Suite.bat)
-launcher/               — Go source for the .exe (rebuild with build_launcher.sh)
+Repo-root TPMS_Suite.exe — double-click launcher (starts packaged app or pythonw main.py)
+launcher/               — launch_stub.py (Windows rebuild: build_launcher.bat)
+                          optional Go source (build_launcher.sh) — must use -H windowsgui
+                          Start TPMS Suite.bat must NOT start this .exe (flicker loop).
 
 From the repo root on Windows:
   Setup_Windows.bat              first-time venv + deps

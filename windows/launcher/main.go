@@ -1,66 +1,102 @@
 // Windows entry launcher for TPMS Suite 2.0.
-// Cross-compile: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o TPMS_Suite.exe ./windows/launcher
+// Cross-compile (no console flash):
+//
+//	GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -H windowsgui" -o TPMS_Suite.exe ./windows/launcher
 package main
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"syscall"
+	"unsafe"
+)
+
+const (
+	createNewProcessGroup = 0x00000200
+	detachedProcess       = 0x00000008
+	mbOK                  = 0x00000000
+	mbIconError           = 0x00000010
 )
 
 func main() {
 	exe, err := os.Executable()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "cannot resolve executable:", err)
-		os.Exit(1)
+		fail("cannot resolve executable: " + err.Error())
 	}
 	root := filepath.Dir(exe)
 
-	// Prefer full PyInstaller package next to this launcher.
-	packaged := filepath.Join(root, "dist", "TPMS_Suite", "TPMS_Suite.exe")
-	if st, err := os.Stat(packaged); err == nil && !st.IsDir() {
-		runDetached(packaged, root)
-		return
+	// 1) Full PyInstaller package (installer / local build).
+	packaged := filepath.Join(root, "dist", "TPMS_Suite", "Fyrqom_TPMS_Suite.exe")
+	if !fileExists(packaged) {
+		packaged = filepath.Join(root, "dist", "TPMS_Suite", "TPMS_Suite.exe")
 	}
-
-	bat := filepath.Join(root, "Start TPMS Suite.bat")
-	if st, err := os.Stat(bat); err == nil && !st.IsDir() {
-		cmd := exec.Command("cmd.exe", "/c", bat)
-		cmd.Dir = root
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Stdin = os.Stdin
-		if err := cmd.Run(); err != nil {
-			if ee, ok := err.(*exec.ExitError); ok {
-				os.Exit(ee.ExitCode())
-			}
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+	if fileExists(packaged) {
+		if err := startDetached(packaged, root, nil); err != nil {
+			fail("failed to start packaged app: " + err.Error())
 		}
 		return
 	}
 
-	fmt.Fprintln(os.Stderr, "TPMS Suite launcher: missing Start TPMS Suite.bat")
-	fmt.Fprintln(os.Stderr, "Run Setup_Windows.bat once, or build with Build_Windows_Installer.bat")
-	fmt.Fprintln(os.Stderr, "Root:", root)
-	waitEnter()
-	os.Exit(1)
-}
-
-func runDetached(path, dir string) {
-	cmd := exec.Command(path)
-	cmd.Dir = dir
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: false}
-	if err := cmd.Start(); err != nil {
-		fmt.Fprintln(os.Stderr, "failed to start packaged app:", err)
-		waitEnter()
-		os.Exit(1)
+	// 2) Source checkout: pythonw/python + main.py.
+	// Never call Start TPMS Suite.bat from here — that bat used to re-launch this
+	// exe and caused an infinite console flicker loop.
+	mainPy := filepath.Join(root, "main.py")
+	if fileExists(mainPy) {
+		if py, ok := findPython(root); ok {
+			if err := startDetached(py, root, []string{mainPy}); err != nil {
+				fail("failed to start TPMS Suite: " + err.Error())
+			}
+			return
+		}
+		fail("Python was not found.\n\nRun Setup_Windows.bat once, or install Python 3.11+\nfrom python.org (check \"Add python.exe to PATH\").")
 	}
+
+	fail("TPMS Suite launcher: nothing to run.\n\nExpected either:\n  dist\\TPMS_Suite\\TPMS_Suite.exe\nor:\n  main.py + Python\n\nRoot: " + root)
 }
 
-func waitEnter() {
-	fmt.Fprintln(os.Stderr, "Press Enter to close…")
-	fmt.Scanln()
+func findPython(root string) (string, bool) {
+	candidates := []string{
+		filepath.Join(root, ".venv", "Scripts", "pythonw.exe"),
+		filepath.Join(root, ".venv", "Scripts", "python.exe"),
+		filepath.Join(os.Getenv("LocalAppData"), "Programs", "Python", "Python312", "pythonw.exe"),
+		filepath.Join(os.Getenv("LocalAppData"), "Programs", "Python", "Python312", "python.exe"),
+		filepath.Join(os.Getenv("LocalAppData"), "Programs", "Python", "Python311", "pythonw.exe"),
+		filepath.Join(os.Getenv("LocalAppData"), "Programs", "Python", "Python311", "python.exe"),
+	}
+	for _, c := range candidates {
+		if fileExists(c) {
+			return c, true
+		}
+	}
+	for _, name := range []string{"pythonw.exe", "python.exe"} {
+		if p, err := exec.LookPath(name); err == nil && p != "" {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}
+
+func startDetached(path, dir string, args []string) error {
+	cmd := exec.Command(path, args...)
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: createNewProcessGroup | detachedProcess,
+		HideWindow:    true,
+	}
+	return cmd.Start()
+}
+
+func fail(msg string) {
+	user32 := syscall.NewLazyDLL("user32.dll")
+	messageBox := user32.NewProc("MessageBoxW")
+	title, _ := syscall.UTF16PtrFromString("TPMS Suite")
+	body, _ := syscall.UTF16PtrFromString(msg)
+	messageBox.Call(0, uintptr(unsafe.Pointer(body)), uintptr(unsafe.Pointer(title)), uintptr(mbOK|mbIconError))
+	os.Exit(1)
 }

@@ -25,6 +25,7 @@ from comparative_report import build_comparison, export_comparative_excel, expor
 from comparison_view import ComparisonView
 from dialogs import ask_save_path
 from iq_urh_tool import IqUrhView
+from range_view import RangeView
 from themes import (
     COLOR_BG,
     COLOR_BG_CARD,
@@ -144,6 +145,11 @@ class CombinedApp(ctk.CTk):
             corner_radius=10, command=lambda: self.show_view("compare"),
         )
         self.compare_tab.pack(side="left", padx=(0, 4), pady=4)
+        self.range_tab = ctk.CTkButton(
+            tabs, text="Range Radar", width=120, height=34, font=ui_font(13, "bold"),
+            corner_radius=10, command=lambda: self.show_view("range"),
+        )
+        self.range_tab.pack(side="left", padx=(0, 4), pady=4)
         self.iq_tab = ctk.CTkButton(
             tabs, text="IQ / URH", width=100, height=34, font=ui_font(13, "bold"),
             corner_radius=10, command=lambda: self.show_view("iq"),
@@ -174,6 +180,7 @@ class CombinedApp(ctk.CTk):
         ctk.CTkButton(
             run_box, text="Run full", width=96, height=30, font=ui_font(12, "bold"),
             fg_color=COLOR_BTN_FULL, hover_color=COLOR_BTN_FULL_HOVER,
+            text_color="#FFFFFF",
             command=lambda: self._start_both(run_full=True),
         ).pack(side="left", padx=(0, 8), pady=4)
 
@@ -212,13 +219,20 @@ class CombinedApp(ctk.CTk):
             export_pdf=lambda: self._export_comparative("pdf"),
         )
         self.iq_view = IqUrhView(self.content)
+        self.range_view = RangeView(
+            self.content,
+            get_sdr=self.sdr_view.get_sensor_snapshot,
+        )
         self.sdr_view.grid(row=0, column=0, sticky="nsew")
         self.board_view.grid(row=0, column=0, sticky="nsew")
         self.compare_view.grid(row=0, column=0, sticky="nsew")
+        self.range_view.grid(row=0, column=0, sticky="nsew")
         self.iq_view.grid(row=0, column=0, sticky="nsew")
         self.board_view.live_sdr_get = self.sdr_view.get_sensor_snapshot
         self.board_view.on_board_rf = self.sdr_view.ingest_board_reading
+        self.board_view.on_board_trigger = self.sdr_view.watch_board_burst
         self.board_view.on_sdr_finalize = self.sdr_view.finalize_board_match
+        self.sdr_view.on_range_update = self.range_view.update_sdr
         self.show_view("board")
 
     def show_view(self, name: str) -> None:
@@ -226,10 +240,12 @@ class CombinedApp(ctk.CTk):
         self.board_view.grid_remove()
         self.sdr_view.grid_remove()
         self.compare_view.grid_remove()
+        self.range_view.grid_remove()
         self.iq_view.grid_remove()
         self._paint_tab(self.board_tab, False)
         self._paint_tab(self.sdr_tab, False)
         self._paint_tab(self.compare_tab, False)
+        self._paint_tab(self.range_tab, False)
         self._paint_tab(self.iq_tab, False)
         if name == "sdr":
             self.sdr_view.grid(row=0, column=0, sticky="nsew")
@@ -238,6 +254,9 @@ class CombinedApp(ctk.CTk):
             self.compare_view.grid(row=0, column=0, sticky="nsew")
             self._paint_tab(self.compare_tab, True)
             self.compare_view.refresh()
+        elif name == "range":
+            self.range_view.grid(row=0, column=0, sticky="nsew")
+            self._paint_tab(self.range_tab, True)
         elif name == "iq":
             self.iq_view.grid(row=0, column=0, sticky="nsew")
             self._paint_tab(self.iq_tab, True)

@@ -19,6 +19,7 @@ class SdrPacket:
     temperature: float | None
     battery: str | None
     raw_json: dict = field(default_factory=dict)
+    rssi: float | None = None
 
 
 @dataclass
@@ -88,6 +89,12 @@ def parse_freq_hz(value: object, default_hz: int = 433_920_000) -> int:
     return int(round(num))
 
 
+def _no_window_kwargs() -> dict:
+    if sys.platform != "win32":
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+
+
 def sdr_present() -> bool:
     if shutil.which("rtl_test"):
         probe = subprocess.run(
@@ -96,6 +103,7 @@ def sdr_present() -> bool:
             text=True,
             timeout=8,
             check=False,
+            **_no_window_kwargs(),
         )
         text = (probe.stdout or "") + (probe.stderr or "")
         if "No supported devices found" in text or probe.returncode != 0:
@@ -111,6 +119,7 @@ def sdr_present() -> bool:
         text=True,
         timeout=12,
         check=False,
+        **_no_window_kwargs(),
     )
     text = (probe.stdout or "") + (probe.stderr or "")
     if "No input drivers" in text and "RTL-SDR" not in text:
@@ -118,6 +127,27 @@ def sdr_present() -> bool:
     if "No supported devices found" in text or "usb_claim_interface error" in text:
         return False
     return probe.returncode == 0 or "Tuned to" in text or "Using device" in text
+
+
+def _packet_rssi(data: dict) -> float | None:
+    for key in ("rssi", "RSSI", "rssi_db"):
+        val = data.get(key)
+        if val in (None, ""):
+            continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            continue
+    try:
+        snr = float(data["snr"]) if data.get("snr") not in (None, "") else None
+        noise = float(data["noise"]) if data.get("noise") not in (None, "") else None
+        if snr is not None and noise is not None:
+            return noise + snr
+        if snr is not None:
+            return -40.0 + snr
+    except (TypeError, ValueError, KeyError):
+        pass
+    return None
 
 
 def parse_json_lines(text: str) -> list[SdrPacket]:
@@ -172,6 +202,7 @@ def parse_json_lines(text: str) -> list[SdrPacket]:
                 temperature=data.get("temperature_C") or data.get("temperature"),
                 battery=str(data["battery_ok"]) if "battery_ok" in data else data.get("battery"),
                 raw_json=data,
+                rssi=_packet_rssi(data),
             )
         )
     return packets
@@ -247,12 +278,14 @@ def free_dongle() -> None:
     """Kill an rtl_433 left behind by a previous run so the dongle is claimable."""
     try:
         if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/IM", "rtl_433.exe"],
-                capture_output=True,
-                timeout=8,
-                check=False,
-            )
+            for image in ("rtl_433.exe", "rtl_433-rtlsdr.exe", "rtl_433-soapysdr.exe"):
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", image],
+                    capture_output=True,
+                    timeout=8,
+                    check=False,
+                    **_no_window_kwargs(),
+                )
         else:
             subprocess.run(
                 ["pkill", "-f", "rtl_433"],
@@ -279,6 +312,7 @@ def start_capture(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            **_no_window_kwargs(),
         )
     except OSError as error:
         return SdrCaptureResult(False, [], None, f"could not start rtl_433: {error}")

@@ -47,6 +47,8 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE runs ADD COLUMN duration_s TEXT")
     if "rtl433_decoder" not in existing:
         conn.execute("ALTER TABLE runs ADD COLUMN rtl433_decoder TEXT")
+    if "rssi" not in existing:
+        conn.execute("ALTER TABLE runs ADD COLUMN rssi TEXT")
 
 
 def completed_rows(conn: sqlite3.Connection) -> set[int]:

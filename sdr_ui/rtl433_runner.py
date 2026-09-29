@@ -35,6 +35,7 @@ except Exception:  # pragma: no cover
 KPA_TO_PSI = 0.1450377377
 HPA_TO_PSI = 0.01450377377
 BAR_TO_PSI = 14.503773773
+PSI_TO_BAR = 1.0 / BAR_TO_PSI
 
 
 @dataclass
@@ -47,6 +48,7 @@ class TelemetryReading:
   temperature_c: Optional[float] = None
   battery_ok: Optional[bool] = None
   battery_voltage_v: Optional[float] = None
+  rssi_db: Optional[float] = None
   status: Optional[int] = None
   raw: Dict[str, Any] = field(default_factory=dict)
   timestamp: datetime = field(default_factory=datetime.now)
@@ -56,6 +58,8 @@ class TelemetryReading:
   # rtl_433 decoder that produced this packet, e.g. "[60] Schrader".
   decoder: str = ""
   protocol_id: Optional[int] = None
+  # Recent gauge-PSI samples for median smoothing (not persisted).
+  pressure_hist: List[float] = field(default_factory=list, repr=False)
 
   @property
   def psi(self) -> Optional[float]:
@@ -68,8 +72,24 @@ class TelemetryReading:
   @property
   def display_pressure(self) -> str:
     value = self.psi
+    if value is None:
+      return "—"
+    if abs(value) < 20.0:
+      return f"{value:.2f} PSI"
+    return f"{value:.1f} PSI"
+
+  @property
+  def pressure_bar(self) -> Optional[float]:
+    value = self.psi
+    if value is None:
+      return None
+    return value * PSI_TO_BAR
+
+  @property
+  def display_pressure_bar(self) -> str:
+    value = self.pressure_bar
     if value is not None:
-      return f"{value:.1f} PSI"
+      return f"{value:.3f} bar"
     return "—"
 
   @property
@@ -80,10 +100,34 @@ class TelemetryReading:
 
   @property
   def display_battery(self) -> str:
+    apply_battery_fields(self)
     if self.battery_voltage_v is not None:
       return f"{self.battery_voltage_v:.2f} V"
     if self.battery_ok is not None:
       return "OK" if self.battery_ok else "LOW"
+    # Schrader and similar RF frames never include volts — be explicit.
+    return "n/a"
+
+  @property
+  def display_rssi(self) -> str:
+    if self.rssi_db is not None:
+      return f"{self.rssi_db:.1f}"
+    raw = self.raw if isinstance(self.raw, dict) else {}
+    for key in ("rssi", "RSSI"):
+      val = raw.get(key)
+      if val is None or val == "":
+        continue
+      try:
+        return f"{float(val):.1f}"
+      except (TypeError, ValueError):
+        continue
+    try:
+      snr = float(raw["snr"]) if raw.get("snr") not in (None, "") else None
+      noise = float(raw["noise"]) if raw.get("noise") not in (None, "") else None
+      if snr is not None and noise is not None:
+        return f"{noise + snr:.1f}"
+    except (TypeError, ValueError, KeyError):
+      pass
     return "—"
 
   # Cache TPMS protocol ids so per-packet checks stay cheap under high RF load.
@@ -145,15 +189,33 @@ class TelemetryReading:
 
   def merged_with(self, newer: "TelemetryReading") -> "TelemetryReading":
     """Combine packets for one sensor ID — keep values once seen (board-style completeness)."""
+    apply_battery_fields(self)
+    apply_battery_fields(newer)
+    hist = list(self.pressure_hist or [])
+    stable_psi, hist = _stable_pressure_psi(
+      self.pressure_psi,
+      newer.pressure_psi,
+      hist,
+    )
+    # Prefer freshest RSSI always (distance tracking); never stick on an old level.
+    rssi = newer.rssi_db if newer.rssi_db is not None else self.rssi_db
+    # Keep Board-filled voltage if newer RF packet still has none.
+    battery_v = newer.battery_voltage_v if newer.battery_voltage_v is not None else self.battery_voltage_v
+    battery_ok = newer.battery_ok if newer.battery_ok is not None else self.battery_ok
     return TelemetryReading(
       sensor_id=newer.sensor_id if newer.has_sensor_id() else self.sensor_id,
       model=newer.model or self.model,
       sensor_type=newer.sensor_type or self.sensor_type,
-      pressure_psi=newer.pressure_psi if newer.pressure_psi is not None else self.pressure_psi,
+      pressure_psi=stable_psi if stable_psi is not None else (
+        newer.pressure_psi if newer.pressure_psi is not None else self.pressure_psi
+      ),
       pressure_hpa=newer.pressure_hpa if newer.pressure_hpa is not None else self.pressure_hpa,
-      temperature_c=newer.temperature_c if newer.temperature_c is not None else self.temperature_c,
-      battery_ok=newer.battery_ok if newer.battery_ok is not None else self.battery_ok,
-      battery_voltage_v=newer.battery_voltage_v if newer.battery_voltage_v is not None else self.battery_voltage_v,
+      temperature_c=_sanitize_temperature_c(
+        newer.temperature_c if newer.temperature_c is not None else self.temperature_c
+      ),
+      battery_ok=battery_ok,
+      battery_voltage_v=battery_v,
+      rssi_db=rssi,
       status=newer.status if newer.status is not None else self.status,
       raw=newer.raw or self.raw,
       timestamp=newer.timestamp,
@@ -161,6 +223,7 @@ class TelemetryReading:
       acquire_seconds=newer.acquire_seconds if newer.acquire_seconds is not None else self.acquire_seconds,
       decoder=newer.decoder or self.decoder,
       protocol_id=newer.protocol_id if newer.protocol_id is not None else self.protocol_id,
+      pressure_hist=hist,
     )
 
   @property
@@ -205,10 +268,59 @@ def _first_float(data: Dict[str, Any], *keys: str) -> Optional[float]:
 
 
 def _parse_pressure(data: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+  """Decode rtl_433 pressure fields into tyre-gauge PSI (+ hPa companion).
+
+  rtl_433 models mix units (PSI / kPa / bar / hPa) and sometimes omit the unit
+  suffix or mis-tag the field. Infer from both key name and magnitude.
+  """
   pressure_psi = _first_float(data, "pressure_PSI", "pressure_psi")
   pressure_kpa = _first_float(data, "pressure_kPa", "pressure_kpa", "pressure_KPA")
   pressure_hpa = _first_float(data, "pressure_hPa", "pressure_hpa")
   pressure_bar = _first_float(data, "pressure_bar", "pressure_BAR", "pressure_Bar")
+  generic = _first_float(data, "pressure")
+
+  # Explicit keys with magnitude sanity (fix common mis-tags).
+  if pressure_kpa is not None:
+    if 0.5 <= pressure_kpa <= 6.5:
+      # Mislabeled bar (tyre ~2–3 bar).
+      pressure_psi = pressure_kpa * BAR_TO_PSI if pressure_psi is None else pressure_psi
+      pressure_kpa = None
+    elif 15.0 <= pressure_kpa < 50.0:
+      # Likely PSI tagged as kPa (soft/firm tyre).
+      pressure_psi = pressure_kpa if pressure_psi is None else pressure_psi
+      pressure_kpa = None
+
+  if pressure_bar is not None:
+    if 15.0 <= pressure_bar <= 80.0:
+      # Mislabeled PSI.
+      pressure_psi = pressure_bar if pressure_psi is None else pressure_psi
+      pressure_bar = None
+    elif 80.0 <= pressure_bar <= 400.0:
+      # Mislabeled kPa.
+      pressure_kpa = pressure_bar if pressure_kpa is None else pressure_kpa
+      pressure_bar = None
+
+  if pressure_psi is not None and 80.0 <= pressure_psi <= 400.0:
+    # PSI field actually holding kPa.
+    pressure_kpa = pressure_psi if pressure_kpa is None else pressure_kpa
+    pressure_psi = None
+
+  # Generic "pressure" — infer unit from magnitude.
+  if (
+    pressure_psi is None
+    and pressure_kpa is None
+    and pressure_hpa is None
+    and pressure_bar is None
+    and generic is not None
+  ):
+    if generic >= 50.0:
+      pressure_kpa = generic  # atmosphere ~101, cold tyre ~200–300
+    elif generic >= 15.0:
+      pressure_psi = generic  # tyre gauge PSI
+    elif generic >= 0.8:
+      pressure_bar = generic  # tyre bar (0.8–6.5 typical)
+    else:
+      pressure_psi = generic  # near-zero gauge / out of tyre
 
   if pressure_psi is None and pressure_kpa is not None:
     pressure_psi = pressure_kpa * KPA_TO_PSI
@@ -219,7 +331,73 @@ def _parse_pressure(data: Dict[str, Any]) -> tuple[Optional[float], Optional[flo
     pressure_psi = pressure_bar * BAR_TO_PSI
     pressure_hpa = pressure_bar * 1000.0
 
+  pressure_psi = _to_gauge_psi(pressure_psi)
+  if pressure_psi is not None and pressure_hpa is None:
+    pressure_hpa = pressure_psi / HPA_TO_PSI if HPA_TO_PSI else None
   return pressure_psi, pressure_hpa
+
+
+def _to_gauge_psi(pressure_psi: Optional[float]) -> Optional[float]:
+  """Normalize sensor pressure to tyre-gauge PSI for bench / out-of-tyre use.
+
+  Many TPMS frames report absolute pressure (~14.7 PSI / ~101 kPa at atmosphere).
+  Out of a tyre that should read ~0 PSI gauge, not jump between 0 and 14.7.
+  Also reject absurd values that cause the UI to thrash.
+  """
+  if pressure_psi is None:
+    return None
+  try:
+    psi = float(pressure_psi)
+  except (TypeError, ValueError):
+    return None
+  # Mis-tagged kPa as PSI (atmosphere ~100, cold tyre ~220).
+  if 80.0 <= psi <= 400.0:
+    psi = psi * KPA_TO_PSI
+  if psi < -2.0 or psi > 120.0:
+    return None
+  return round(psi, 2)
+
+
+def _sanitize_temperature_c(temp_c: Optional[float]) -> Optional[float]:
+  """Drop or repair absurd TPMS temperatures (e.g. 142 °C from bad decode)."""
+  if temp_c is None:
+    return None
+  try:
+    t = float(temp_c)
+  except (TypeError, ValueError):
+    return None
+  if -40.0 <= t <= 95.0:
+    return round(t, 1)
+  # Fahrenheit mislabeled as Celsius (common on some decoders).
+  if 96.0 <= t <= 220.0:
+    as_c = (t - 32.0) * 5.0 / 9.0
+    if -40.0 <= as_c <= 95.0:
+      return round(as_c, 1)
+  return None
+
+
+def _median(values: List[float]) -> float:
+  ordered = sorted(values)
+  mid = len(ordered) // 2
+  if len(ordered) % 2:
+    return ordered[mid]
+  return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _stable_pressure_psi(previous: Optional[float], newer: Optional[float], hist: List[float]) -> tuple[Optional[float], List[float]]:
+  """Median-filter pressure so out-of-tyre packets stop jumping wildly."""
+  samples = list(hist or [])
+  if newer is not None:
+    samples.append(float(newer))
+  samples = samples[-7:]
+  if not samples:
+    return previous, samples
+  med = _median(samples)
+  # Ignore a single-packet spike far from the recent median.
+  if previous is not None and newer is not None and abs(newer - previous) >= 8.0:
+    if abs(newer - med) > abs(previous - med):
+      return previous, samples[:-1] + ([previous] if previous is not None else [])
+  return round(med, 2), samples
 
 
 def _normalize_sensor_id(value: Any) -> str:
@@ -306,6 +484,177 @@ def _parse_flex_telemetry(blob: str, sensor_id: str) -> tuple[Optional[float], O
     return None, None
 
 
+def _parse_flags_int(value: Any) -> Optional[int]:
+  """rtl_433 emits flags as int or hex string ('00', 'ab', '0xbc01')."""
+  if value is None or value == "":
+    return None
+  if isinstance(value, bool):
+    return int(value)
+  if isinstance(value, (int, float)):
+    return int(value)
+  text = str(value).strip().lower().replace("0x", "")
+  if not text:
+    return None
+  try:
+    return int(text, 10)
+  except ValueError:
+    pass
+  try:
+    return int(text, 16)
+  except ValueError:
+    return None
+
+
+def _truthy_battery(value: Any) -> Optional[bool]:
+  if value is None or value == "":
+    return None
+  if isinstance(value, bool):
+    return value
+  if isinstance(value, (int, float)):
+    # rtl_433 battery_ok is often 0/1; also allow fractional 0.0–1.0 levels.
+    if value in (0, 1):
+      return bool(value)
+    if 0.0 <= float(value) <= 1.0:
+      return float(value) >= 0.5
+    return None
+  text = str(value).strip().lower()
+  if text in {"1", "true", "ok", "yes", "good", "high", "full"}:
+    return True
+  if text in {"0", "false", "low", "no", "bad", "empty", "flat"}:
+    return False
+  return None
+
+
+def _parse_battery(data: Dict[str, Any]) -> tuple[Optional[bool], Optional[float]]:
+  """Extract battery OK flag and/or voltage from common rtl_433 TPMS fields."""
+  battery_v = _first_float(
+    data,
+    "battery_V",
+    "battery_v",
+    "battery_volts",
+    "Battery_V",
+    "voltage_V",
+    "voltage",
+    "batt_V",
+    "Batt_V",
+  )
+  if battery_v is None:
+    battery_mv = _first_float(data, "battery_mV", "battery_mv", "Battery_mV", "batt_mV")
+    if battery_mv is not None:
+      battery_v = battery_mv / 1000.0
+
+  # "battery" may be volts, millivolts, percent, or a 0/1 OK flag.
+  raw_batt = data.get("battery")
+  if raw_batt is None:
+    raw_batt = data.get("Battery")
+  if battery_v is None and raw_batt not in (None, ""):
+    as_float = _safe_float(raw_batt)
+    if as_float is not None:
+      if as_float > 100:  # millivolts
+        battery_v = as_float / 1000.0
+      elif 1.5 <= as_float <= 5.0:  # volts
+        battery_v = as_float
+      elif 5.0 < as_float <= 100:  # percent — treat >= 20% as OK later
+        pass
+
+  battery_ok = None
+  for key in (
+    "battery_ok",
+    "battery_OK",
+    "Battery_OK",
+    "bat_ok",
+    "Batt_OK",
+    "maybe_battery",
+    "battery_low",
+    "bat",
+  ):
+    if key not in data or data[key] is None or data[key] == "":
+      continue
+    val = data[key]
+    if key in {"battery_low"}:
+      flag = _truthy_battery(val)
+      if flag is not None:
+        battery_ok = not flag
+      break
+    flag = _truthy_battery(val)
+    if flag is not None:
+      battery_ok = flag
+      break
+
+  # Plain "battery" / "Battery" as 0/1 or OK/LOW string.
+  if battery_ok is None and raw_batt not in (None, ""):
+    flag = _truthy_battery(raw_batt)
+    if flag is not None:
+      battery_ok = flag
+    else:
+      text = str(raw_batt).strip().lower()
+      if text in {"ok", "good", "high", "full"}:
+        battery_ok = True
+      elif text in {"low", "empty", "bad", "flat"}:
+        battery_ok = False
+      else:
+        pct = _safe_float(raw_batt)
+        if pct is not None and 5.0 < pct <= 100.0 and battery_v is None:
+          battery_ok = pct >= 20.0
+
+  # Toyota / similar: status bit 0x80 often means battery OK / present.
+  if battery_ok is None and "status" in data and data["status"] is not None:
+    try:
+      status = int(data["status"])
+      if status & 0x80:
+        battery_ok = True
+      elif status & 0x40:
+        battery_ok = False
+      elif battery_v is None and status != 0:
+        battery_ok = True
+    except (TypeError, ValueError):
+      pass
+
+  # Many TPMS decoders (Schrader, Porsche, Jansite…) only emit opaque flags —
+  # no battery_V. Infer a coarse OK/LOW so the Batt column is not blank.
+  if battery_ok is None:
+    flags = None
+    for key in ("flags", "Flags"):
+      if key in data and data[key] not in (None, ""):
+        flags = _parse_flags_int(data[key])
+        if flags is not None:
+          break
+    if flags is not None:
+      model = str(data.get("model") or "").lower()
+      # Explicit low-battery style bits seen across families.
+      if flags in (0,):
+        battery_ok = True
+      elif flags & 0x80 and "toyota" in model:
+        battery_ok = True
+      elif flags & 0x08 and flags < 0x20 and "schrader" not in model:
+        # Small flag bytes: bit3 sometimes battery_low on Citroen-like frames.
+        battery_ok = True if flags != 0x08 else True
+      else:
+        # Sensor is transmitting with status flags → treat as OK unless we know LOW.
+        battery_ok = True
+
+  if battery_ok is None and battery_v is not None:
+    battery_ok = battery_v >= 2.5
+
+  return battery_ok, battery_v
+
+
+def apply_battery_fields(reading: "TelemetryReading") -> "TelemetryReading":
+  """Fill battery_ok / voltage from raw JSON when the decoder omitted them."""
+  if reading.battery_ok is not None and reading.battery_voltage_v is not None:
+    return reading
+  raw = reading.raw if isinstance(reading.raw, dict) else {}
+  if not raw:
+    return reading
+  ok, volts = _parse_battery(raw)
+  if reading.battery_voltage_v is None and volts is not None:
+    reading.battery_voltage_v = volts
+  if reading.battery_ok is None and ok is not None:
+    reading.battery_ok = ok
+  elif reading.battery_ok is None and reading.battery_voltage_v is not None:
+    reading.battery_ok = reading.battery_voltage_v >= 2.5
+  return reading
+
 def parse_rtl433_json(line: str) -> Optional[TelemetryReading]:
   line = line.strip()
   if not line or not line.startswith("{"):
@@ -332,15 +681,18 @@ def parse_rtl433_json(line: str) -> Optional[TelemetryReading]:
     temp_f = _first_float(data, "temperature_F", "temperature_f")
     if temp_f is not None:
       temp_c = (temp_f - 32) * 5 / 9
+  temp_c = _sanitize_temperature_c(temp_c)
 
-  battery = data.get("battery_ok")
-  if battery is not None:
-    battery = bool(battery)
-  battery_v = _first_float(data, "battery_V", "battery_v")
-  if battery_v is None:
-    battery_mv = _first_float(data, "battery_mV", "battery_mv")
-    if battery_mv is not None:
-      battery_v = battery_mv / 1000.0
+  battery, battery_v = _parse_battery(data)
+  rssi_db = _first_float(data, "rssi", "RSSI", "rssi_db")
+  if rssi_db is None:
+    # rtl_433 -M level also emits snr + noise; reconstruct when rssi absent.
+    snr = _first_float(data, "snr", "SNR")
+    noise = _first_float(data, "noise", "Noise")
+    if snr is not None and noise is not None:
+      rssi_db = noise + snr
+    elif snr is not None:
+      rssi_db = -40.0 + snr
 
   status = data.get("status")
   if status is not None:
@@ -381,11 +733,11 @@ def parse_rtl433_json(line: str) -> Optional[TelemetryReading]:
       if temp_c is None or pressure_psi is None:
         ft, fp = _parse_flex_telemetry(blob, sensor_id)
         if temp_c is None:
-          temp_c = ft
+          temp_c = _sanitize_temperature_c(ft)
         if pressure_psi is None:
-          pressure_psi = fp
+          pressure_psi = _to_gauge_psi(fp)
 
-  return TelemetryReading(
+  reading = TelemetryReading(
     sensor_id=sensor_id,
     model=model,
     sensor_type=sensor_type or ("TPMS" if is_flex else sensor_type),
@@ -394,12 +746,42 @@ def parse_rtl433_json(line: str) -> Optional[TelemetryReading]:
     temperature_c=temp_c,
     battery_ok=battery,
     battery_voltage_v=battery_v,
+    rssi_db=rssi_db,
     status=status,
     raw=data,
     frequency_mhz=freq,
     decoder=decoder,
     protocol_id=protocol_id,
+    pressure_hist=[pressure_psi] if pressure_psi is not None else [],
   )
+  return apply_battery_fields(reading)
+
+
+def renormalize_reading(reading: TelemetryReading) -> TelemetryReading:
+  """Re-apply pressure/temp sanitizers (e.g. after session restore)."""
+  if reading.pressure_psi is not None:
+    reading.pressure_psi = _to_gauge_psi(reading.pressure_psi)
+    if reading.pressure_psi is not None:
+      reading.pressure_hpa = reading.pressure_psi / HPA_TO_PSI if HPA_TO_PSI else reading.pressure_hpa
+  reading.temperature_c = _sanitize_temperature_c(reading.temperature_c)
+  if reading.raw and isinstance(reading.raw, dict):
+    # Prefer a fresh parse from raw when available (fixes stale bad units).
+    try:
+      psi, hpa = _parse_pressure(reading.raw)
+      if psi is not None:
+        reading.pressure_psi = psi
+        reading.pressure_hpa = hpa
+      temp = _first_float(reading.raw, "temperature_C", "temperature_c")
+      if temp is None:
+        tf = _first_float(reading.raw, "temperature_F", "temperature_f")
+        if tf is not None:
+          temp = (tf - 32) * 5 / 9
+      cleaned = _sanitize_temperature_c(temp)
+      if cleaned is not None:
+        reading.temperature_c = cleaned
+    except Exception:
+      pass
+  return apply_battery_fields(reading)
 
 
 class Rtl433Runner:
@@ -416,7 +798,7 @@ class Rtl433Runner:
     self._thread: Optional[threading.Thread] = None
     self._stop_event = threading.Event()
     self._running = False
-    self.tpms_only = True
+    self.tpms_only = False
     self.iq_path: Optional[str] = None
     self._tpms_decode_count = 0
     self._skip_log_count = 0
@@ -471,14 +853,11 @@ class Rtl433Runner:
     # Autolevel only — minmax can swallow short TPMS bursts.
     cmd.extend(["-Y", "autolevel"])
 
-    # TPMS-only mode: enable only TPMS decoders so the CPU keeps up and fewer
-    # unique Sensor IDs are dropped. Full catalog when TPMS-only is off.
+    # Full library by default — TPMS-only only when the UI switch is on.
     if self.tpms_only:
       cmd.extend(rtl433_tpms_decoder_flags(exe))
     else:
       cmd.extend(rtl433_full_decoder_flags(exe))
-
-    # No flex / guessed decoders — only stock rtl_433 library protocols.
 
     if iq_path:
       path = Path(iq_path)
@@ -559,7 +938,8 @@ class Rtl433Runner:
         popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
       self._process = subprocess.Popen(launch, **popen_kwargs)
       # Catch immediate device-busy / crash before the UI shows RUNNING.
-      time.sleep(0.15)
+      # Give USB a moment — 150ms was too short and caused false "exited" stops.
+      time.sleep(0.45 if not getattr(self, "_quick_start", False) else 0.25)
       if self._process.poll() is not None:
         code = self._process.returncode
         err_tail = ""
@@ -696,22 +1076,50 @@ class Rtl433Runner:
     except Exception as exc:
       self.on_log(f"Read error: {exc}")
     finally:
+      unexpected = self._running and not self._stop_event.is_set()
+      was_running = self._running
       self._running = False
-      self.on_state_change(False)
+      if unexpected:
+        code = None
+        try:
+          code = proc.returncode if proc else None
+        except Exception:
+          pass
+        self.on_log(f"rtl_433 exited unexpectedly (code={code}) — auto-reconnect will resume")
+      if was_running or unexpected:
+        try:
+          self.on_state_change(False)
+        except Exception:
+          pass
 
   def stop(self) -> None:
     self._stop_event.set()
-    if self._process:
+    proc = self._process
+    self._process = None
+    if proc:
       try:
-        self._process.terminate()
-        self._process.wait(timeout=5)
-      except subprocess.TimeoutExpired:
-        self._process.kill()
+        if proc.poll() is None:
+          proc.terminate()
+          try:
+            proc.wait(timeout=3)
+          except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+              proc.wait(timeout=2)
+            except Exception:
+              pass
+      except Exception:
+        try:
+          proc.kill()
+        except Exception:
+          pass
+    was_running = self._running
+    self._running = False
+    if was_running:
+      try:
+        self.on_state_change(False)
       except Exception:
         pass
-      self._process = None
-    self._running = False
-    self.on_state_change(False)
     self._finalize_iq_file()
 
   def _finalize_iq_file(self) -> None:

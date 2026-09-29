@@ -37,6 +37,7 @@ _protocol_info_cache: dict[str, tuple[dict[int, str], tuple[int, ...]]] = {}
 
 
 def _run_rtl433_help(exe: Path | None, topic: str) -> str:
+  import os
   import subprocess
 
   binary = exe if exe is not None else get_rtl433_exe()
@@ -51,6 +52,7 @@ def _run_rtl433_help(exe: Path | None, topic: str) -> str:
       errors="replace",
       timeout=20,
       cwd=str(Path(binary).parent),
+      creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
   except Exception:
     return ""

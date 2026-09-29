@@ -125,6 +125,7 @@ def _sdr_status() -> PathStatus:
         if not path:
             continue
         try:
+            no_window = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
             if binary == "rtl_test":
                 proc = subprocess.run(
                     [path, "-t"],
@@ -132,6 +133,7 @@ def _sdr_status() -> PathStatus:
                     text=True,
                     timeout=8,
                     check=False,
+                    **no_window,
                 )
             else:
                 proc = subprocess.run(
@@ -140,6 +142,7 @@ def _sdr_status() -> PathStatus:
                     text=True,
                     timeout=10,
                     check=False,
+                    **no_window,
                 )
             text = (proc.stdout or "") + (proc.stderr or "")
             if "No supported devices found" in text or "Failed to open" in text:
