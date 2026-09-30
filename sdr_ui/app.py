@@ -113,18 +113,12 @@ class SdrView(ctk.CTkFrame):
     self._setup_styles()
     self._build_ui()
     self._load_prefs()
-    restored = self._restore_session_snapshot()
+    # Session restore deferred — CombinedApp asks Continue vs New Session at startup.
     self._update_stats()
     self._notify_status()
     self.after(self._AUTOSAVE_MS, self._autosave_tick)
     self.after(self._UI_FLUSH_MS, self._flush_readings_tick)
     self.after(2500, self._keepalive_tick)
-    if restored:
-      self.after(200, lambda: self._log(
-        f"Restored {len(self._sensors)} SDR sensor(s) from last session — press START to resume RF."
-      ))
-      # Do not auto-start listen: it races duplicate windows (usb_open ERROR) and
-      # overwrites the restored snapshot before the operator is ready.
 
     if self.setup_mgr.is_first_run():
       self.after(400, self._show_setup)
@@ -1774,6 +1768,26 @@ class SdrView(ctk.CTkFrame):
       self._autosave_dirty = False
     except Exception as exc:
       self._log(f"SDR autosave failed: {exc}")
+
+  def previous_sensor_count(self) -> int:
+    data = load_session()
+    if not data:
+      return 0
+    sensors = data.get("sensors") or {}
+    return len(sensors) if isinstance(sensors, dict) else 0
+
+  def restore_previous_session(self) -> bool:
+    restored = self._restore_session_snapshot()
+    if restored:
+      self._log(
+        f"Restored {len(self._sensors)} SDR sensor(s) from last session — press START to resume RF."
+      )
+    return restored
+
+  def clear_session_silent(self) -> None:
+    """Clear SDR live session without confirmation (startup New Session)."""
+    self._clear_session()
+    self.footer_label.configure(text="New session — previous SDR readings cleared")
 
   def _restore_session_snapshot(self) -> bool:
     data = load_session()

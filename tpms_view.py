@@ -31,6 +31,7 @@ from themes import (
     COLOR_BTN_PAUSE_HOVER,
     COLOR_BTN_PRIMARY,
     COLOR_BTN_PRIMARY_HOVER,
+    COLOR_BTN_PRIMARY_TEXT,
     COLOR_BTN_SECONDARY,
     COLOR_BTN_SECONDARY_HOVER,
     COLOR_BTN_STOP,
@@ -153,20 +154,13 @@ class TpmsView(ctk.CTkFrame):
         self._setup_styles()
         self._build_ui()
         self._reset_display()
-        restored = self._restore_session_from_db()
+        # Session restore is deferred — CombinedApp asks Continue vs New Session at startup.
         self._autoload_default_excel()
         self.after(150, self._drain)
         self.after(80, self._animate_badge)
         self.after(900, self._poll_live_sdr)
         self._notify_status()
         self.live_sdr_get = None
-        if restored:
-            self.after(
-                250,
-                lambda: self.status_var.set(
-                    f"Restored {restored} Board result row(s) from last session — no rerun needed"
-                ),
-            )
 
     def _toplevel(self):
         return self.winfo_toplevel()
@@ -354,10 +348,10 @@ class TpmsView(ctk.CTkFrame):
         charts_anchor.grid_columnconfigure(0, weight=1)
         charts_anchor.grid_rowconfigure(0, weight=1)
         self.trend_charts = BoardTrendCharts(
-            charts_anchor, height=100, title="Board trend graphs  ·  pass rate / cumulative / battery"
+            charts_anchor, height=78, title="Board trend graphs  ·  pass rate / cumulative / battery"
         )
-        self.trend_charts.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
-        self.charts = ResultCharts(charts_anchor, height=88, title="Board results")
+        self.trend_charts.grid(row=0, column=0, sticky="nsew", pady=(0, 2))
+        self.charts = ResultCharts(charts_anchor, height=70, title="Board results")
         self.charts.grid(row=1, column=0, sticky="ew")
 
         top = ctk.CTkFrame(self, fg_color=COLOR_BG_CARD, corner_radius=8, border_width=1, border_color=COLOR_BORDER)
@@ -381,12 +375,23 @@ class TpmsView(ctk.CTkFrame):
         # Run chunk / Run full / Chunk live only in the top nav — do not repeat them here.
         toolbar = ctk.CTkFrame(top_inner, fg_color=COLOR_BG_PANEL, corner_radius=8)
         toolbar.pack(fill="x", pady=(0, 8))
-        toolbar.grid_columnconfigure(2, weight=1)
+        toolbar.grid_columnconfigure(3, weight=1)
 
-        # Run chunk / Run full live in the top nav only. Keep state so Pause/Stop still work.
-        self.start_btn = _ControlState()
+        # Board-only START lives here; Run chunk / Run full (Board+SDR) stay in the top nav.
         self.full_btn = _ControlState()
-
+        self.start_btn = ctk.CTkButton(
+            toolbar,
+            text="START",
+            width=96,
+            height=32,
+            font=ui_font(12, "bold"),
+            fg_color=COLOR_BTN_PRIMARY,
+            hover_color=COLOR_BTN_PRIMARY_HOVER,
+            text_color=COLOR_BTN_PRIMARY_TEXT,
+            corner_radius=8,
+            command=lambda: self.start_test(skip_sdr=True, run_full=False),
+        )
+        self.start_btn.grid(row=0, column=0, padx=(8, 6), pady=8, sticky="w")
         self.pause_btn = ctk.CTkButton(
             toolbar,
             text="PAUSE",
@@ -400,7 +405,7 @@ class TpmsView(ctk.CTkFrame):
             state="disabled",
             command=self.toggle_pause,
         )
-        self.pause_btn.grid(row=0, column=0, padx=(8, 6), pady=8, sticky="w")
+        self.pause_btn.grid(row=0, column=1, padx=(0, 6), pady=8, sticky="w")
         self.stop_btn = ctk.CTkButton(
             toolbar,
             text="STOP",
@@ -414,7 +419,7 @@ class TpmsView(ctk.CTkFrame):
             state="disabled",
             command=self.stop_test,
         )
-        self.stop_btn.grid(row=0, column=1, padx=(0, 8), pady=8, sticky="w")
+        self.stop_btn.grid(row=0, column=2, padx=(0, 8), pady=8, sticky="w")
 
         ctk.CTkLabel(toolbar, text="Port", font=ui_font(11, "bold"), text_color=COLOR_TEXT_DIM).grid(
             row=0, column=7, padx=(8, 4), pady=8, sticky="e"
@@ -503,57 +508,57 @@ class TpmsView(ctk.CTkFrame):
         self.codes_hint.pack(anchor="w")
 
         current = ctk.CTkFrame(self, fg_color=COLOR_BG_CARD, corner_radius=8, border_width=1, border_color=COLOR_BORDER)
-        current.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        current.grid(row=1, column=0, sticky="ew", pady=(0, 4))
         current_inner = ctk.CTkFrame(current, fg_color="transparent")
-        current_inner.pack(fill="x", padx=10, pady=8)
+        current_inner.pack(fill="x", padx=8, pady=4)
 
         top_row = ctk.CTkFrame(current_inner, fg_color="transparent")
         top_row.pack(fill="x")
         self.vehicle_var = ctk.StringVar(value="Ready — choose an Excel database and/or enter custom codes")
         ctk.CTkLabel(
-            top_row, textvariable=self.vehicle_var, font=ctk.CTkFont(size=14, weight="bold"), text_color=COLOR_TEXT, anchor="w"
+            top_row, textvariable=self.vehicle_var, font=ctk.CTkFont(size=12, weight="bold"), text_color=COLOR_TEXT, anchor="w"
         ).pack(side="left")
         self.row_counter = ctk.CTkLabel(
-            top_row, text="", font=ctk.CTkFont(size=11, weight="bold"), fg_color=COLOR_BLUE, text_color="white",
-            corner_radius=6, width=90,
+            top_row, text="", font=ctk.CTkFont(size=10, weight="bold"), fg_color=COLOR_BLUE, text_color="white",
+            corner_radius=5, width=84, height=20,
         )
         self.row_counter.pack(side="right")
         self.meta_var = ctk.StringVar(value="OE: —   ·   Supplier: —   ·   Freq: —")
-        ctk.CTkLabel(current_inner, textvariable=self.meta_var, font=ctk.CTkFont(size=11), text_color=COLOR_TEXT_DIM, anchor="w").pack(
-            anchor="w", pady=(2, 4)
+        ctk.CTkLabel(current_inner, textvariable=self.meta_var, font=ctk.CTkFont(size=10), text_color=COLOR_TEXT_DIM, anchor="w").pack(
+            anchor="w", pady=(0, 2)
         )
 
         codes = ctk.CTkFrame(current_inner, fg_color="transparent")
         codes.pack(fill="x")
         self.code_vars = {"A": ctk.StringVar(value="—"), "B": ctk.StringVar(value="—"), "C": ctk.StringVar(value="—")}
         for key, bg, fg, padx_right in (
-            ("A", CODE_A_BG, CODE_A_FG, 6),
-            ("B", CODE_B_BG, CODE_B_FG, 6),
+            ("A", CODE_A_BG, CODE_A_FG, 4),
+            ("B", CODE_B_BG, CODE_B_FG, 4),
             ("C", CODE_C_BG, CODE_C_FG, 0),
         ):
-            box = ctk.CTkFrame(codes, fg_color=bg, corner_radius=6)
+            box = ctk.CTkFrame(codes, fg_color=bg, corner_radius=5)
             box.pack(side="left", expand=True, fill="both", padx=(0, padx_right))
             inner = ctk.CTkFrame(box, fg_color="transparent")
-            inner.pack(fill="x", padx=12, pady=8)
+            inner.pack(fill="x", padx=8, pady=3)
             ctk.CTkLabel(
-                inner, text=f"CODE {key}", font=ctk.CTkFont(size=9, weight="bold"), text_color=fg, anchor="w"
-            ).pack(side="left", padx=(0, 10))
+                inner, text=f"CODE {key}", font=ctk.CTkFont(size=8, weight="bold"), text_color=fg, anchor="w"
+            ).pack(side="left", padx=(0, 8))
             ctk.CTkLabel(
                 inner,
                 textvariable=self.code_vars[key],
-                font=ctk.CTkFont(family="Consolas", size=13, weight="bold"),
+                font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
                 text_color=fg,
                 anchor="w",
             ).pack(side="left", fill="x", expand=True)
 
-        tel = ctk.CTkFrame(current_inner, fg_color=TELEMETRY_BG, corner_radius=6)
-        tel.pack(fill="x", pady=(8, 0))
+        tel = ctk.CTkFrame(current_inner, fg_color=TELEMETRY_BG, corner_radius=5)
+        tel.pack(fill="x", pady=(4, 0))
         tel_inner = ctk.CTkFrame(tel, fg_color="transparent")
-        tel_inner.pack(fill="x", padx=12, pady=10)
+        tel_inner.pack(fill="x", padx=8, pady=4)
         ctk.CTkLabel(
             tel_inner,
             text="LIVE TELEMETRY",
-            font=ctk.CTkFont(size=9, weight="bold"),
+            font=ctk.CTkFont(size=8, weight="bold"),
             text_color=TELEMETRY_FG,
             anchor="w",
         ).pack(anchor="w")
@@ -561,11 +566,11 @@ class TpmsView(ctk.CTkFrame):
         ctk.CTkLabel(
             tel_inner,
             textvariable=self.reading_var,
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=ctk.CTkFont(size=11, weight="bold"),
             text_color=TELEMETRY_FG,
             anchor="w",
             justify="left",
-        ).pack(fill="x", anchor="w", pady=(2, 0))
+        ).pack(fill="x", anchor="w", pady=(1, 0))
 
     def _refresh_ports(self) -> None:
         ports = find_serial_ports() or [default_port()]
@@ -950,6 +955,50 @@ class TpmsView(ctk.CTkFrame):
                 return
         if DEFAULT_HAMATON_XLSX.is_file():
             self._load_excel(DEFAULT_HAMATON_XLSX)
+
+    def previous_session_count(self) -> int:
+        """How many Board OK/NOK rows are stored from the last session."""
+        try:
+            from tpms_bench.results_db import connect, fetch_all
+            from tpms_bench.runner import DB_PATH
+        except Exception:
+            return 0
+        if not DB_PATH.exists():
+            return 0
+        try:
+            db = connect(DB_PATH)
+            rows = fetch_all(db)
+            db.close()
+        except Exception:
+            return 0
+        return sum(1 for row in rows if str(row["board_performance"] or "").strip().upper() in {"OK", "NOK"})
+
+    def restore_previous_session(self) -> int:
+        """Hydrate the Board table from SQLite. Returns restored row count."""
+        restored = self._restore_session_from_db()
+        if restored:
+            self.status_var.set(f"Restored {restored} Board result row(s) from last session")
+            self._set_state_badge("IDLE")
+        return restored
+
+    def clear_session_silent(self) -> None:
+        """Clear Board results without a confirmation dialog (startup New Session)."""
+        try:
+            reset_session_db()
+        except Exception:
+            pass
+        if self.source_xlsx and self.source_xlsx.is_file():
+            try:
+                from tpms_bench.excel_io import copy_workbook
+                from tpms_bench.runner import OUT_XLSX
+
+                copy_workbook(self.source_xlsx, OUT_XLSX, force=True)
+            except Exception:
+                pass
+        self._clear_readings()
+        self._reset_display()
+        self._set_state_badge("IDLE")
+        self.status_var.set("New session — previous Board results cleared")
 
     def reset_session(self) -> None:
         if self.worker and self.worker.is_alive():

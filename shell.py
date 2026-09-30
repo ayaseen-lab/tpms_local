@@ -84,6 +84,8 @@ class CombinedApp(ctk.CTk):
             # Full catalog by default when launching a clean automated run.
             full = os.environ.get("FYRQOM_RUN_FULL", "1") == "1"
             self.after(1800, lambda: self._start_both(run_full=full))
+        else:
+            self.after(350, self._prompt_session_choice)
 
     def _build_chrome(self) -> None:
         header = ctk.CTkFrame(self, fg_color=COLOR_HEADER_BG, corner_radius=0, height=72)
@@ -234,6 +236,68 @@ class CombinedApp(ctk.CTk):
         self.board_view.on_sdr_finalize = self.sdr_view.finalize_board_match
         self.sdr_view.on_range_update = self.range_view.update_sdr
         self.show_view("board")
+
+    def _prompt_session_choice(self) -> None:
+        """Ask whether to continue the previous Board/SDR session or start clean."""
+        board_n = 0
+        sdr_n = 0
+        try:
+            board_n = int(self.board_view.previous_session_count())
+        except Exception:
+            board_n = 0
+        try:
+            sdr_n = int(self.sdr_view.previous_sensor_count())
+        except Exception:
+            sdr_n = 0
+        if board_n <= 0 and sdr_n <= 0:
+            return
+
+        parts = []
+        if board_n:
+            parts.append(f"{board_n} Board result row(s)")
+        if sdr_n:
+            parts.append(f"{sdr_n} SDR sensor(s)")
+        summary = " and ".join(parts)
+
+        # Yes = continue · No = clear / new session
+        continue_session = messagebox.askyesno(
+            "Previous session found",
+            f"A previous session is saved:\n\n  {summary}\n\n"
+            "Yes  — Continue previous session (keep results)\n"
+            "No   — Start a new session (clear Board + SDR values)",
+            parent=self,
+        )
+        if continue_session:
+            try:
+                restored_b = self.board_view.restore_previous_session()
+            except Exception:
+                restored_b = 0
+            try:
+                restored_s = self.sdr_view.restore_previous_session()
+            except Exception:
+                restored_s = False
+            note = []
+            if restored_b:
+                note.append(f"Board {restored_b}")
+            if restored_s:
+                note.append(f"SDR {len(self.sdr_view.get_sensor_snapshot())}")
+            if note:
+                self.title(f"{APP_TITLE}  ·  restored {' + '.join(note)}")
+            return
+
+        try:
+            self.board_view.clear_session_silent()
+        except Exception:
+            pass
+        try:
+            self.sdr_view.clear_session_silent()
+        except Exception:
+            pass
+        try:
+            self.compare_view.refresh()
+        except Exception:
+            pass
+        self.title(f"{APP_TITLE}  ·  new session")
 
     def show_view(self, name: str) -> None:
         self._active = name
