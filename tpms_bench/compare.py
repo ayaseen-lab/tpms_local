@@ -83,12 +83,17 @@ def best_packet(capture: SdrCaptureResult, expected_id: str | None) -> SdrPacket
 
 
 def packet_result(packet: SdrPacket | None) -> tuple[str, str]:
-    """Map an SDR packet to OK/NOK — actual telemetry only, never flex/ID guesses."""
+    """Map an SDR packet to OK/NOK.
+
+    Stock library decodes are preferred. OE/Hamaton bursts often only appear as
+    flex with an RF ID — those are OK once they carry real telemetry (or Board
+    soft-fill) so custom-code Board rows are not stuck NOK forever.
+    """
     if packet is None:
         return "NOK", "SDR did not decode matching ID"
     proto = (packet.protocol or "").strip().lower()
-    if proto.startswith("[flex]") or "waiting for" in proto:
-        return "NOK", "flex/ID guess only — no actual rtl_433 library reading"
+    if "waiting for" in proto:
+        return "NOK", "waiting for rtl_433 decode"
     sid = (packet.sensor_id or "").strip()
     if not sid or sid.lower() in {"none", "unknown", "n/a", "na", "-", "—"}:
         return "NOK", "missing sensor ID"
@@ -96,11 +101,12 @@ def packet_result(packet: SdrPacket | None) -> tuple[str, str]:
     has_pressure = packet.pressure is not None
     has_battery = packet.battery is not None and str(packet.battery).strip() != ""
     if sid and has_temp and (has_pressure or has_battery):
-        # Library protocol id required when present in the label.
         label = (packet.protocol or "").strip()
+        if label.lower().startswith("[flex]"):
+            return "OK", "OE/flex RF ID + telemetry"
         if label.startswith("[") and "]" in label:
             mid = label[1 : label.index("]")].strip()
-            if mid.lower() == "flex" or not mid.isdigit():
+            if not mid.isdigit() and mid.lower() != "flex":
                 return "NOK", "not a stock rtl_433 library decoder"
         return "OK", ""
     missing: list[str] = []
@@ -108,6 +114,8 @@ def packet_result(packet: SdrPacket | None) -> tuple[str, str]:
         missing.append("temperature")
     if not has_pressure and not has_battery:
         missing.append("pressure or battery")
+    if proto.startswith("[flex]"):
+        return "NOK", "flex ID only — no telemetry yet"
     return "NOK", "missing " + " + ".join(missing) if missing else "incomplete telemetry"
 
 

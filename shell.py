@@ -25,6 +25,7 @@ from comparative_report import build_comparison, export_comparative_excel, expor
 from comparison_view import ComparisonView
 from dialogs import ask_save_path
 from iq_urh_tool import IqUrhView
+from progress_view import ProgressView
 from range_view import RangeView
 from themes import (
     COLOR_BG,
@@ -110,7 +111,7 @@ class CombinedApp(ctk.CTk):
         titles = ctk.CTkFrame(left, fg_color="transparent")
         titles.pack(side="left")
         ctk.CTkLabel(
-            titles, text="TPMS  Suite", font=ui_font(16, "bold"), text_color=COLOR_HEADER_TEXT
+            titles, text="TPMS Suite 4.0", font=ui_font(16, "bold"), text_color=COLOR_HEADER_TEXT
         ).pack(anchor="w")
         ctk.CTkLabel(titles, text=APP_SUBTITLE, font=ui_font(11), text_color=COLOR_HEADER_SUB).pack(anchor="w")
 
@@ -142,6 +143,11 @@ class CombinedApp(ctk.CTk):
             corner_radius=10, command=lambda: self.show_view("sdr"),
         )
         self.sdr_tab.pack(side="left", padx=(0, 4), pady=4)
+        self.progress_tab = ctk.CTkButton(
+            tabs, text="Progress", width=108, height=34, font=ui_font(13, "bold"),
+            corner_radius=10, command=lambda: self.show_view("progress"),
+        )
+        self.progress_tab.pack(side="left", padx=(0, 4), pady=4)
         self.compare_tab = ctk.CTkButton(
             tabs, text="Comparison", width=120, height=34, font=ui_font(13, "bold"),
             corner_radius=10, command=lambda: self.show_view("compare"),
@@ -206,11 +212,17 @@ class CombinedApp(ctk.CTk):
         self.content.grid_columnconfigure(0, weight=1)
 
     def _build_views(self) -> None:
-        self.sdr_view = SdrView(self.content, on_status_change=self._on_sdr_status)
+        self.progress_view = ProgressView(self.content)
+        self.sdr_view = SdrView(
+            self.content,
+            on_status_change=self._on_sdr_status,
+            on_process_update=self._on_sdr_process,
+        )
         self.board_view = TpmsView(
             self.content,
             on_status_change=self._on_board_status,
             on_chunk_complete=self._on_chunk_complete,
+            on_process_update=self._on_board_process,
             chunk_var=self.chunk_var,
         )
         self.compare_view = ComparisonView(
@@ -227,15 +239,58 @@ class CombinedApp(ctk.CTk):
         )
         self.sdr_view.grid(row=0, column=0, sticky="nsew")
         self.board_view.grid(row=0, column=0, sticky="nsew")
+        self.progress_view.grid(row=0, column=0, sticky="nsew")
         self.compare_view.grid(row=0, column=0, sticky="nsew")
         self.range_view.grid(row=0, column=0, sticky="nsew")
         self.iq_view.grid(row=0, column=0, sticky="nsew")
         self.board_view.live_sdr_get = self.sdr_view.get_sensor_snapshot
+        self.board_view.live_sdr_prepare = self._prepare_sdr_ready
         self.board_view.on_board_rf = self.sdr_view.ingest_board_reading
         self.board_view.on_board_trigger = self.sdr_view.watch_board_burst
         self.board_view.on_sdr_finalize = self.sdr_view.finalize_board_match
+        self.board_view.on_prepare_sdr = self._prepare_sdr_for_board
+        self.board_view.on_sdr_release = self._release_sdr_after_board
         self.sdr_view.on_range_update = self.range_view.update_sdr
         self.show_view("board")
+
+    def _prepare_sdr_for_board(self, freq_mhz: float | None = None) -> bool:
+        """Ensure SDR is listening (and tuned) for Board / custom-code compare."""
+        try:
+            return bool(self.sdr_view.ensure_listening(freq_mhz=freq_mhz))
+        except Exception:
+            return False
+
+    def _prepare_sdr_ready(self, freq_mhz: float | None = None) -> bool:
+        """Sync prepare for BenchRunner — True only when rtl_433 is alive on band."""
+        try:
+            tuned = bool(self.sdr_view.ensure_listening(freq_mhz=freq_mhz))
+        except Exception:
+            return False
+        try:
+            alive = bool(self.sdr_view.is_listen_alive())
+        except Exception:
+            alive = False
+        # ensure_listening True means already on-band; also require subprocess up.
+        return bool(tuned and alive)
+
+    def _release_sdr_after_board(self, reason: str = "", message: str = "") -> None:
+        """Board session/chunk settled — stop SDR listening until the next Start/row."""
+        try:
+            self.sdr_view.release_after_board_session(reason=reason, message=message)
+        except Exception:
+            pass
+
+    def _on_board_process(self, **kwargs) -> None:
+        try:
+            self.progress_view.board_event(**kwargs)
+        except Exception:
+            pass
+
+    def _on_sdr_process(self, **kwargs) -> None:
+        try:
+            self.progress_view.sdr_event(**kwargs)
+        except Exception:
+            pass
 
     def _prompt_session_choice(self) -> None:
         """Ask whether to continue the previous Board/SDR session or start clean."""
@@ -303,17 +358,22 @@ class CombinedApp(ctk.CTk):
         self._active = name
         self.board_view.grid_remove()
         self.sdr_view.grid_remove()
+        self.progress_view.grid_remove()
         self.compare_view.grid_remove()
         self.range_view.grid_remove()
         self.iq_view.grid_remove()
         self._paint_tab(self.board_tab, False)
         self._paint_tab(self.sdr_tab, False)
+        self._paint_tab(self.progress_tab, False)
         self._paint_tab(self.compare_tab, False)
         self._paint_tab(self.range_tab, False)
         self._paint_tab(self.iq_tab, False)
         if name == "sdr":
             self.sdr_view.grid(row=0, column=0, sticky="nsew")
             self._paint_tab(self.sdr_tab, True)
+        elif name == "progress":
+            self.progress_view.grid(row=0, column=0, sticky="nsew")
+            self._paint_tab(self.progress_tab, True)
         elif name == "compare":
             self.compare_view.grid(row=0, column=0, sticky="nsew")
             self._paint_tab(self.compare_tab, True)

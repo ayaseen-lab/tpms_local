@@ -2,9 +2,9 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-title TPMS Suite 2.0
+title TPMS Suite 4.0
 echo.
-echo  TPMS Suite 2.0
+echo  TPMS Suite 4.0
 echo  --------------
 
 REM Prefer packaged PyInstaller onedir build if present

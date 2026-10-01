@@ -1,19 +1,19 @@
-TPMS Suite 2.0
+TPMS Suite 4.0
 
 What's new
 ----------
-• Default Hamaton full catalog (data/Hamaton_database_*.xlsx)
-• Board USB-TTL RX first — J-Link / JTAG is optional (Windows client path)
-• SDR OK only from stock rtl_433 library telemetry (no flex / no guessing)
-• Board waits for live SDR compare before the next ABC codes
-• Related-ID matching between Board and rtl_433
-• Windows: Start TPMS Suite.bat, Setup_Windows.bat, Build_Windows_Installer.bat,
-  and TPMS_Suite.exe launcher
+• Chapter 4.0 Query Version (0x40) — read board firmware from the UI
+• Firmware is the primary field (TPMS software version), with HW / Boot /
+  Trigger / Prog DB shown alongside
+• Query firmware button on the Board tab (no full run required)
+• Progress tab Connect step shows the same version report
+• Progress pipeline cards with per-step Logs and Clear all
+• Board settles SDR listen after Board OK; Excel stock library path fixes
 
 Notes
 -----
 Windows clients: plug USB board + RTL-SDR, run Setup_Windows.bat once, then
-Start TPMS Suite.bat (or TPMS_Suite.exe). J-Link is not required when the
+Start TPMS Suite.bat (or Fyrqom_TPMS_Suite.exe). J-Link is not required when the
 board replies on USB RX.
 
 To build the full packaged installer on a Windows PC:

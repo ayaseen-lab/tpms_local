@@ -173,20 +173,55 @@ def append_manual_code_row(
     code_b: str,
     code_c: str,
     label: str = "Manual code",
+    make: str = "",
+    model: str = "",
+    freq: str = "",
 ) -> int:
-    row = ws.max_row + 1
+    row = int(ws.max_row or 1) + 1
+    if row < 2:
+        row = 2
+    # If the sheet only has a header, openpyxl may still report max_row=1.
     if ws.max_row == 1 and ws.cell(1, 1).value is None:
         row = 2
-    ws.cell(row, cols.get("Make", 1), label)
-    ws.cell(row, cols.get("Model", 2), "Custom opcode")
+    make_text = (make or "").strip() or label or "Manual"
+    model_text = (model or "").strip() or "Custom opcode"
+    # Empty freq left SDR on whatever band was last used — default EU TPMS.
+    freq_text = (freq or "").strip() or "433.92"
+    ws.cell(row, cols.get("Make", 1), make_text)
+    ws.cell(row, cols.get("Model", 2), model_text)
     ws.cell(row, cols.get("Year From", 3), "")
     ws.cell(row, cols.get("OE supplier", 8), "Manual")
-    ws.cell(row, cols.get("OE Number", 9), "")
-    ws.cell(row, cols.get("Freq", 10), "")
+    ws.cell(row, cols.get("OE Number", 9), label or "")
+    ws.cell(row, cols.get("Freq", 10), freq_text)
     ws.cell(row, cols.get("CODEA", 16), code_a)
     ws.cell(row, cols.get("CODEB", 17), code_b)
     ws.cell(row, cols.get("CODEC", 18), code_c)
     return row
+
+
+def manual_code_present(
+    ws: Worksheet,
+    cols: dict[str, int],
+    code_a: str,
+    code_b: str,
+    code_c: str,
+) -> bool:
+    """True when a data row already has this CODE A/B/C triple."""
+    ca = str(code_a or "").strip().upper()
+    cb = str(code_b or "").strip().upper()
+    cc = str(code_c or "").strip().upper()
+    if not (ca and cb and cc):
+        return False
+    col_a = cols.get("CODEA", 16)
+    col_b = cols.get("CODEB", 17)
+    col_c = cols.get("CODEC", 18)
+    for row in range(2, int(ws.max_row or 1) + 1):
+        a = str(ws.cell(row, col_a).value or "").strip().upper()
+        b = str(ws.cell(row, col_b).value or "").strip().upper()
+        c = str(ws.cell(row, col_c).value or "").strip().upper()
+        if a == ca and b == cb and c == cc:
+            return True
+    return False
 
 
 def _header_map(ws: Worksheet) -> dict[str, int]:

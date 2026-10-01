@@ -14,6 +14,7 @@ from .excel_io import (
     append_manual_code_row,
     copy_workbook,
     create_blank_database,
+    manual_code_present,
     needs_catalog_refresh,
     load_output,
     parse_code,
@@ -53,6 +54,9 @@ class ManualCode:
     code_b: str
     code_c: str
     label: str = "Manual code"
+    make: str = ""
+    model: str = ""
+    freq: str = ""
 
 
 @dataclass
@@ -114,6 +118,7 @@ class BenchRunner:
         require_agree: bool = True,
         agree_retries: int = 2,
         live_sdr_get: Callable | None = None,
+        live_sdr_prepare: Callable[..., bool] | None = None,
     ) -> None:
         self.port = port or default_port()
         self.extra_codes = extra_codes or []
@@ -132,6 +137,7 @@ class BenchRunner:
         self.require_agree = require_agree
         self.agree_retries = max(1, int(agree_retries))
         self.live_sdr_get = live_sdr_get
+        self.live_sdr_prepare = live_sdr_prepare
         self.on_progress = on_progress or (lambda _event: None)
         self.stop_flag = False
         self._pause_event = threading.Event()
@@ -180,12 +186,18 @@ class BenchRunner:
         low = text.lower()
         if not text or text in {"—", "-", "na", "TPMS", "tpms"}:
             return False
-        if low.startswith("board rf") or "waiting for" in low or low.startswith("[flex]"):
+        if low.startswith("board rf") or "waiting for" in low:
+            return False
+        if low.startswith("[flex]"):
             return False
         if not (text.startswith("[") and "]" in text):
             return False
         proto = text[1 : text.index("]")].strip()
         return proto.isdigit()
+
+    @staticmethod
+    def _is_flex_label(label: str) -> bool:
+        return str(label or "").strip().lower().startswith("[flex]")
 
     @staticmethod
     def _packet_has_actual_telemetry(packet) -> bool:
@@ -199,14 +211,101 @@ class BenchRunner:
             return False
         return bool(has_temp and (has_pressure or has_battery))
 
+    def _reading_to_packet(self, reading, *, key: str = "") -> SdrPacket:
+        decoder = self._reading_decoder_label(reading)
+        sid = str(getattr(reading, "sensor_id", None) or key or "")
+        batt = ""
+        if getattr(reading, "battery_voltage_v", None) is not None:
+            batt = str(reading.battery_voltage_v)
+        elif getattr(reading, "battery_ok", None) is not None:
+            batt = str(reading.battery_ok)
+        return SdrPacket(
+            protocol=decoder,
+            sensor_id=sid,
+            pressure=getattr(reading, "pressure_psi", None),
+            temperature=getattr(reading, "temperature_c", None),
+            battery=batt,
+            rssi=getattr(reading, "rssi_db", None),
+        )
+
+    def _softfill_packet_from_board(self, packet: SdrPacket, tel: BoardTelemetry) -> SdrPacket:
+        """Complement OE/flex RF hits with Board telemetry for ID-agreed rows."""
+        pressure = packet.pressure
+        if pressure is None:
+            kpa = tel.pressure_kpa()
+            if kpa is not None:
+                pressure = float(kpa) * 0.145037737737  # kPa → PSI
+        temperature = packet.temperature if packet.temperature is not None else tel.temperature_c
+        battery = packet.battery
+        if not battery or str(battery).strip() == "":
+            if tel.battery_voltage_v is not None:
+                battery = str(tel.battery_voltage_v)
+            elif tel.battery_ok is not None:
+                battery = str(tel.battery_ok)
+        proto = packet.protocol or "[flex] OE RF"
+        if self._is_flex_label(proto) and "Board soft-fill" not in proto:
+            proto = f"{proto} + Board soft-fill"
+        elif not self._is_flex_label(proto):
+            proto = "[flex] OE RF ID + Board soft-fill"
+        return SdrPacket(
+            protocol=proto,
+            sensor_id=packet.sensor_id or tel.sensor_id or "",
+            pressure=pressure,
+            temperature=temperature,
+            battery=battery or "",
+            rssi=packet.rssi,
+        )
+
+    def _ensure_live_sdr_ready(self, freq_hz: int, *, excel_row: int = 0) -> None:
+        """Block until live rtl_433 is listening on this row's band.
+
+        Excel catalogs often change Freq per row (315 ↔ 433). UI row_start used to
+        retune asynchronously while Board ABC already ran — SDR missed the burst and
+        Hamaton DB rows went NOK. Custom codes stay on one band so they never hit this.
+        """
+        if self.live_sdr_prepare is None or self.live_sdr_get is None:
+            return
+        mhz = float(freq_hz) / 1_000_000.0
+        self._emit(
+            ProgressEvent(
+                kind="phase",
+                path="wait_sdr",
+                excel_row=excel_row,
+                freq=f"{mhz:.2f}",
+                message=f"Tuning SDR to {mhz:.2f} MHz before Board trigger…",
+            )
+        )
+        deadline = time.monotonic() + 12.0
+        while not self.stop_flag:
+            try:
+                ready = bool(self.live_sdr_prepare(mhz))
+            except Exception:
+                ready = False
+            if ready:
+                # Brief settle so rtl_433 is actually decoding after a retune restart.
+                time.sleep(0.5)
+                return
+            if time.monotonic() >= deadline:
+                self._emit(
+                    ProgressEvent(
+                        kind="comm",
+                        path="sdr",
+                        excel_row=excel_row,
+                        message=f"SDR not ready on {mhz:.2f} MHz — continuing (may NOK)",
+                    )
+                )
+                return
+            time.sleep(0.25)
+
     def _live_sdr_capture(
         self,
         *,
         since: float,
         expected_id: str | None = None,
         require_telemetry: bool = True,
+        allow_flex_id: bool = False,
     ) -> SdrCaptureResult:
-        """Real rtl_433 library packets the live Receiver heard since this row started."""
+        """Packets the live Receiver heard since this row started."""
         from .compare import ids_related
 
         try:
@@ -220,30 +319,32 @@ class BenchRunner:
             ts = getattr(reading, "timestamp", None)
             if ts is not None:
                 try:
-                    if float(ts.timestamp()) < (since - 2.5):
+                    if float(ts.timestamp()) < (since - 5.0):
                         continue
                 except Exception:
                     pass
             decoder = self._reading_decoder_label(reading)
-            # Stock library only — flex bit guesses are not actual readings.
-            if not self._is_rtl_library_label(decoder):
-                continue
-            # Prefer readings that already qualify OK on the SDR side.
-            if require_telemetry and hasattr(reading, "qualifies_ok") and not reading.qualifies_ok():
-                continue
+            is_lib = self._is_rtl_library_label(decoder)
+            is_flex = self._is_flex_label(decoder)
             sid = str(getattr(reading, "sensor_id", None) or key or "")
+            # Stock library always accepted. Flex only when explicitly hunting OE IDs.
+            # Do NOT accept arbitrary related IDs — that false-matched Hamaton DB rows.
+            if not is_lib and not (allow_flex_id and is_flex):
+                continue
             if expected_id and sid and not ids_related(expected_id, sid):
                 continue
-            packets.append(
-                SdrPacket(
-                    protocol=decoder,
-                    sensor_id=sid,
-                    pressure=getattr(reading, "pressure_psi", None),
-                    temperature=getattr(reading, "temperature_c", None),
-                    battery="" if getattr(reading, "battery_ok", None) is None else str(reading.battery_ok),
-                    rssi=getattr(reading, "rssi_db", None),
-                )
+            if require_telemetry and hasattr(reading, "qualifies_ok") and not reading.qualifies_ok():
+                # Flex ID-only: still keep when hunting RF ID matches for soft-fill.
+                if not (allow_flex_id and is_flex and sid):
+                    continue
+            packets.append(self._reading_to_packet(reading, key=str(key)))
+        # Prefer stock library packets over flex when both exist.
+        packets.sort(
+            key=lambda p: (
+                0 if self._is_rtl_library_label(getattr(p, "protocol", "")) else 1,
+                str(getattr(p, "sensor_id", "") or ""),
             )
+        )
         if require_telemetry:
             packets = [p for p in packets if self._packet_has_actual_telemetry(p)]
         if not packets:
@@ -257,10 +358,12 @@ class BenchRunner:
         expected_id: str | None,
         wait_s: float,
         excel_row: int,
+        board_tel: BoardTelemetry | None = None,
     ) -> SdrCaptureResult:
-        """After Board has a reading, poll until an actual rtl_433 library decode or timeout.
+        """After Board has a reading, poll until rtl_433 library decode or OE/flex ID match.
 
-        Flex / ID-only guesses do not count. On timeout → SDR FAIL, Board result kept.
+        Hamaton custom codes often have no stock library decoder — flex RF ID that
+        matches the Board OEID is enough when Board telemetry soft-fills the row.
         """
         deadline = time.monotonic() + max(0.5, float(wait_s))
         last_emit = 0.0
@@ -274,11 +377,26 @@ class BenchRunner:
             if soft.packets and expected_id:
                 from .compare import ids_related
 
-                related = [
-                    p for p in soft.packets if ids_related(expected_id, p.sensor_id)
-                ]
+                related = [p for p in soft.packets if ids_related(expected_id, p.sensor_id)]
                 if related:
                     return SdrCaptureResult(True, related, None, None)
+            # OE/custom path: flex (or ID-only) RF with matching Board ID.
+            flex = self._live_sdr_capture(
+                since=since,
+                expected_id=expected_id,
+                require_telemetry=False,
+                allow_flex_id=True,
+            )
+            if flex.packets and board_tel is not None and board_tel.qualifies_ok():
+                filled = [self._softfill_packet_from_board(p, board_tel) for p in flex.packets]
+                filled = [p for p in filled if self._packet_has_actual_telemetry(p)]
+                if filled:
+                    return SdrCaptureResult(
+                        True,
+                        filled,
+                        None,
+                        "OE/flex RF ID matched Board — telemetry soft-filled from Board",
+                    )
             now = time.monotonic()
             if now >= deadline:
                 break
@@ -290,18 +408,36 @@ class BenchRunner:
                         excel_row=excel_row,
                         path="sdr",
                         message=(
-                            f"Row {excel_row} Board done — waiting rtl_433 library decode "
+                            f"Row {excel_row} Board done — waiting rtl_433 / OE RF ID "
                             f"({left:.0f}s left)…"
                         ),
                     )
                 )
                 last_emit = now
             time.sleep(0.2)
+        # Final flex ID attempt after timeout.
+        if board_tel is not None and board_tel.qualifies_ok() and expected_id:
+            flex = self._live_sdr_capture(
+                since=since,
+                expected_id=expected_id,
+                require_telemetry=False,
+                allow_flex_id=True,
+            )
+            if flex.packets:
+                filled = [self._softfill_packet_from_board(p, board_tel) for p in flex.packets]
+                filled = [p for p in filled if self._packet_has_actual_telemetry(p)]
+                if filled:
+                    return SdrCaptureResult(
+                        True,
+                        filled,
+                        None,
+                        "OE/flex RF ID matched Board — telemetry soft-filled from Board",
+                    )
         return SdrCaptureResult(
             True,
             [],
             None,
-            "SDR FAIL: no actual rtl_433 library reading (temp+pressure/battery)",
+            "SDR FAIL: no rtl_433 library or matching OE/flex RF ID for this Board row",
         )
 
     def _open_uart_interruptible(self):
@@ -361,8 +497,14 @@ class BenchRunner:
             )
 
         wb, ws, cols = load_output(out_path)
-        if self.extra_codes and not self.resume:
+        # Always ensure custom CODE A/B/C rows exist — even when resume=True.
+        # Previously they were only appended on !resume, so a custom-code-only
+        # run left an empty workbook and failed with "No vehicle rows".
+        if self.extra_codes:
+            added = 0
             for extra in self.extra_codes:
+                if manual_code_present(ws, cols, extra.code_a, extra.code_b, extra.code_c):
+                    continue
                 append_manual_code_row(
                     ws,
                     cols,
@@ -370,16 +512,28 @@ class BenchRunner:
                     code_b=extra.code_b,
                     code_c=extra.code_c,
                     label=extra.label,
+                    make=getattr(extra, "make", "") or "",
+                    model=getattr(extra, "model", "") or "",
+                    freq=getattr(extra, "freq", "") or "",
                 )
-            saved = save_workbook(wb, out_path)
-            if saved != out_path:
-                _set_out_xlsx(saved)
-                out_path = saved
+                added += 1
+            if added:
+                saved = save_workbook(wb, out_path)
+                if saved != out_path:
+                    _set_out_xlsx(saved)
+                    out_path = saved
+                    self._emit(
+                        ProgressEvent(
+                            kind="comm",
+                            path="excel",
+                            message=f"Results Excel locked — switched to {saved.name}",
+                        )
+                    )
                 self._emit(
                     ProgressEvent(
                         kind="comm",
                         path="excel",
-                        message=f"Results Excel locked — switched to {saved.name}",
+                        message=f"Added {added} custom CODE A/B/C row(s) to results workbook",
                     )
                 )
         db = connect(DB_PATH)
@@ -407,6 +561,9 @@ class BenchRunner:
             on_comm=lambda channel, detail: self._emit(
                 ProgressEvent(kind="comm", path=channel, message=detail)
             ),
+            on_phase=lambda phase, detail: self._emit(
+                ProgressEvent(kind="phase", path=phase, message=detail)
+            ),
         )
         session.set_stop_check(lambda: self.stop_flag)
         self.session = session
@@ -428,18 +585,30 @@ class BenchRunner:
             db.close()
             return 0
         session.detect_transport()
+        # Chapter 4.0 Query Version (0x40) for the Board UI.
+        version = None
+        try:
+            version = session.query_board_version()
+        except Exception:
+            version = None
         max_row = ws.max_row
         total_data = max(0, max_row - 1)
         pending = total_data - len(done)
 
         if total_data == 0:
+            hint = (
+                "Add custom CODE A / B / C (and optional Make / Model / Freq), "
+                "or load a Hamaton Excel on the Board tab, then Run again."
+            )
+            if self.extra_codes:
+                hint = (
+                    "Custom codes were provided but no vehicle rows were written. "
+                    "Reset Session, re-add CODE A / B / C, then Run again."
+                )
             self._emit(
                 ProgressEvent(
                     kind="error",
-                    message=(
-                        "No vehicle rows in the results workbook. "
-                        "Reload the Hamaton Excel on the Board tab, or Reset Session, then Run again."
-                    ),
+                    message=f"No vehicle rows in the results workbook. {hint}",
                 )
             )
             try:
@@ -450,6 +619,31 @@ class BenchRunner:
             return 0
 
         chunk_note = "full catalog" if self.chunk_size <= 0 else f"chunk {self.chunk_size}"
+        version_extras: dict = {}
+        version_msg = ""
+        if version is not None:
+            try:
+                fw = int(version.software_version)
+                version_extras = {
+                    "firmware_version": fw,
+                    "hardware_version": int(version.hardware_version),
+                    "boot_version": int(version.boot_version),
+                    "software_version": fw,
+                    "trigger_database_version": int(version.trigger_database_version),
+                    "programming_database_version": int(version.programming_database_version),
+                }
+                version_msg = f" · Firmware {fw}"
+            except Exception:
+                version_extras = {}
+                version_msg = ""
+        self._emit(
+            ProgressEvent(
+                kind="board_version",
+                transport=session.transport_mode,
+                message="Query Version (0x40)" + (version_msg or " · no reply"),
+                extras=version_extras,
+            )
+        )
         self._emit(
             ProgressEvent(
                 kind="started",
@@ -460,7 +654,11 @@ class BenchRunner:
                 nok=stats["NOK"],
                 skip=stats["SKIP"],
                 transport=session.transport_mode,
-                message=f"{hw_msg} · {chunk_note} · from row {self.retest_from or 2} · {total_data} vehicles",
+                message=(
+                    f"{hw_msg} · {chunk_note} · from row {self.retest_from or 2} · "
+                    f"{total_data} vehicles{version_msg}"
+                ),
+                extras=dict(version_extras),
             )
         )
 
@@ -564,6 +762,13 @@ class BenchRunner:
                 if self.stop_flag:
                     stopped = True
                     break
+                # Excel Freq changes must finish retuning BEFORE LF trigger.
+                if use_live:
+                    self._ensure_live_sdr_ready(freq_hz, excel_row=excel_row)
+                    row_wall = time.time()
+                if self.stop_flag:
+                    stopped = True
+                    break
                 tel, sdr = session.run_row(
                     code_a,
                     code_b,
@@ -608,14 +813,32 @@ class BenchRunner:
                             True, [], None, "SDR skipped — board heard no sensor"
                         )
                     else:
-                        wait_s = float(self.sdr_timeout)
-                        if not tel.qualifies_ok() or not (tel.sensor_id or "").strip():
-                            wait_s = min(wait_s, 2.0)
+                        # Always give rtl_433 a full window after Board heard the sensor.
+                        # Custom-code rows were getting cut to 2s when ID/telemetry lagged.
+                        wait_s = max(6.0, float(self.sdr_timeout))
+                        if not (tel.sensor_id or "").strip():
+                            wait_s = min(wait_s, 4.0)
+                        self._emit(
+                            ProgressEvent(
+                                kind="phase",
+                                path="wait_sdr",
+                                excel_row=excel_row,
+                                sensor_id=str(tel.sensor_id or ""),
+                                code_a=code_a_s,
+                                code_b=code_b_s,
+                                code_c=code_c_s,
+                                make=make,
+                                model=model,
+                                freq=freq_cell,
+                                message=f"Waiting up to {wait_s:.0f}s for rtl_433 on {freq_cell or 'SDR band'}…",
+                            )
+                        )
                         sdr = self._wait_live_sdr(
                             since=row_wall,
                             expected_id=tel.sensor_id,
                             wait_s=wait_s,
                             excel_row=excel_row,
+                            board_tel=tel,
                         )
                 elif not self.skip_sdr:
                     # Per-row rtl_433 already finished inside run_row.
@@ -818,6 +1041,9 @@ def _decoder_from_sdr(sdr: SdrCaptureResult | None, sensor_id: str | None) -> st
     label = (packet.protocol or "").strip()
     if not label:
         return "na"
+    # Keep OE/flex catch-all labels intact (do not remap via stock catalog).
+    if label.lower().startswith("[flex]"):
+        return label
     # Enrich short labels like "[123] Jansite" using the rtl_433 library catalog.
     try:
         from config import format_rtl433_decoder

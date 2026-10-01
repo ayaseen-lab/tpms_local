@@ -11,7 +11,7 @@ Switching tabs only changes the view. SDR listening and board tests keep running
 2. Double-click `Setup_Windows.bat` once (venv + deps + rtl_433/Zadig)
 3. Next times: double-click `TPMS_Suite.exe` or `Start TPMS Suite.bat`
 
-**Packaged installer (full .exe app):** on a Windows PC run `Build_Windows_Installer.bat`, or download the CI artifact from the `windows-installer` GitHub Action. That produces `dist_installer\TPMS_Suite_Setup_2.0.0.exe`.
+**Packaged installer (full .exe app):** on a Windows PC run `Build_Windows_Installer.bat`, or download the CI artifact from the `windows-installer` GitHub Action. That produces `dist_installer\TPMS_Suite_Setup_4.0.0.exe`.
 
 Board USB RX works without J-Link / JTAG. Plug the Hamaton USB board + RTL-SDR and start.
 
@@ -74,7 +74,7 @@ A manual triple is tested in addition to Excel rows. If no Excel file is selecte
 powershell -ExecutionPolicy Bypass -File .\build_installer.ps1
 ```
 
-That script downloads official **rtl_433** (MSVC x64 25.12) and **Zadig 2.9**, builds a folder-based (not one-file) app, then compiles `dist_installer\TPMS_Suite_Setup_2.0.0.exe`.
+That script downloads official **rtl_433** (MSVC x64 25.12) and **Zadig 2.9**, builds a folder-based (not one-file) app, then compiles `dist_installer\TPMS_Suite_Setup_4.0.0.exe`.
 
 Or double-click `Build_Windows_Installer.bat`.
 

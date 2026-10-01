@@ -297,11 +297,17 @@ class BoardTelemetry:
 class BoardSession:
     """USB-TTL TX for commands; USB-TTL RX first with board SRAM fallback."""
 
-    def __init__(self, serial_port, on_comm: CommCb | None = None) -> None:
+    def __init__(
+        self,
+        serial_port,
+        on_comm: CommCb | None = None,
+        on_phase: Callable[[str, str], None] | None = None,
+    ) -> None:
         self.serial = serial_port
         self.uart_rx_active = False
         self.jlink_enabled = True
         self.on_comm = on_comm or (lambda _c, _d: None)
+        self.on_phase = on_phase or (lambda _phase, _message: None)
         self.transport_mode = "Detecting…"
         self.last_path = "none"
         self.tx_path = "USB-TTL TX"
@@ -311,6 +317,13 @@ class BoardSession:
         self.ttl_ok = False
         self._stop_check: Callable[[], bool] = lambda: False
         self._aborted = False
+        self.board_version = None  # VersionInfo from Chapter 4.0 Query Version (0x40)
+
+    def _emit_phase(self, phase: str, message: str = "") -> None:
+        try:
+            self.on_phase(phase, message)
+        except Exception:
+            pass
 
     def set_stop_check(self, fn: Callable[[], bool]) -> None:
         self._stop_check = fn
@@ -437,6 +450,40 @@ class BoardSession:
             else:
                 rx = "no board reply path yet — will retry on USB/J-Link"
         return True, f"TX {port} · RX {rx}"
+
+    def query_board_version(self):
+        """Chapter 4.0 Query Version (0x40) — hardware / boot / software / trigger / program DB.
+
+        Returns a VersionInfo on success, else None. Stores the last result on
+        ``self.board_version`` for the UI.
+        """
+        if self.should_stop():
+            return None
+        codec = QueryVersionCodec()
+        try:
+            result = self.execute(codec, timeout=float(getattr(codec, "TIMEOUT_SECONDS", 2.0) or 2.0))
+        except Exception as exc:
+            self._signal("uart", f"Query Version failed: {exc}")
+            return None
+        if result is None or not getattr(result, "is_success", False):
+            msg = getattr(result, "message", None) or "no reply"
+            self._signal("uart", f"Query Version NOK · {msg}")
+            return None
+        version = result.value
+        self.board_version = version
+        try:
+            hw = int(version.hardware_version)
+            boot = int(version.boot_version)
+            sw = int(version.software_version)
+            trig = int(version.trigger_database_version)
+            prog = int(version.programming_database_version)
+            self._signal(
+                "uart",
+                f"Query Version OK · Firmware {sw} · HW {hw} · Boot {boot} · Trig {trig} · Prog {prog}",
+            )
+        except Exception:
+            self._signal("uart", "Query Version OK")
+        return version
 
     def send_codec(self, codec: CommandCodec) -> None:
         if self.should_stop() or not getattr(self.serial, "is_open", False):
@@ -958,6 +1005,7 @@ class BoardSession:
             return tel, empty_sdr
         requested_id = format_oeid(oeid) if oeid else None
 
+        self._emit_phase("program", "Programming ABC codes…")
         program = self.program(code_a, code_b, code_c, oeid)
         if self.should_stop() or (program.is_failure and (program.message or "") == "stopped"):
             tel.reasons.append("stopped")
@@ -987,6 +1035,7 @@ class BoardSession:
         sdr_proc = start_capture(iq_path, frequency_hz=frequency_hz, duration_s=sdr_duration) if iq_path else None
 
         expected_id = tel.programmed_id if program_trusted else None
+        self._emit_phase("trigger", "LF trigger — waiting for sensor…")
         activated, trigger_reading, _note = self.lf_activate(
             code_a, code_b, code_c, expected_id=expected_id
         )
@@ -1004,6 +1053,7 @@ class BoardSession:
         if trigger_complete and tel.battery_voltage_v is not None:
             tel.read_ok = True
         elif heard:
+            self._emit_phase("query", "Query sensor reading…")
             query = self.query(expected_id=expected_id)
             if query.is_success and isinstance(query.value, QuerySensorReading):
                 _merge_query_reading(tel, query.value)
