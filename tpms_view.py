@@ -124,6 +124,7 @@ class TpmsView(ctk.CTkFrame):
         master,
         on_status_change: Optional[Callable[[bool, str], None]] = None,
         on_chunk_complete: Optional[Callable[[str], None]] = None,
+        on_process_update: Optional[Callable[..., None]] = None,
         chunk_var: Optional[tk.StringVar] = None,
         **kwargs,
     ):
@@ -131,9 +132,16 @@ class TpmsView(ctk.CTkFrame):
         super().__init__(master, **kwargs)
         self.on_status_change = on_status_change or (lambda _running, _label: None)
         self.on_chunk_complete = on_chunk_complete or (lambda _msg: None)
+        self.on_process_update = on_process_update or (lambda *_a, **_k: None)
         self.on_board_rf: Callable | None = None
         self.on_board_trigger: Callable | None = None
         self.on_sdr_finalize: Callable | None = None
+        # Combined shell: ensure SDR is listening (and tuned) before/during Board rows.
+        self.on_prepare_sdr: Callable[..., bool] | None = None
+        # Combined shell: release/stop SDR after Board session/chunk settles.
+        self.on_sdr_release: Callable[..., None] | None = None
+        # Optional sync prepare used by BenchRunner (blocks until tuned).
+        self.live_sdr_prepare: Callable[..., bool] | None = None
         self.chunk_var = chunk_var or tk.StringVar(value="100")
 
         self.queue: queue.Queue[ProgressEvent] = queue.Queue()
@@ -371,6 +379,37 @@ class TpmsView(ctk.CTkFrame):
             side="right", padx=(0, 12)
         )
 
+        # Chapter 4.0 Query Version (0x40) — firmware (TPMS software) is the primary field.
+        ver_row = ctk.CTkFrame(top_inner, fg_color=COLOR_BG_PANEL, corner_radius=8)
+        ver_row.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(
+            ver_row,
+            text="Firmware",
+            font=ui_font(10, "bold"),
+            text_color=COLOR_TEXT_MUTED,
+        ).pack(side="left", padx=(10, 8), pady=6)
+        self.version_var = ctk.StringVar(value="—  (Query firmware or START)")
+        ctk.CTkLabel(
+            ver_row,
+            textvariable=self.version_var,
+            font=ui_font(11, "bold"),
+            text_color=COLOR_TEXT,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True, padx=(0, 8), pady=6)
+        self.query_fw_btn = ctk.CTkButton(
+            ver_row,
+            text="Query firmware",
+            width=120,
+            height=28,
+            font=ui_font(11, "bold"),
+            fg_color=COLOR_BTN_PRIMARY,
+            hover_color=COLOR_BTN_PRIMARY_HOVER,
+            text_color=COLOR_BTN_PRIMARY_TEXT,
+            corner_radius=8,
+            command=self.query_firmware_version,
+        )
+        self.query_fw_btn.pack(side="right", padx=(0, 10), pady=4)
+
         # Grid toolbar: buttons keep intrinsic size at any window width.
         # Run chunk / Run full / Chunk live only in the top nav — do not repeat them here.
         toolbar = ctk.CTkFrame(top_inner, fg_color=COLOR_BG_PANEL, corner_radius=8)
@@ -478,6 +517,20 @@ class TpmsView(ctk.CTkFrame):
             file_row, text="Choose Excel…", width=120, height=28, font=ui_font(11, "bold"),
             fg_color=COLOR_BTN_PRIMARY, hover_color=COLOR_BTN_PRIMARY_HOVER, corner_radius=8, command=self.select_excel,
         ).pack(side="left")
+        self.remove_excel_btn = ctk.CTkButton(
+            file_row,
+            text="Remove",
+            width=78,
+            height=28,
+            font=ui_font(11, "bold"),
+            fg_color=COLOR_BTN_STOP,
+            hover_color=COLOR_BTN_STOP_HOVER,
+            text_color="#FFFFFF",
+            corner_radius=8,
+            command=self.remove_excel,
+            state="disabled",
+        )
+        self.remove_excel_btn.pack(side="left", padx=(6, 0))
         ctk.CTkButton(
             file_row, text="Reset", width=70, height=28, font=ui_font(11),
             fg_color=COLOR_BTN_SECONDARY, hover_color=COLOR_BTN_SECONDARY_HOVER, corner_radius=8, command=self.reset_session,
@@ -490,14 +543,33 @@ class TpmsView(ctk.CTkFrame):
             ctk.CTkLabel(code_row, text=f"CODE {key}", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_TEXT_DIM).pack(
                 side="left", padx=(0, 4)
             )
-            entry = ctk.CTkEntry(code_row, width=120, height=28, placeholder_text=f"{key} hex", **entry_colors())
+            entry = ctk.CTkEntry(code_row, width=110, height=28, placeholder_text=f"{key} hex", **entry_colors())
             entry.pack(side="left", padx=(0, 8))
             entry.bind("<Return>", lambda _e: self.add_custom_code())
             self.manual_entries[key] = entry
-        self.manual_label_entry = ctk.CTkEntry(code_row, width=120, height=28, placeholder_text="label", **entry_colors())
+
+        meta_row = ctk.CTkFrame(top_inner, fg_color="transparent")
+        meta_row.pack(fill="x", pady=(4, 0))
+        ctk.CTkLabel(meta_row, text="Make", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_TEXT_DIM).pack(
+            side="left", padx=(0, 4)
+        )
+        self.manual_make_entry = ctk.CTkEntry(meta_row, width=110, height=28, placeholder_text="optional", **entry_colors())
+        self.manual_make_entry.pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(meta_row, text="Model", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_TEXT_DIM).pack(
+            side="left", padx=(0, 4)
+        )
+        self.manual_model_entry = ctk.CTkEntry(meta_row, width=110, height=28, placeholder_text="optional", **entry_colors())
+        self.manual_model_entry.pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(meta_row, text="Freq", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_TEXT_DIM).pack(
+            side="left", padx=(0, 4)
+        )
+        self.manual_freq_entry = ctk.CTkEntry(meta_row, width=90, height=28, placeholder_text="433.92", **entry_colors())
+        self.manual_freq_entry.pack(side="left", padx=(0, 8))
+        self.manual_label_entry = ctk.CTkEntry(meta_row, width=110, height=28, placeholder_text="label", **entry_colors())
         self.manual_label_entry.pack(side="left", padx=(0, 6))
+        self.manual_label_entry.bind("<Return>", lambda _e: self.add_custom_code())
         ctk.CTkButton(
-            code_row, text="Add Code", width=90, height=28, font=ctk.CTkFont(size=11, weight="bold"),
+            meta_row, text="Add Code", width=90, height=28, font=ctk.CTkFont(size=11, weight="bold"),
             fg_color=COLOR_GREEN, hover_color="#15803d", command=self.add_custom_code,
         ).pack(side="left")
         self.codes_list = ctk.CTkFrame(top_inner, fg_color="transparent")
@@ -869,7 +941,18 @@ class TpmsView(ctk.CTkFrame):
                 messagebox.showinfo("Custom opcodes", f"CODE {key} is not a valid hex opcode: {raw}", parent=self._toplevel())
                 raise ValueError("invalid custom code")
         label = self._entry_text(self.manual_label_entry) or f"Manual code {len(self.custom_codes) + 1}"
-        return ManualCode(code_a=values["A"].upper(), code_b=values["B"].upper(), code_c=values["C"].upper(), label=label)
+        make = self._entry_text(self.manual_make_entry)
+        model = self._entry_text(self.manual_model_entry)
+        freq = self._entry_text(self.manual_freq_entry) or "433.92"
+        return ManualCode(
+            code_a=values["A"].upper(),
+            code_b=values["B"].upper(),
+            code_c=values["C"].upper(),
+            label=label,
+            make=make,
+            model=model,
+            freq=freq,
+        )
 
     def add_custom_code(self) -> None:
         try:
@@ -882,7 +965,13 @@ class TpmsView(ctk.CTkFrame):
         self.custom_codes.append(extra)
         for entry in self.manual_entries.values():
             entry.delete(0, "end")
-        self.manual_label_entry.delete(0, "end")
+        for entry in (
+            self.manual_label_entry,
+            self.manual_make_entry,
+            self.manual_model_entry,
+            self.manual_freq_entry,
+        ):
+            entry.delete(0, "end")
         self._refresh_codes_list()
         self.status_var.set(f"Added custom code {extra.label}: {extra.code_a} / {extra.code_b} / {extra.code_c}")
         self.focus_code_fields()
@@ -909,9 +998,21 @@ class TpmsView(ctk.CTkFrame):
         for index, code in enumerate(self.custom_codes):
             row = ctk.CTkFrame(self.codes_list, fg_color=COLOR_CYAN_BG, corner_radius=6)
             row.pack(side="left", padx=(0, 6), pady=2)
+            meta = " · ".join(
+                part
+                for part in (
+                    code.make,
+                    code.model,
+                    code.freq,
+                )
+                if part
+            )
+            text = f"{code.label}: {code.code_a}/{code.code_b}/{code.code_c}"
+            if meta:
+                text = f"{text}  ({meta})"
             ctk.CTkLabel(
                 row,
-                text=f"{code.label}: {code.code_a}/{code.code_b}/{code.code_c}",
+                text=text,
                 font=ctk.CTkFont(family="Consolas", size=11),
                 text_color=COLOR_TEXT,
             ).pack(side="left", padx=(8, 4), pady=3)
@@ -936,9 +1037,41 @@ class TpmsView(ctk.CTkFrame):
             return
         self._load_excel(Path(path))
 
+    def remove_excel(self) -> None:
+        """Clear the selected Excel catalog (custom CODE A/B/C stay)."""
+        if self._state_label in ("RUNNING", "PAUSED"):
+            messagebox.showinfo(
+                "Remove Excel",
+                "Stop the Board test before removing the Excel file.",
+                parent=self._toplevel(),
+            )
+            return
+        if not self.source_xlsx:
+            self._update_excel_buttons()
+            return
+        name = self.source_xlsx.name
+        if not messagebox.askyesno(
+            "Remove Excel",
+            f"Remove “{name}” from this session?\n\n"
+            "Custom CODE A / B / C entries are kept. You can choose another Excel later.",
+            parent=self._toplevel(),
+        ):
+            return
+        self.source_xlsx = None
+        self.file_label.configure(text="No file selected", text_color=COLOR_ORANGE)
+        self._update_excel_buttons()
+        self._refresh_ready_banner()
+        self.status_var.set(f"Removed {name} — choose another Excel or use custom codes")
+
+    def _update_excel_buttons(self) -> None:
+        has_file = bool(self.source_xlsx and Path(self.source_xlsx).exists())
+        if hasattr(self, "remove_excel_btn"):
+            self.remove_excel_btn.configure(state="normal" if has_file else "disabled")
+
     def _load_excel(self, path: Path) -> None:
         self.source_xlsx = path
         self.file_label.configure(text=self.source_xlsx.name, text_color=COLOR_GREEN)
+        self._update_excel_buttons()
         self._refresh_ready_banner()
 
     def _autoload_default_excel(self) -> None:
@@ -1048,6 +1181,105 @@ class TpmsView(ctk.CTkFrame):
             )
             return False
 
+        freq_mhz = self._preferred_sdr_freq_mhz(extra_codes)
+        # Custom-code / Board runs need live SDR — start + tune before ABC if needed.
+        if callable(self.on_prepare_sdr):
+            try:
+                ready = bool(self.on_prepare_sdr(freq_mhz=freq_mhz))
+            except Exception:
+                ready = False
+            if not ready:
+                self.status_var.set(
+                    f"Starting SDR on {(freq_mhz if freq_mhz is not None else 433.92):.2f} MHz first — Board starts in a few seconds…"
+                )
+                self.start_btn.configure(state="disabled")
+                if hasattr(self, "full_btn"):
+                    self.full_btn.configure(state="disabled")
+                self._set_state_badge("RUNNING")
+                self.after(
+                    4500,
+                    lambda: self._start_test_now(
+                        skip_sdr=skip_sdr,
+                        chunk_size=chunk_size,
+                        run_full=run_full,
+                        extra_codes=extra_codes,
+                    ),
+                )
+                return True
+
+        return self._start_test_now(
+            skip_sdr=skip_sdr,
+            chunk_size=chunk_size,
+            run_full=run_full,
+            extra_codes=extra_codes,
+        )
+
+    def _preferred_sdr_freq_mhz(self, extra_codes: list | None = None) -> float | None:
+        """Best center frequency for upcoming Board rows (custom Freq, else Excel)."""
+        codes = list(extra_codes or self.custom_codes or [])
+        for code in codes:
+            text = str(getattr(code, "freq", "") or "").strip()
+            if not text:
+                continue
+            try:
+                from tpms_bench.rtl433 import parse_freq_hz
+
+                return parse_freq_hz(text) / 1_000_000.0
+            except Exception:
+                try:
+                    return float(text.replace("MHz", "").replace("M", "").strip())
+                except ValueError:
+                    pass
+        if codes:
+            return 433.92
+        # Excel-only run: peek first catalog Freq so SDR is armed on the right band
+        # before ABC (avoids retune race that NOKs Hamaton DB rows).
+        path = self.source_xlsx
+        if path and Path(path).is_file():
+            try:
+                from openpyxl import load_workbook
+                from tpms_bench.rtl433 import parse_freq_hz
+
+                wb = load_workbook(path, read_only=True, data_only=True)
+                ws = wb[wb.sheetnames[0]]
+                headers = {
+                    str(c.value).strip(): int(c.column)
+                    for c in ws[1]
+                    if c.value not in (None, "")
+                }
+                freq_col = headers.get("Freq") or headers.get("Frequency") or 10
+                code_a_col = headers.get("CODEA") or headers.get("Code A") or 16
+                for row in ws.iter_rows(min_row=2, values_only=True):
+                    if not row:
+                        continue
+                    vals = list(row)
+                    ca = vals[code_a_col - 1] if len(vals) >= code_a_col else None
+                    if ca in (None, ""):
+                        continue
+                    freq_val = vals[freq_col - 1] if len(vals) >= freq_col else None
+                    if freq_val in (None, ""):
+                        continue
+                    mhz = parse_freq_hz(freq_val) / 1_000_000.0
+                    wb.close()
+                    return mhz
+                wb.close()
+            except Exception:
+                pass
+            return 433.92
+        return None
+
+    def _start_test_now(
+        self,
+        *,
+        skip_sdr: bool = True,
+        chunk_size: int | None = None,
+        run_full: bool = False,
+        extra_codes: list | None = None,
+    ) -> bool:
+        if self.worker and self.worker.is_alive():
+            return True
+
+        codes = list(extra_codes) if extra_codes is not None else list(self.custom_codes)
         # Keep existing Board results — only "Reset Session" clears. Resume unfinished rows.
         if not self._session_rows:
             self._hydrate_session_rows_from_db()
@@ -1067,14 +1299,15 @@ class TpmsView(ctk.CTkFrame):
             source_xlsx=self.source_xlsx,
             resume=True,
             skip_sdr=skip_sdr,
-            sdr_timeout=float(__import__("os").environ.get("FYRQOM_SDR_TIMEOUT", "8")),
-            extra_codes=extra_codes,
+            sdr_timeout=float(__import__("os").environ.get("FYRQOM_SDR_TIMEOUT", "10")),
+            extra_codes=codes,
             on_progress=self.queue.put,
             chunk_size=size,
             retest_from=None,
             require_agree=False,
             agree_retries=1,
             live_sdr_get=self.live_sdr_get,
+            live_sdr_prepare=self.live_sdr_prepare,
         )
         if skip_sdr:
             self.status_var.set(
@@ -1343,12 +1576,184 @@ class TpmsView(ctk.CTkFrame):
         except Exception:
             pass
         self.status_var.set(message)
+        # Board run settled — stop SDR listening (dongle idle until next Start).
+        if callable(self.on_sdr_release):
+            try:
+                self.on_sdr_release(reason=label, message=message or "")
+            except Exception:
+                pass
+
+    def _release_sdr_after_chunk(self, message: str = "") -> None:
+        if callable(self.on_sdr_release):
+            try:
+                self.on_sdr_release(reason="CHUNK", message=message or "Chunk complete")
+            except Exception:
+                pass
 
     def _blink_led(self, widget: ctk.CTkLabel, active_color: str) -> None:
         widget.configure(text_color=active_color)
         self.after(350, lambda: widget.configure(text_color=LED_IDLE))
 
+    def _set_board_version_ui(self, extras: dict, message: str = "") -> None:
+        """Show firmware (TPMS software) first; other Chapter 4.0 fields secondary."""
+        if not hasattr(self, "version_var"):
+            return
+
+        def _num(key: str):
+            raw = extras.get(key)
+            if raw in (None, ""):
+                return None
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return raw
+
+        if not extras:
+            self.version_var.set(message or "Firmware — no reply")
+            return
+
+        fw = _num("firmware_version")
+        if fw is None:
+            fw = _num("software_version")
+        if fw is None:
+            self.version_var.set(message or "Firmware — no reply")
+            return
+
+        try:
+            fw_text = f"{int(fw)}  (0x{int(fw):08X})"
+        except (TypeError, ValueError):
+            fw_text = str(fw)
+
+        extras_parts = []
+        for key, short in (
+            ("hardware_version", "HW"),
+            ("boot_version", "Boot"),
+            ("trigger_database_version", "Trigger"),
+            ("programming_database_version", "Prog DB"),
+        ):
+            val = _num(key)
+            if val is None:
+                continue
+            try:
+                extras_parts.append(f"{short} {int(val)}")
+            except (TypeError, ValueError):
+                extras_parts.append(f"{short} {val}")
+        suffix = f"  ·  {' · '.join(extras_parts)}" if extras_parts else ""
+        self.version_var.set(f"{fw_text}{suffix}")
+
+    def query_firmware_version(self) -> None:
+        """Open UART, run Chapter 4.0 Query Version (0x40), show firmware on the strip."""
+        if self.worker and self.worker.is_alive():
+            self.status_var.set("Stop the Board run before querying firmware")
+            return
+        if getattr(self, "_fw_query_busy", False):
+            return
+        self._fw_query_busy = True
+        if hasattr(self, "query_fw_btn"):
+            self.query_fw_btn.configure(state="disabled")
+        self.version_var.set("Querying firmware…")
+        self.status_var.set("Query Version (0x40) — reading firmware…")
+
+        def _work() -> None:
+            extras: dict = {}
+            err = ""
+            try:
+                from tpms_bench.board import BoardSession
+                from tpms_bench.uart import open_uart
+
+                port = None
+                try:
+                    port = port_device(self.port_combo.get()) or None
+                except Exception:
+                    port = None
+                ser = open_uart(port)
+                try:
+                    session = BoardSession(
+                        ser,
+                        on_comm=lambda ch, detail: self.after(
+                            0, lambda: self._apply(
+                                ProgressEvent(kind="comm", path=ch, message=detail)
+                            )
+                        ),
+                    )
+                    session.detect_transport()
+                    version = session.query_board_version()
+                    if version is not None:
+                        extras = {
+                            "firmware_version": int(version.software_version),
+                            "hardware_version": int(version.hardware_version),
+                            "boot_version": int(version.boot_version),
+                            "software_version": int(version.software_version),
+                            "trigger_database_version": int(version.trigger_database_version),
+                            "programming_database_version": int(
+                                version.programming_database_version
+                            ),
+                        }
+                    else:
+                        err = "no reply"
+                finally:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+            except Exception as exc:
+                err = str(exc) or "query failed"
+
+            def _done() -> None:
+                self._fw_query_busy = False
+                if hasattr(self, "query_fw_btn"):
+                    self.query_fw_btn.configure(state="normal")
+                if extras:
+                    self._set_board_version_ui(extras)
+                    fw = extras.get("firmware_version", extras.get("software_version"))
+                    self.status_var.set(f"Firmware {fw}")
+                    try:
+                        self.on_process_update(
+                            kind="board_version",
+                            message=f"Firmware {fw}",
+                            extras=dict(extras),
+                        )
+                    except Exception:
+                        pass
+                else:
+                    self.version_var.set(f"Firmware — {err or 'no reply'}")
+                    self.status_var.set(f"Query firmware failed · {err or 'no reply'}")
+
+            self.after(0, _done)
+
+        threading.Thread(target=_work, daemon=True).start()
+
     def _apply(self, event: ProgressEvent) -> None:
+        try:
+            self.on_process_update(
+                kind=event.kind,
+                path=str(event.path or ""),
+                message=str(event.message or ""),
+                excel_row=event.excel_row,
+                sensor_id=str(event.sensor_id or ""),
+                performance=str(event.performance or ""),
+                code_a=str(event.code_a or ""),
+                code_b=str(event.code_b or ""),
+                code_c=str(event.code_c or ""),
+                make=str(event.make or ""),
+                model=str(event.model or ""),
+                transport=str(event.transport or ""),
+                tool_path=str(event.path or ""),
+                temperature=str(event.temperature or ""),
+                pressure=str(event.pressure or ""),
+                voltage=str(event.voltage or ""),
+                freq=str(event.freq or ""),
+                rtl433_decoder=str(event.rtl433_decoder or ""),
+                sdr_compare=str(event.sdr_compare or ""),
+                extras=dict(getattr(event, "extras", None) or {}),
+            )
+        except Exception:
+            pass
+
+        if event.kind == "board_version":
+            self._set_board_version_ui(getattr(event, "extras", None) or {}, event.message or "")
+            return
+
         if event.kind == "comm":
             if event.path == "ttl":
                 self._blink_led(self.ttl_led, LED_TTL_ON)
@@ -1363,7 +1768,23 @@ class TpmsView(ctk.CTkFrame):
                 self.status_var.set(event.message)
             return
 
+        if event.kind == "phase":
+            phase = str(event.path or "").lower()
+            label = {
+                "program": "Programming ABC…",
+                "trigger": "Triggering sensor…",
+                "query": "Querying sensor…",
+            }.get(phase, event.message or phase)
+            if event.message:
+                self.status_var.set(event.message)
+            else:
+                self.status_var.set(label)
+            return
+
         if event.kind == "started":
+            extras = getattr(event, "extras", None) or {}
+            if extras:
+                self._set_board_version_ui(extras, event.message or "")
             self._total_rows = event.total
             self._set_state_badge("RUNNING")
             if event.transport:
@@ -1387,6 +1808,14 @@ class TpmsView(ctk.CTkFrame):
             self.code_vars["C"].set(event.code_c or "—")
             self._update_stat_labels(event.pending, event.done, event.ok, event.nok, event.total)
             self.status_var.set(f"Testing row {event.excel_row}: {event.make} {event.model} · {event.pending} pending")
+            if callable(self.on_prepare_sdr):
+                try:
+                    from tpms_bench.rtl433 import parse_freq_hz
+
+                    mhz = parse_freq_hz(event.freq) / 1_000_000.0 if event.freq else None
+                    self.on_prepare_sdr(freq_mhz=mhz)
+                except Exception:
+                    pass
             if self.on_board_trigger:
                 try:
                     self.on_board_trigger(
@@ -1523,6 +1952,7 @@ class TpmsView(ctk.CTkFrame):
             self.pause_btn.configure(text="RESUME")
             self._set_state_badge("PAUSED")
             self.status_var.set(event.message or "Chunk complete — review Comparison")
+            self._release_sdr_after_chunk(event.message or "")
             self.after(80, lambda: self.on_chunk_complete(event.message or ""))
 
         elif event.kind == "finished":

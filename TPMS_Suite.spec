@@ -40,6 +40,7 @@ hiddenimports = [
     "activity_terminal",
     "dialogs",
     "tpms_view",
+    "progress_view",
     "shell",
     "comparative_report",
     "iq_urh_tool",

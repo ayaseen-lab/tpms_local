@@ -165,9 +165,12 @@ class TelemetryReading:
     return sid.lower() not in {"none", "unknown", "n/a", "na", "—", "-"}
 
   def qualifies_ok(self) -> bool:
-    """Actual rtl_433 library telemetry only — never guess from flex bits."""
-    if (self.decoder or "").lower().startswith("[flex]"):
-      return False
+    """Telemetry completeness for OK.
+
+    Stock library preferred. Flex/OE ID-only stays NOK; flex with real
+    temp+(pressure|battery) — including Board soft-fill — can OK so custom
+    Hamaton codes are not stuck NOK when rtl_433 has no stock decoder.
+    """
     has_core = self.has_sensor_id() and self.temperature_c is not None
     has_pressure = self.psi is not None
     has_battery = self.battery_ok is not None or self.battery_voltage_v is not None
@@ -176,8 +179,6 @@ class TelemetryReading:
   def nok_reason(self) -> str:
     if self.qualifies_ok():
       return ""
-    if (self.decoder or "").lower().startswith("[flex]"):
-      return "flex ID only — no actual temp/pressure from rtl_433 library"
     missing: List[str] = []
     if not self.has_sensor_id():
       missing.append("sensor ID")
@@ -185,6 +186,8 @@ class TelemetryReading:
       missing.append("temperature")
     if self.psi is None and self.battery_ok is None and self.battery_voltage_v is None:
       missing.append("pressure or battery")
+    if (self.decoder or "").lower().startswith("[flex]") and missing:
+      return "flex RF ID — missing " + " + ".join(missing)
     return "missing " + " + ".join(missing) if missing else "incomplete telemetry"
 
   def merged_with(self, newer: "TelemetryReading") -> "TelemetryReading":
@@ -432,7 +435,10 @@ def _normalize_sensor_id(value: Any) -> str:
 
 # Flex catch-all for OE/Hamaton bursts the stock rtl_433 TPMS library misses
 # (strong FSK ~52/104 µs Manchester — confirmed via IQ analyzer on conflict rows).
+# Keep a SINGLE -X: multiple flex specs compete with the stock library and can
+# starve Hamaton DB rows of real [protocol] decodes.
 FLEX_TPMS_DECODER = "n=HamatonOE-FSK_MC,m=FSK_MC_ZEROBIT,s=52,l=104,r=4096"
+FLEX_TPMS_DECODERS = (FLEX_TPMS_DECODER,)
 
 
 def _flex_hex_blob(data: Dict[str, Any]) -> str:
@@ -714,15 +720,20 @@ def parse_rtl433_json(line: str) -> Optional[TelemetryReading]:
       protocol_id = None
   decoder = format_rtl433_decoder(protocol_id, model)
 
-  # Flex catch-all: stock library missed the burst, but Manchester bits carry the OE ID.
+  # Flex catch-all: ONLY when stock library did not assign a protocol id.
+  # Never rewrite a real [60]/[156]/… library packet to [flex] — that breaks
+  # Hamaton catalog DB matching (stock decode looks like OE miss).
   is_flex = (
-    "rows" in data
-    or "codes" in data
-    or model.upper().startswith("HAMATONOE")
-    or "FSK_MC" in model.upper()
-    or model in {"ConflictTPMS", "HamatonOE-FSK_MC"}
+    protocol_id is None
+    and (
+      "rows" in data
+      or "codes" in data
+      or model.upper().startswith("HAMATONOE")
+      or "FSK_MC" in model.upper()
+      or model in {"ConflictTPMS", "HamatonOE-FSK_MC", "HamatonOE-FSK_MC2", "HamatonOE-FSK_MC3"}
+    )
   )
-  if is_flex and (not sensor_id or not protocol_id):
+  if is_flex and (not sensor_id or protocol_id is None):
     blob = _flex_hex_blob(data)
     flex_id = _extract_id_from_flex_hex(blob)
     if flex_id:
@@ -858,6 +869,11 @@ class Rtl433Runner:
       cmd.extend(rtl433_tpms_decoder_flags(exe))
     else:
       cmd.extend(rtl433_full_decoder_flags(exe))
+
+    # Hamaton / OE custom codes often have no stock library decoder — keep the
+    # flex Manchester catch-alls so Board rows can still match an RF ID.
+    for flex in FLEX_TPMS_DECODERS:
+      cmd.extend(["-X", flex])
 
     if iq_path:
       path = Path(iq_path)

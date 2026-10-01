@@ -60,10 +60,17 @@ from widgets import LiveTelemetryBar, StatCard
 class SdrView(ctk.CTkFrame):
   """SDR receiver UI. Switching away from this frame does not stop rtl_433."""
 
-  def __init__(self, master, on_status_change: Optional[Callable[[bool, str], None]] = None, **kwargs):
+  def __init__(
+    self,
+    master,
+    on_status_change: Optional[Callable[[bool, str], None]] = None,
+    on_process_update: Optional[Callable[..., None]] = None,
+    **kwargs,
+  ):
     kwargs.setdefault("fg_color", COLOR_BG)
     super().__init__(master, **kwargs)
     self.on_status_change = on_status_change or (lambda _running, _label: None)
+    self.on_process_update = on_process_update or (lambda *_a, **_k: None)
     self.on_range_update: Optional[Callable[..., None]] = None
 
     self.setup_mgr = SetupManager()
@@ -477,7 +484,7 @@ class SdrView(ctk.CTkFrame):
 
   def _refresh_table_count(self) -> None:
     matches = len(self._row_matches)
-    unique = len(self._sensors)
+    unique = self._unique_id_count()
     if matches:
       self.table_count_label.configure(
         text=f"{matches} match{'es' if matches != 1 else ''}  ·  {unique} unique ID{'s' if unique != 1 else ''}"
@@ -503,19 +510,75 @@ class SdrView(ctk.CTkFrame):
     )
     return ok, nok
 
-  def _unique_rtl_ids(self) -> int:
-    if self._row_matches:
-      ids = {
-        str(row.get("rtl_id") or row.get("sensor_id") or "").upper()
-        for row in self._row_matches
-        if self._is_rtl_decoder(row.get("decoder"))
-      }
-      return len({i for i in ids if i})
-    return sum(1 for r in self._sensors.values() if self._is_rtl_decoder(r.display_decoder))
+  def _lookup_sensor_reading(self, sensor_id: str):
+    """Resolve a Sensor ID against `_sensors` (exact, then case-insensitive)."""
+    sid = str(sensor_id or "").strip()
+    if not sid:
+      return None
+    reading = self._sensors.get(sid)
+    if reading is not None:
+      return reading
+    upper = sid.upper()
+    for key, value in self._sensors.items():
+      if str(key).upper() == upper:
+        return value
+    return None
+
+  def _unique_sensor_entries(self) -> list[tuple[str, object]]:
+    """Same Sensor IDs the UNIQUE IDs StatCard counts, with best available reading.
+
+    Counts distinct RF Sensor IDs rtl_433 actually heard (stock library or OE/flex).
+    Board WAIT placeholders (— / waiting for decode) are never counted.
+    """
+    entries: list[tuple[str, object]] = []
+    seen: set[str] = set()
+
+    def _add(sid: object, reading: object = None) -> None:
+      text = str(sid or "").strip().upper()
+      if not text or text in seen:
+        return
+      if text in {"—", "-", "NA", "N/A", "NONE", "UNKNOWN"}:
+        return
+      seen.add(text)
+      if reading is None:
+        reading = self._lookup_sensor_reading(text)
+      entries.append((text, reading))
+
+    # 1) Live table — every real RF ID heard this session.
+    for sid, reading in self._sensors.items():
+      if reading is None:
+        continue
+      label = getattr(reading, "display_decoder", None)
+      has_id = bool(getattr(reading, "has_sensor_id", lambda: False)())
+      if self._is_match_decoder(label):
+        _add(sid, reading)
+      elif has_id and bool(getattr(reading, "is_tpms", False)):
+        _add(sid, reading)
+
+    # 2) Board match rows that already stamped a stock/flex rtl ID (OK path).
+    for row in self._row_matches:
+      decoder = str(row.get("decoder") or "")
+      low = decoder.lower()
+      if "waiting" in low or "no decode" in low:
+        continue
+      if not self._is_match_decoder(decoder):
+        continue
+      rtl_id = row.get("rtl_id") or ""
+      show_id = row.get("sensor_id") or ""
+      # Prefer rtl_id; sensor_id may still be the Board OEID on WAIT→OK races.
+      sid = rtl_id or show_id
+      if str(show_id).strip() in {"—", "-", ""} and not rtl_id:
+        continue
+      _add(sid, row.get("reading"))
+
+    return sorted(entries, key=lambda item: str(item[0]).upper())
+
+  def _unique_id_count(self) -> int:
+    return len(self._unique_sensor_entries())
 
   def _update_stats(self):
     matches = len(self._row_matches)
-    unique = self._unique_rtl_ids() if matches else len(self._sensors)
+    unique = self._unique_id_count()
     ok, nok = self._sensor_counts()
     # ROW MATCHES = Board rows waiting on / resolved by rtl_433.
     self.stat_sensors.set_value(str(matches if matches else self._total_readings))
@@ -538,7 +601,7 @@ class SdrView(ctk.CTkFrame):
         f"Session: {matches if matches else self._total_readings} row match(es) · "
         f"{unique} rtl Sensor ID(s) · {self._total_readings} packet(s)"
         + (f" · {wait} waiting rtl_433" if wait else "")
-        + " · OK only when rtl_433 library decoded"
+        + " · unique = distinct RF Sensor IDs heard"
       )
     )
     self._update_export_button()
@@ -713,6 +776,55 @@ class SdrView(ctk.CTkFrame):
     self._want_listening = True
     self._start_listen(auto=False)
 
+  def ensure_listening(self, freq_mhz: float | None = None) -> bool:
+    """Make sure rtl_433 is live; optionally retune center frequency.
+
+    Returns True when already listening on the requested band (no restart needed).
+    Used so Board custom-code rows get an SDR chance instead of instant NOK.
+    """
+    need_retune = False
+    target = None
+    try:
+      if freq_mhz is not None and float(freq_mhz) > 100:
+        target = float(freq_mhz)
+    except (TypeError, ValueError):
+      target = None
+
+    if target is not None:
+      try:
+        current = float(str(self.custom_freq.get() or "").strip())
+      except (TypeError, ValueError):
+        current = 0.0
+      if abs(current - target) > 0.05:
+        need_retune = True
+      # Prefer a single center freq for Board row matching (avoid dual-band hop miss).
+      try:
+        custom_name = next(
+          (name for name, preset in FREQUENCY_PRESETS.items() if preset.get("custom")),
+          None,
+        )
+        if custom_name:
+          self.preset_combo.set(custom_name)
+          self._on_preset_change(custom_name)
+        self.custom_freq.configure(state="normal")
+        self.custom_freq.delete(0, "end")
+        self.custom_freq.insert(0, f"{target:.2f}")
+      except Exception:
+        pass
+
+    alive = bool(self._listen_alive())
+    if alive and not need_retune:
+      return True
+
+    if need_retune:
+      self._log(f"Retuning SDR to {target:.2f} MHz for Board row…")
+      self.restart_listen()
+      return False
+
+    self._log("Starting SDR listen for Board / custom-code compare…")
+    self.start_listen()
+    return False
+
   def restart_listen(self) -> None:
     """Stop then start so a replugged RTL-SDR is reopened cleanly."""
     self._want_listening = True
@@ -816,6 +928,7 @@ class SdrView(ctk.CTkFrame):
       return
     self._starting = True
     self._want_listening = True
+    self._notify_process("starting", "Opening RTL-SDR / rtl_433…")
     try:
       self._start_listen_body(auto=auto)
     finally:
@@ -935,6 +1048,21 @@ class SdrView(ctk.CTkFrame):
       self.runner.stop()
     else:
       self._set_status(False)
+
+  def release_after_board_session(self, *, reason: str = "", message: str = "") -> None:
+    """Stop rtl_433 after Board finished / stopped / chunk — keep captured SDR rows."""
+    was_live = bool(self._listening or self.runner.is_running or self._want_listening)
+    self._stop_listen()
+    if not was_live:
+      return
+    label = str(reason or "DONE").strip().upper() or "DONE"
+    note = str(message or "").strip() or f"Board {label} — SDR listening stopped"
+    self._log(note)
+    self._notify_process(
+      "stopped",
+      note,
+      tool="rtl_433 + RTL-SDR",
+    )
   def _on_reading(self, reading: TelemetryReading):
     # rtl_433 thread — only queue. Keep lock hold tiny so RSSI never stalls here.
     self._pending_lock.acquire()
@@ -988,6 +1116,18 @@ class SdrView(ctk.CTkFrame):
         self._sensors[sid] = merged
         self._sensor_reads[sid] = 1
         new_ids.append(sid)
+        if self._is_match_decoder(merged.display_decoder):
+          self._notify_process(
+            "decode",
+            f"Decoded {merged.display_decoder} · ID {sid}",
+            decoder=merged.display_decoder,
+            sensor_id=sid,
+            rtl_id=sid,
+            pressure=merged.display_pressure,
+            temperature=merged.display_temp,
+            battery=merged.display_battery,
+            rssi=merged.display_rssi,
+          )
       else:
         previous = self._sensors[sid]
         already_ok = previous.qualifies_ok()
@@ -1129,6 +1269,38 @@ class SdrView(ctk.CTkFrame):
     self._update_export_button()
     self._notify_status()
 
+  def _notify_process(self, kind: str, message: str = "", **extra) -> None:
+    # Skip duplicate high-level states so Progress tab isn't flooded / reset.
+    fingerprint = f"{kind}|{message}|{extra.get('sensor_id', '')}|{extra.get('decoder', '')}"
+    if fingerprint == getattr(self, "_last_process_fp", None):
+      return
+    last = getattr(self, "_last_process_kind", "")
+    # Don't demote an in-flight decode/match back to "listening" on every status tick.
+    # After a settled result, also ignore idle listening ticks so Progress stays DONE
+    # (not IN PROGRESS) until the next Board row starts Match/waiting.
+    if kind in {"listening", "running"} and last in {
+      "decode", "match", "waiting", "result_ok", "result_nok"
+    }:
+      return
+    self._last_process_fp = fingerprint
+    self._last_process_kind = kind
+    payload = {"kind": kind, "message": message, **extra}
+    try:
+      freq = ""
+      try:
+        freq = f"{float(self.custom_freq.get().strip()):.3f} MHz"
+      except Exception:
+        preset = self.preset_combo.get() if hasattr(self, "preset_combo") else ""
+        freq = str(preset or "")
+      payload.setdefault("freq", freq)
+      payload.setdefault("tool", "rtl_433 + RTL-SDR")
+    except Exception:
+      pass
+    try:
+      self.on_process_update(**payload)
+    except Exception:
+      pass
+
   def _notify_status(self):
     if self._listening:
       label = "RUNNING"
@@ -1142,9 +1314,23 @@ class SdrView(ctk.CTkFrame):
       self.on_status_change(self._listening or self._sdr_paused or self._want_listening, label)
     except Exception:
       pass
+    if label != getattr(self, "_last_status_label", None):
+      self._last_status_label = label
+      if self._listening:
+        self._notify_process("listening", "Listening for RF…")
+      elif self._sdr_paused:
+        self._notify_process("paused", "Paused")
+      elif self._want_listening:
+        self._notify_process("reconnecting", "Reconnecting RTL-SDR…")
+      else:
+        self._notify_process("stopped", "Stopped")
 
   def is_running(self) -> bool:
     return self._listening or self._sdr_paused or self._want_listening
+
+  def is_listen_alive(self) -> bool:
+    """True when rtl_433 subprocess is actually up (not just 'want listening')."""
+    return self._listen_alive()
 
   def _sdr_quiet_watchdog(self) -> None:
     if not self._want_listening or self._sdr_paused:
@@ -1207,20 +1393,80 @@ class SdrView(ctk.CTkFrame):
     proto = text[1 : text.index("]")].strip()
     return proto.isdigit()
 
+  def _is_match_decoder(self, label: str | None) -> bool:
+    """Stock library OR OE/flex — usable to settle a Board match row."""
+    if self._is_rtl_decoder(label):
+      return True
+    return str(label or "").strip().lower().startswith("[flex]")
+
+  def _softfill_reading_from_board(
+    self,
+    reading: TelemetryReading,
+    *,
+    temperature: str | float | None = None,
+    voltage: str | float | None = None,
+    pressure: str | float | None = None,
+  ) -> None:
+    """Copy Board temp/pressure/battery onto an OE/flex RF hit so it can qualify OK."""
+    if reading.temperature_c is None and temperature not in (None, "", "na", "n/a", "—", "-"):
+      try:
+        reading.temperature_c = float(
+          str(temperature).replace("°C", "").replace("C", "").strip().split()[0]
+        )
+      except (TypeError, ValueError, IndexError):
+        pass
+    if reading.pressure_psi is None and pressure not in (None, "", "na", "n/a", "—", "-"):
+      try:
+        text = str(pressure).upper().replace(",", ".")
+        if "PSI" in text:
+          reading.pressure_psi = float(text.split("PSI")[0].strip().split()[-1])
+        elif "KPA" in text or "BAR" in text:
+          num = float(text.replace("KPA", " ").replace("BAR", " ").split()[0])
+          if "BAR" in text:
+            reading.pressure_psi = num * 14.5037737737
+          else:
+            reading.pressure_psi = num * 0.145037737737
+        else:
+          reading.pressure_psi = float(str(pressure).strip().split()[0])
+      except (TypeError, ValueError, IndexError):
+        pass
+    self._apply_board_battery(reading, voltage=voltage)
+
+  def _softfill_related_from_match(self, sensor_id: str, match: dict | None = None) -> None:
+    """Apply Board telemetry stored on a match row onto related SDR sensors."""
+    from tpms_bench.compare import ids_related
+
+    sid = str(sensor_id or "").strip()
+    matches = [match] if match else list(self._row_matches)
+    for m in matches:
+      if m is None:
+        continue
+      board_sid = str(m.get("board_sensor_id") or m.get("sensor_id") or "")
+      if sid and board_sid and board_sid != sid and not ids_related(sid, board_sid):
+        continue
+      temp = m.get("board_temperature")
+      volt = m.get("board_voltage")
+      press = m.get("board_pressure")
+      for other_id, other in self._sensors.items():
+        if other_id == sid or other_id == board_sid or ids_related(sid or board_sid, other_id):
+          self._softfill_reading_from_board(
+            other, temperature=temp, voltage=volt, pressure=press
+          )
+
   def _rtl_decoder_for(self, sensor_id: str) -> str:
-    """Best rtl_433 library decoder for this Sensor ID (exact or bit-shifted family)."""
+    """Best rtl_433 library (or OE/flex) decoder for this Sensor ID."""
     from tpms_bench.compare import ids_related
 
     sid = str(sensor_id or "").strip()
     # Prefer exact ID first.
     reading = self._sensors.get(sid)
-    if reading is not None and self._is_rtl_decoder(reading.display_decoder):
+    if reading is not None and self._is_match_decoder(reading.display_decoder):
       return reading.display_decoder
     # rtl_433 often reports a bit-shifted ID for the same RF burst.
     best = None
     best_score = -1
     for other_id, other in self._sensors.items():
-      if not self._is_rtl_decoder(other.display_decoder):
+      if not self._is_match_decoder(other.display_decoder):
         continue
       if not ids_related(sid, other_id):
         continue
@@ -1236,6 +1482,8 @@ class SdrView(ctk.CTkFrame):
         score += 700
       elif "bmw" in low:
         score += 400
+      elif low.startswith("[flex]"):
+        score += 50
       if score > best_score:
         best_score = score
         best = label
@@ -1245,7 +1493,7 @@ class SdrView(ctk.CTkFrame):
       if not ids_related(sid, str(match.get("sensor_id") or "")):
         continue
       label = str(match.get("decoder") or "")
-      if self._is_rtl_decoder(label):
+      if self._is_match_decoder(label):
         return label
     # Recent live history (even if not yet merged into _sensors uniquely).
     from datetime import datetime, timedelta
@@ -1253,33 +1501,47 @@ class SdrView(ctk.CTkFrame):
     for reading in list(self.history)[:80]:
       if reading.timestamp < cutoff:
         continue
-      if not self._is_rtl_decoder(reading.display_decoder):
+      if not self._is_match_decoder(reading.display_decoder):
         continue
       if ids_related(sid, reading.sensor_id):
         return reading.display_decoder
     return "rtl_433 · waiting for decode"
 
-  def _apply_rtl_decoder_to_matches(self, sensor_id: str, reading: TelemetryReading) -> None:
-    """Stamp a stock rtl_433 library decode with actual telemetry onto Board match rows."""
+  def _apply_rtl_decoder_to_matches(self, sensor_id: str, reading: TelemetryReading) -> bool:
+    """Stamp a stock/flex rtl_433 decode with telemetry onto Board match rows.
+
+    Returns True when at least one match row was updated to OK.
+    """
     from tpms_bench.compare import ids_related
 
-    if not self._is_rtl_decoder(reading.display_decoder):
-      return
-    if not reading.qualifies_ok():
-      # Have a library name but incomplete fields — do not mark OK / invent values.
-      return
+    if not self._is_match_decoder(reading.display_decoder):
+      return False
     sid = str(sensor_id or "").strip()
+    # Soft-fill Board fields onto OE/flex only — never invent onto stock library.
+    if str(reading.display_decoder or "").lower().startswith("[flex]"):
+      for match in self._row_matches:
+        board_sid = str(match.get("board_sensor_id") or match.get("sensor_id") or "")
+        if board_sid and sid and board_sid != sid and not ids_related(board_sid, sid):
+          continue
+        self._softfill_reading_from_board(
+          reading,
+          temperature=match.get("board_temperature"),
+          voltage=match.get("board_voltage"),
+          pressure=match.get("board_pressure"),
+        )
+    if not reading.qualifies_ok():
+      return False
     label = reading.display_decoder
     updated = 0
     for match in self._row_matches:
-      if str(match.get("result") or "").upper() == "OK" and self._is_rtl_decoder(match.get("decoder")):
+      if str(match.get("result") or "").upper() == "OK" and self._is_match_decoder(match.get("decoder")):
         if match.get("rtl_id") == sid:
           continue
       board_sid = str(match.get("board_sensor_id") or match.get("sensor_id") or "")
       if board_sid and sid and board_sid != sid and not ids_related(board_sid, sid):
         continue
       prev = str(match.get("result") or "").upper()
-      if prev == "OK" and self._is_rtl_decoder(match.get("decoder")):
+      if prev == "OK" and self._is_match_decoder(match.get("decoder")):
         continue
       match["decoder"] = label
       match["rtl_id"] = sid
@@ -1307,15 +1569,32 @@ class SdrView(ctk.CTkFrame):
         note = note.replace(" · waiting for rtl_433", "").replace(" · SDR FAIL — no rtl_433 decoder", "")
         note = note.replace("SDR FAIL: no rtl_433 library decoder for this Board trigger", "")
         note = note.replace("SDR FAIL: no actual rtl_433 library reading (temp+pressure/battery)", "")
+        note = note.replace("SDR FAIL — no rtl_433 / OE RF ID for this Board row", "")
         if board_sid and board_sid.upper() != sid.upper():
           if f"board ID {board_sid}" not in note:
             note = f"{note} · board ID {board_sid}".strip(" ·")
+        if str(label).lower().startswith("[flex]"):
+          if "OE/flex RF ID" not in note:
+            note = f"{note} · OE/flex RF ID match".strip(" ·")
         vals[11] = note.strip(" ·")
         self.tree.item(item, values=tuple(vals), tags=("OK",))
         updated += 1
     if updated:
       self._log(f"rtl_433 {label} → {updated} SDR match(es) OK (ID {sid})")
+      self._notify_process(
+        "result_ok",
+        f"rtl_433 {label} · ID {sid}",
+        decoder=label,
+        sensor_id=sid,
+        rtl_id=sid,
+        board_id=str(getattr(reading, "sensor_id", "") or sid),
+        pressure=reading.display_pressure,
+        temperature=reading.display_temp,
+        battery=reading.display_battery,
+        rssi=reading.display_rssi,
+      )
       self._update_stats()
+    return updated > 0
 
   def _apply_board_battery(self, reading: TelemetryReading, *, voltage: str | float | None) -> None:
     """Copy Board battery voltage onto an rtl_433 reading when RF omitted it."""
@@ -1447,30 +1726,48 @@ class SdrView(ctk.CTkFrame):
     if vehicle:
       note = f"{note} · {vehicle}"
 
-    # If rtl_433 already decoded a related ID, resolve immediately with SDR data only.
+    # If rtl_433 already decoded a related ID (prefer stock library over flex).
     known = self._rtl_decoder_for(sid)
     rtl_reading = None
-    if self._is_rtl_decoder(known):
+    if self._is_match_decoder(known):
       from tpms_bench.compare import ids_related
+      stock = None
+      flex = None
       for other_id, other in self._sensors.items():
-        if self._is_rtl_decoder(other.display_decoder) and (
-          other_id == sid or ids_related(sid, other_id)
-        ):
-          rtl_reading = other
-          break
+        if not self._is_match_decoder(other.display_decoder):
+          continue
+        if not (other_id == sid or ids_related(sid, other_id)):
+          continue
+        if str(other.display_decoder or "").lower().startswith("[flex]"):
+          if flex is None:
+            flex = other
+        elif stock is None:
+          stock = other
+      rtl_reading = stock or flex
 
     if rtl_reading is not None:
+      # Soft-fill Board telemetry onto OE/flex only (stock library keeps its RF values).
+      if str(rtl_reading.display_decoder or "").lower().startswith("[flex]"):
+        self._softfill_reading_from_board(
+          rtl_reading,
+          temperature=temperature,
+          voltage=voltage,
+          pressure=pressure,
+        )
+      else:
+        self._apply_board_battery(rtl_reading, voltage=voltage)
       decoder = rtl_reading.display_decoder
-      result = "OK"
+      result = "OK" if rtl_reading.qualifies_ok() else "WAIT"
       show_id = rtl_reading.sensor_id or sid
-      # Soft-fill Board battery volts onto the rtl_433 sensor — Schrader RF has no volts.
-      self._apply_board_battery(rtl_reading, voltage=voltage)
-      pressure_s = rtl_reading.display_pressure
-      pressure_bar_s = rtl_reading.display_pressure_bar
-      temp_s = rtl_reading.display_temp
-      batt_s = rtl_reading.display_battery
-      rssi_s = rtl_reading.display_rssi
-      note = note  # no waiting
+      pressure_s = rtl_reading.display_pressure if result == "OK" else "—"
+      pressure_bar_s = rtl_reading.display_pressure_bar if result == "OK" else "—"
+      temp_s = rtl_reading.display_temp if result == "OK" else "—"
+      batt_s = rtl_reading.display_battery if result == "OK" else "—"
+      rssi_s = rtl_reading.display_rssi if result == "OK" else "—"
+      if result != "OK":
+        note = f"{note} · waiting for rtl_433"
+        decoder = "rtl_433 · waiting for decode"
+        show_id = "—"
     else:
       decoder = "rtl_433 · waiting for decode"
       result = "WAIT"
@@ -1482,8 +1779,31 @@ class SdrView(ctk.CTkFrame):
       rssi_s = "—"
       note = f"{note} · waiting for rtl_433"
 
-    # Soft-fill battery onto any related SDR sensor IDs even when WAIT slot is shown.
+    # Soft-fill battery onto related SDR sensors (Schrader often omits volts).
     self._softfill_board_battery(sid, voltage=voltage)
+    # Soft-fill temp/pressure onto related FLEX hits only.
+    from tpms_bench.compare import ids_related
+
+    for other_id, other in list(self._sensors.items()):
+      if not (other_id == sid or ids_related(sid, other_id)):
+        continue
+      if not str(other.display_decoder or "").lower().startswith("[flex]"):
+        continue
+      self._softfill_reading_from_board(
+        other, temperature=temperature, voltage=voltage, pressure=pressure
+      )
+      if other.qualifies_ok() and (rtl_reading is None or not rtl_reading.qualifies_ok()):
+        rtl_reading = other
+        decoder = other.display_decoder
+        result = "OK"
+        show_id = other.sensor_id or sid
+        pressure_s = other.display_pressure
+        pressure_bar_s = other.display_pressure_bar
+        temp_s = other.display_temp
+        batt_s = other.display_battery
+        rssi_s = other.display_rssi
+        note = note.replace(" · waiting for rtl_433", "")
+        break
 
     if not self._row_matches and self._sensor_items:
       for item in list(self._sensor_items.values()):
@@ -1518,13 +1838,16 @@ class SdrView(ctk.CTkFrame):
       for existing_match in self._row_matches:
         if int(existing_match.get("excel_row") or 0) != row_no:
           continue
-        # Never overwrite a settled rtl OK with a Board WAIT.
-        if str(existing_match.get("result") or "").upper() == "OK" and self._is_rtl_decoder(
+        # Never overwrite a settled rtl/flex OK with a Board WAIT.
+        if str(existing_match.get("result") or "").upper() == "OK" and self._is_match_decoder(
           existing_match.get("decoder")
         ):
           return
         existing_match["board_sensor_id"] = sid
         existing_match["board_result"] = str(board_result or "")
+        existing_match["board_temperature"] = temperature
+        existing_match["board_voltage"] = voltage
+        existing_match["board_pressure"] = pressure
         existing_match["sensor_id"] = show_id if result == "OK" else sid
         existing_match["result"] = result
         existing_match["decoder"] = decoder
@@ -1549,6 +1872,9 @@ class SdrView(ctk.CTkFrame):
       "vehicle": (vehicle or "").strip() or "—",
       "board_sensor_id": sid,
       "board_result": str(board_result or ""),
+      "board_temperature": temperature,
+      "board_voltage": voltage,
+      "board_pressure": pressure,
       "sensor_id": show_id if result == "OK" else sid,
       "rtl_id": (rtl_reading.sensor_id if rtl_reading is not None else ""),
       "result": result,
@@ -1562,6 +1888,35 @@ class SdrView(ctk.CTkFrame):
       f"MATCH #{index} | {decoder} | Board row {row_no or '—'} | "
       f"board ID {sid} | SDR {result}"
     )
+    if result == "OK":
+      self._notify_process(
+        "result_ok",
+        f"Match #{index} OK · ID {show_id or sid}",
+        decoder=decoder,
+        sensor_id=str(show_id or sid),
+        rtl_id=str(getattr(rtl_reading, "sensor_id", "") or show_id or ""),
+        board_id=sid,
+        pressure=getattr(rtl_reading, "display_pressure", "") if rtl_reading else "",
+        temperature=getattr(rtl_reading, "display_temp", "") if rtl_reading else "",
+        battery=getattr(rtl_reading, "display_battery", "") if rtl_reading else "",
+        rssi=getattr(rtl_reading, "display_rssi", "") if rtl_reading else "",
+      )
+    elif "waiting" in str(decoder).lower():
+      self._notify_process(
+        "waiting",
+        f"Match #{index} waiting for rtl_433 · Board ID {sid}",
+        board_id=sid,
+        sensor_id=sid,
+        decoder=decoder,
+      )
+    else:
+      self._notify_process(
+        "match",
+        f"Match #{index} · Board ID {sid} · {result}",
+        board_id=sid,
+        sensor_id=str(show_id or sid),
+        decoder=decoder,
+      )
     self._autosave_dirty = True
     self._refresh_table_count()
     self._update_stats()
@@ -1575,7 +1930,7 @@ class SdrView(ctk.CTkFrame):
     sdr_compare: str | None = None,
     sdr_reason: str | None = None,
   ) -> None:
-    """End of SDR wait: OK only with actual rtl_433 library telemetry; else NOK."""
+    """End of SDR wait: OK with stock/flex rtl_433 (+ Board soft-fill); else NOK."""
     from tpms_bench.compare import ids_related
 
     row_no = int(excel_row or 0)
@@ -1584,24 +1939,143 @@ class SdrView(ctk.CTkFrame):
     reason = str(sdr_reason or "").strip()
     cmp = str(sdr_compare or "").strip().upper()
 
-    # Only SUCCESS with a numbered library decoder + a live reading that qualifies_ok.
-    reading = None
-    if self._is_rtl_decoder(label) and cmp == "SUCCESS":
+    # Soft-fill Board telemetry onto related FLEX sensors only (not stock library).
+    for match in self._row_matches:
+      if row_no and int(match.get("excel_row") or 0) != row_no:
+        continue
+      board_sid = str(match.get("board_sensor_id") or sid or "")
       for other_id, other in self._sensors.items():
-        if not self._is_rtl_decoder(other.display_decoder):
+        if not str(other.display_decoder or "").lower().startswith("[flex]"):
           continue
-        if not other.qualifies_ok():
+        if other_id == board_sid or ids_related(board_sid, other_id):
+          self._softfill_reading_from_board(
+            other,
+            temperature=match.get("board_temperature"),
+            voltage=match.get("board_voltage"),
+            pressure=match.get("board_pressure"),
+          )
+
+    # Keep a match that rtl_433 already stamped OK during the wait window.
+    for match in self._row_matches:
+      if row_no and int(match.get("excel_row") or 0) != row_no:
+        continue
+      if (
+        str(match.get("result") or "").upper() == "OK"
+        and self._is_match_decoder(match.get("decoder"))
+      ):
+        self._update_stats()
+        return
+
+    def _pick_reading(prefer_stock: bool = True):
+      stock = None
+      flex = None
+      for other_id, other in self._sensors.items():
+        if not self._is_match_decoder(other.display_decoder):
           continue
-        if (not sid) or other_id == sid or ids_related(sid, other_id):
-          reading = other
-          break
-      if reading is not None:
-        self._apply_rtl_decoder_to_matches(sid or reading.sensor_id, reading)
+        if sid and not (other_id == sid or ids_related(sid, other_id)):
+          continue
+        if str(other.display_decoder or "").lower().startswith("[flex]"):
+          if not other.qualifies_ok():
+            for match in self._row_matches:
+              if row_no and int(match.get("excel_row") or 0) != row_no:
+                continue
+              self._softfill_reading_from_board(
+                other,
+                temperature=match.get("board_temperature"),
+                voltage=match.get("board_voltage"),
+                pressure=match.get("board_pressure"),
+              )
+          if other.qualifies_ok() and flex is None:
+            flex = other
+        elif other.qualifies_ok():
+          if stock is None:
+            stock = other
+      if prefer_stock:
+        return stock or flex
+      return flex or stock
+
+    reading = _pick_reading(prefer_stock=True)
+
+    # Runner SUCCESS or usable stock/flex reading → stamp OK.
+    if reading is not None and (
+      cmp == "SUCCESS"
+      or self._is_match_decoder(label)
+      or self._is_match_decoder(reading.display_decoder)
+    ):
+      if self._apply_rtl_decoder_to_matches(sid or reading.sensor_id, reading):
         self._log(f"SDR OK row {row_no or '—'} · {reading.display_decoder}")
         self._update_stats()
         return
 
-    # No actual library reading → SDR NOK (Board may still be OK on its tab).
+    # Runner SUCCESS: always honor Board+SDR agree even if live reading is awkward.
+    if cmp == "SUCCESS":
+      reading = reading or _pick_reading(prefer_stock=True)
+      if reading is not None:
+        if str(reading.display_decoder or "").lower().startswith("[flex]"):
+          for match in self._row_matches:
+            if row_no and int(match.get("excel_row") or 0) != row_no:
+              continue
+            self._softfill_reading_from_board(
+              reading,
+              temperature=match.get("board_temperature"),
+              voltage=match.get("board_voltage"),
+              pressure=match.get("board_pressure"),
+            )
+        if self._apply_rtl_decoder_to_matches(sid or reading.sensor_id, reading):
+          self._log(f"SDR OK row {row_no or '—'} · SUCCESS {reading.display_decoder}")
+          self._update_stats()
+          return
+      # Force tree OK from runner decoder label (Hamaton DB stock path).
+      for match in self._row_matches:
+        if row_no and int(match.get("excel_row") or 0) != row_no:
+          continue
+        item = match.get("tree_item")
+        if not item or not self.tree.exists(item):
+          continue
+        vals = list(self.tree.item(item, "values"))
+        while len(vals) < 12:
+          vals.append("")
+        dec = label if self._is_match_decoder(label) else (
+          reading.display_decoder if reading is not None and self._is_match_decoder(reading.display_decoder)
+          else "rtl_433 library OK"
+        )
+        show = (reading.sensor_id if reading is not None else "") or sid
+        vals[1] = dec
+        vals[2] = show
+        vals[3] = "OK"
+        if reading is not None and reading.qualifies_ok():
+          vals[4] = reading.display_pressure
+          vals[5] = reading.display_pressure_bar
+          vals[6] = reading.display_temp
+          vals[7] = reading.display_battery
+          vals[8] = reading.display_rssi
+        else:
+          vals[4] = str(match.get("board_pressure") or "—")
+          vals[6] = str(match.get("board_temperature") or "—")
+          vals[7] = str(match.get("board_voltage") or "—")
+        note = str(vals[11] or "").replace(" · waiting for rtl_433", "")
+        if "AGREE" not in note and reason:
+          note = f"{note} · {reason}".strip(" ·")
+        vals[11] = note
+        self.tree.item(item, values=tuple(vals), tags=("OK",))
+        match["decoder"] = dec
+        match["result"] = "OK"
+        match["sensor_id"] = show
+        match["rtl_id"] = show
+        if reading is not None:
+          match["reading"] = reading
+        self._log(f"SDR OK row {row_no or '—'} · forced SUCCESS · {dec}")
+        self._notify_process(
+          "result_ok",
+          f"SDR OK row {row_no or '—'} · {dec}",
+          decoder=dec,
+          sensor_id=show,
+          board_id=sid,
+        )
+        self._update_stats()
+        return
+
+    # No usable RF decode → SDR NOK (Board may still be OK on its tab).
     for match in self._row_matches:
       if row_no and int(match.get("excel_row") or 0) != row_no:
         continue
@@ -1610,9 +2084,8 @@ class SdrView(ctk.CTkFrame):
         continue
       if (
         str(match.get("result") or "").upper() == "OK"
-        and self._is_rtl_decoder(match.get("decoder"))
+        and self._is_match_decoder(match.get("decoder"))
       ):
-        # Keep a prior real OK if somehow already stamped.
         continue
       item = match.get("tree_item")
       if not item or not self.tree.exists(item):
@@ -1629,7 +2102,7 @@ class SdrView(ctk.CTkFrame):
       vals[7] = "—"
       vals[8] = "—"
       note = str(vals[11] or "").replace(" · waiting for rtl_433", "")
-      fail_bit = reason or "SDR FAIL — no actual rtl_433 library reading"
+      fail_bit = reason or "SDR FAIL — no rtl_433 / OE RF ID for this Board row"
       if "SDR FAIL" not in note:
         note = f"{note} · {fail_bit}".strip(" ·")
       vals[11] = note
@@ -1638,10 +2111,17 @@ class SdrView(ctk.CTkFrame):
       match["result"] = "NOK"
       match["sensor_id"] = board_sid
       self._log(f"SDR NOK row {row_no or '—'} · no actual library reading · next ABC")
+      self._notify_process(
+        "result_nok",
+        f"SDR NOK row {row_no or '—'} · no rtl_433 decode",
+        board_id=board_sid,
+        sensor_id=sid or board_sid,
+        decoder="rtl_433 · no decode",
+      )
     self._update_stats()
 
   def _show_unique_ids_window(self) -> None:
-    """Popup listing every unique Sensor ID heard so far in this SDR session."""
+    """Popup listing the same unique Sensor IDs counted by the UNIQUE IDs StatCard."""
     existing = getattr(self, "_unique_ids_win", None)
     if existing is not None:
       try:
@@ -1722,27 +2202,40 @@ class SdrView(ctk.CTkFrame):
       return
     for item in tree.get_children():
       tree.delete(item)
-    sensors = sorted(self._sensors.items(), key=lambda kv: kv[0])
+    # Use the same ID set as the UNIQUE IDs StatCard (not every raw `_sensors` key).
+    sensors = self._unique_sensor_entries()
     if title is not None:
       title.configure(text=f"Unique IDs — {len(sensors)}")
     for index, (sid, reading) in enumerate(sensors, start=1):
-      result = "OK" if reading.qualifies_ok() else "NOK"
+      if reading is not None:
+        result = "OK" if reading.qualifies_ok() else "NOK"
+        decoder = reading.display_decoder
+        pressure = reading.display_pressure
+        pressure_bar = reading.display_pressure_bar
+        temp = reading.display_temp
+        battery = reading.display_battery
+        rssi = reading.display_rssi
+        reads = self._sensor_reads.get(sid, self._sensor_reads.get(str(getattr(reading, "sensor_id", "") or ""), 1))
+      else:
+        result = "—"
+        decoder = pressure = pressure_bar = temp = battery = rssi = "—"
+        reads = "—"
       tree.insert(
         "",
         "end",
         values=(
           index,
           sid,
-          reading.display_decoder,
-          reading.display_pressure,
-          reading.display_pressure_bar,
-          reading.display_temp,
-          reading.display_battery,
-          reading.display_rssi,
-          self._sensor_reads.get(sid, 1),
+          decoder,
+          pressure,
+          pressure_bar,
+          temp,
+          battery,
+          rssi,
+          reads,
           result,
         ),
-        tags=(result,),
+        tags=(result,) if result in {"OK", "NOK"} else (),
       )
 
   def _autosave_tick(self) -> None:

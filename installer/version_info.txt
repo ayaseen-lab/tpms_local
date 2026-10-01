@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 0, 0, 0),
-    prodvers=(2, 0, 0, 0),
+    filevers=(4, 0, 0, 0),
+    prodvers=(4, 0, 0, 0),
     mask=0x3F,
     flags=0x0,
     OS=0x40004,
@@ -16,13 +16,13 @@ VSVersionInfo(
           "040904B0",
           [
             StringStruct("CompanyName", "Fyrqom"),
-            StringStruct("FileDescription", "Fyrqom TPMS Suite 2.0"),
-            StringStruct("FileVersion", "2.0.0"),
+            StringStruct("FileDescription", "Fyrqom TPMS Suite 4.0"),
+            StringStruct("FileVersion", "4.0.0"),
             StringStruct("InternalName", "Fyrqom_TPMS_Suite"),
             StringStruct("LegalCopyright", "Copyright (c) Fyrqom"),
             StringStruct("OriginalFilename", "Fyrqom_TPMS_Suite.exe"),
             StringStruct("ProductName", "Fyrqom TPMS Suite"),
-            StringStruct("ProductVersion", "2.0.0"),
+            StringStruct("ProductVersion", "4.0.0"),
           ],
         )
       ]

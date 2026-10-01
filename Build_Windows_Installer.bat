@@ -1,9 +1,9 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-title Build TPMS Suite Windows installer (2.0)
+title Build TPMS Suite Windows installer (4.0)
 echo.
-echo  Builds Fyrqom_TPMS_Suite.exe + TPMS_Suite_Setup_2.0.0.exe
+echo  Builds Fyrqom_TPMS_Suite.exe + TPMS_Suite_Setup_4.0.0.exe
 echo  Requires: Python 3.11+, network (vendor download), Inno Setup 6
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_installer.ps1"
