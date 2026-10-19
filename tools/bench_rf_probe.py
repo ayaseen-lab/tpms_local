@@ -5,6 +5,10 @@ Shows whether an ID came from a fresh SRAM frame or a stale leftover.
 Run:  python tools/bench_rf_probe.py <excel_row>
 """
 
+raise SystemExit("J-Link lab tool removed — Board RX is USB-TTL only. Use main.py.")
+
+
+
 from __future__ import annotations
 
 import sys

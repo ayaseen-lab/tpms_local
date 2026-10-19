@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -17,7 +16,6 @@ from hamaton.frame import HamatonFrame
 from hamaton.models import CommandResult, ProgramResult, SensorReading
 from hamaton.parser import HamatonStreamParser
 
-from . import jlink_ram
 from .program_one import ProgramSensorCodec as ProgramOneSensorCodec
 from .program_search import ProgramSearchCodec, SearchProgress
 from .query_sensor import QuerySensorCodec, QuerySensorReading
@@ -29,20 +27,7 @@ from .sensor_reading import (
 )
 
 UART_POLL_S = 0.04
-JLINK_POLL_S = 0.1
-
-
-def _env_force_jtag_rx() -> bool:
-    """Lab override only. Default is auto: USB RX first, J-Link only if needed."""
-    raw = os.environ.get("FYRQOM_FORCE_JTAG_RX", "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
-
-
-# Client Windows boards reply on USB-TTL; J-Link is optional fallback (Mac lab TX-only).
-# Set FYRQOM_FORCE_JTAG_RX=1 to skip UART probe and require J-Link RX.
-FORCE_JTAG_RX = _env_force_jtag_rx()
-# A persistent J-Link session dumps in ~0.08 s, so replies can be polled close
-# to UART cadence instead of once per half second.
+# Board replies come only over USB-TTL RX (no J-Link / JTAG).
 PROGRAM_POLL_S = 0.12
 TRIGGER_WAIT_S = 2.8
 FAST_TRIGGER_WAIT_S = 1.8
@@ -56,6 +41,10 @@ PROGRAM_TIMEOUT_S = 12.0
 PROGRAM_RESEND_S = 1.4
 CANCEL_WAIT_S = 0.12
 LF_SEARCH_TIMEOUT_S = 2.2
+# Transient UART / no-sensor misses — retry before marking the row NOK.
+PROGRAM_ATTEMPTS = 3
+TRIGGER_ATTEMPTS = 3
+RETRY_SETTLE_S = 0.28
 # Per-row IQ (when Board does not skip SDR) — keep short; live SDR tab covers capture.
 DEFAULT_SDR_ROW_S = 3.0
 SDR_FINISH_EXTRA_S = 0.8
@@ -291,6 +280,14 @@ class BoardTelemetry:
         if not parts and not self.program_ok and no_rf:
             return "program failed — board did not acknowledge (timeout)"
 
+        # Surface how many recoveries we already spent before declaring NOK.
+        for reason in self.reasons:
+            text = str(reason or "").strip()
+            if text.startswith("program retries:") or text.startswith("trigger retries:"):
+                _add(text)
+            elif text.startswith("row retry:"):
+                _add(text)
+
         return "; ".join(parts) if parts else "incomplete reading"
 
 
@@ -305,7 +302,6 @@ class BoardSession:
     ) -> None:
         self.serial = serial_port
         self.uart_rx_active = False
-        self.jlink_enabled = True
         self.on_comm = on_comm or (lambda _c, _d: None)
         self.on_phase = on_phase or (lambda _phase, _message: None)
         self.transport_mode = "Detecting…"
@@ -313,7 +309,6 @@ class BoardSession:
         self.tx_path = "USB-TTL TX"
         self.rx_path = "…"
         self._parser = HamatonStreamParser()
-        self.jlink_ok = False
         self.ttl_ok = False
         self._stop_check: Callable[[], bool] = lambda: False
         self._aborted = False
@@ -373,83 +368,41 @@ class BoardSession:
         return bool(self._parser.feed(data))
 
     def detect_transport(self) -> str:
-        """Prefer live USB-TTL RX; use J-Link SRAM only when USB RX is absent."""
+        """USB-TTL TX and RX only — no J-Link / JTAG path."""
         if self.should_stop():
             self.transport_mode = "Stopped"
             return self.transport_mode
         self.ttl_ok = bool(getattr(self.serial, "is_open", False))
-        force_jtag = _env_force_jtag_rx()
-
-        if not force_jtag and self.ttl_ok:
-            self.uart_rx_active = self._probe_uart_rx()
-        else:
-            self.uart_rx_active = False
-
-        # When the board answers on USB, skip J-Link entirely (Windows client path).
-        if self.uart_rx_active and not force_jtag:
-            self.jlink_ok = False
-            self.jlink_enabled = False
+        self.uart_rx_active = self._probe_uart_rx() if self.ttl_ok else False
+        if self.uart_rx_active:
             self.rx_path = "USB-TTL RX"
             self.transport_mode = "USB-TTL TX/RX"
-            return self.transport_mode
-
-        dump = jlink_ram.dump_sram_result()
-        self.jlink_ok = dump.ok
-        self.jlink_enabled = dump.ok
-        if force_jtag:
-            self.uart_rx_active = False
-            if self.jlink_ok:
-                self.rx_path = "J-Link RX"
-                self.transport_mode = "USB-TTL TX · J-Link RX"
-            else:
-                self.rx_path = "none"
-                self.transport_mode = "USB-TTL TX · J-Link not connected"
-            return self.transport_mode
-
-        if self.jlink_ok:
-            self.rx_path = "J-Link RX"
-            self.transport_mode = "USB-TTL TX · J-Link RX"
+        elif self.ttl_ok:
+            # Port open — still use UART RX; probe may have raced before board woke.
+            self.uart_rx_active = True
+            self.rx_path = "USB-TTL RX"
+            self.transport_mode = "USB-TTL TX/RX"
         else:
             self.rx_path = "none"
-            self.transport_mode = "USB-TTL TX · no reply path detected"
+            self.transport_mode = "USB-TTL not open"
         return self.transport_mode
 
     def verify_hardware(self) -> tuple[bool, str]:
-        """Probe RX paths and continue. Never require J-Link.
-
-        Client benches: USB-TTL TX+RX (no JTAG). Lab benches: USB-TTL TX +
-        J-Link SRAM RX. Missing J-Link is fine when USB RX works.
-        """
+        """Require USB-TTL. Board replies are read on USB-TTL RX only."""
         if self.should_stop():
             return True, "stopped"
         self.ttl_ok = bool(getattr(self.serial, "is_open", False))
-        force_jtag = _env_force_jtag_rx()
         port = getattr(self.serial, "port", "")
-
-        if not force_jtag and self.ttl_ok:
-            self.uart_rx_active = self._probe_uart_rx()
-        else:
-            self.uart_rx_active = False
-
-        if self.uart_rx_active and not force_jtag:
-            self.jlink_ok = False
-            self.jlink_enabled = False
-            self._signal("uart", "USB-TTL RX active — J-Link not required")
-            return True, f"TX {port} · RX USB-TTL (J-Link skipped)"
-
-        dump = jlink_ram.dump_sram_result()
-        self.jlink_ok = dump.ok
-        self.jlink_enabled = dump.ok
-        if dump.ok:
-            self._signal("jlink", f"SRAM {len(dump.blob)} bytes")
-            rx = "J-Link RX"
-        else:
-            self._signal("jlink", dump.message or "J-Link not used")
-            if force_jtag:
-                rx = "J-Link not connected (TX only)"
-            else:
-                rx = "no board reply path yet — will retry on USB/J-Link"
-        return True, f"TX {port} · RX {rx}"
+        if not self.ttl_ok:
+            return True, f"TX {port or '—'} · USB-TTL not open"
+        self.uart_rx_active = self._probe_uart_rx()
+        if not self.uart_rx_active:
+            # Still drive UART RX — client boards reply on USB-TTL.
+            self.uart_rx_active = True
+            self._signal("uart", "USB-TTL open — RX assumed (probe quiet)")
+            return True, f"TX {port} · RX USB-TTL"
+        self._signal("uart", "USB-TTL RX active")
+        return True, f"TX {port} · RX USB-TTL"
 
     def query_board_version(self):
         """Chapter 4.0 Query Version (0x40) — hardware / boot / software / trigger / program DB.
@@ -551,152 +504,19 @@ class BoardSession:
         except (CodecError, UnexpectedResponseError, FrameError):
             return None
 
-    def _jlink_before(self) -> set[tuple[int, bytes]]:
-        if not self.jlink_enabled:
-            return set()
-        dump = jlink_ram.dump_sram_result()
-        if dump.ok:
-            self._signal("jlink", "snap")
-            return jlink_ram.snapshot_keys(dump.blob)
-        return set()
-
-    def _frames_from_blob(self, blob: bytes, before: set[tuple[int, bytes]]) -> list[HamatonFrame]:
-        """Frames that appeared after the pre-command SRAM snapshot."""
-        return jlink_ram.new_board_frames(blob, before)
-
-    def _poll_jlink(
-        self,
-        codec: CommandCodec,
-        before: set[tuple[int, bytes]],
-    ) -> CommandResult | None:
-        if not self.jlink_enabled:
-            return None
-        dump = jlink_ram.dump_sram_result()
-        if not dump.ok:
-            return None
-        self._signal("jlink", f"{len(dump.blob)}B")
-
-        # Prefer truly new SRAM frames first.
-        for frame in reversed(self._frames_from_blob(dump.blob, before)):
-            result = self._handle_frame(codec, frame)
-            if result is None:
-                continue
-            self.last_path = "J-Link RX"
-            return result
-
-        # Fallback: board often reuses the same SRAM slot. Accept pending/failure
-        # always. Accept success only when it is new — never a previous row's
-        # program ACK (that caused wrong programmed_id + "stale query" NOKs).
-        extracted = jlink_ram.extract_frames(dump.blob, HamatonFrame.BOARD_ADDRESS)
-        for offset, frame in reversed(extracted[-24:]):
-            key = (offset, frame.to_bytes())
-            result = self._handle_frame(codec, frame)
-            if result is None:
-                continue
-            # A leftover pending/success from a previous command sits in SRAM
-            # forever. Returning it here used to refresh execute()'s deadline
-            # on every poll, so LF-search could hang for hours.
-            if key in before:
-                continue
-            self.last_path = "J-Link RX"
-            return result
-        return None
-
-    def _trigger_reading_from_ram(
-        self,
-        blob: bytes,
-        before: set[tuple[int, bytes]] | None = None,
-        *,
-        expected_id: str | None = None,
-    ) -> SensorReading | None:
-        before = before or set()
-        trigger_codec = TriggerCodec(0, 0, 0)
-        reading: SensorReading | None = None
-        for offset, frame in jlink_ram.extract_frames(blob, HamatonFrame.BOARD_ADDRESS):
-            if before and (offset, frame.to_bytes()) in before:
-                continue
-            payload = frame.payload
-            if len(payload) < 2:
-                continue
-            cmd, sub = payload[0], payload[1]
-            candidate: SensorReading | None = None
-            if cmd == 0x28 and sub in (0x01, 0x02):
-                try:
-                    candidate = parse_sensor_reading(payload[2:])
-                except CodecError:
-                    continue
-            elif cmd in (0x20, 0xA0) and sub == 0x01:
-                try:
-                    result = trigger_codec.parse_response(frame)
-                except (CodecError, UnexpectedResponseError):
-                    continue
-                if result.is_success and isinstance(result.value, SensorReading):
-                    candidate = result.value
-            if candidate is None:
-                continue
-            if expected_id:
-                if candidate.sensor_id.hex().upper() != expected_id.upper():
-                    continue
-            reading = candidate
-        if reading is not None:
-            return reading
-        # Slot reuse: the live sensor often rewrites the same SRAM bytes.
-        # Skipping those leftover keys made every row look like "no LF/RF".
-        if before:
-            return self._trigger_reading_from_ram(blob, None, expected_id=expected_id)
-        return None
-
-    def _query_from_ram(
-        self,
-        blob: bytes,
-        before: set[tuple[int, bytes]] | None = None,
-        *,
-        expected_id: str | None = None,
-    ) -> QuerySensorReading | None:
-        before = before or set()
-        codec = QuerySensorCodec()
-        for offset, frame in reversed(jlink_ram.extract_frames(blob, HamatonFrame.BOARD_ADDRESS)):
-            if before and (offset, frame.to_bytes()) in before:
-                continue
-            payload = frame.payload
-            if len(payload) < 2:
-                continue
-            if payload[0] not in (0x22, 0xA2) or payload[1] != 0x01:
-                continue
-            result = self._handle_frame(codec, frame)
-            if result and result.is_success and isinstance(result.value, QuerySensorReading):
-                reading = result.value
-                if expected_id and reading.sensor_id.hex().upper() != expected_id.upper():
-                    continue
-                return reading
-        if before:
-            return self._query_from_ram(blob, None, expected_id=expected_id)
-        return None
-
     def execute(
         self,
         codec: CommandCodec,
         timeout: float | None = None,
-        jlink_poll_s: float = JLINK_POLL_S,
         *,
         allow_resend: bool = False,
     ) -> CommandResult:
+        """Send a command on USB-TTL TX and wait for the reply on USB-TTL RX."""
         if self.should_stop():
             return CommandResult.failure(0xFF, "stopped")
-        # Program ACKs often only appear in SRAM and reuse the same slot — always
-        # snapshot for program so J-Link fallback can run even when UART RX works.
         is_program = isinstance(codec, ProgramOneSensorCodec)
-        before = (
-            self._jlink_before()
-            if self.jlink_enabled and (is_program or not self.uart_rx_active)
-            else set()
-        )
-        poll_s = PROGRAM_POLL_S if is_program else jlink_poll_s
         try:
             self.send_codec(codec)
-            # Let the board write the reply into SRAM before the first dump.
-            if not self.uart_rx_active:
-                time.sleep(0.08)
         except Exception as exc:
             if self.should_stop() or "stopped" in str(exc).lower():
                 return CommandResult.failure(0xFF, "stopped")
@@ -707,15 +527,12 @@ class BoardSession:
         hard_deadline = started + max(seconds, 1.0) * 2
         last_pending: CommandResult | None = None
         last_pending_key: tuple | None = None
-        last_jlink = 0.0
-        uart_miss_since = time.monotonic()
         resent = False
 
         while time.monotonic() < deadline and time.monotonic() < hard_deadline:
             if self.should_stop():
                 return CommandResult.failure(0xFF, "stopped")
             for frame in self._read_uart_frames(UART_POLL_S):
-                uart_miss_since = time.monotonic()
                 result = self._handle_frame(codec, frame)
                 if result is None:
                     continue
@@ -729,24 +546,6 @@ class BoardSession:
                         deadline = time.monotonic() + seconds
                     continue
                 return result
-
-            need_jlink = self.jlink_enabled and (
-                is_program
-                or not self.uart_rx_active
-                or (time.monotonic() - uart_miss_since) > 0.6
-            )
-            if need_jlink and (time.monotonic() - last_jlink) >= poll_s:
-                last_jlink = time.monotonic()
-                result = self._poll_jlink(codec, before)
-                if result is not None:
-                    if result.is_pending:
-                        last_pending = result
-                        key = (result.message, getattr(result.value, "sensor_count", None))
-                        if key != last_pending_key:
-                            last_pending_key = key
-                            deadline = time.monotonic() + seconds
-                    else:
-                        return result
 
             # Mid-wait resend for Program — boards sometimes miss the first TX.
             if (
@@ -847,24 +646,21 @@ class BoardSession:
         code_c: int,
         *,
         expected_id: str | None = None,
+        wait_s: float | None = None,
     ) -> tuple[bool, SensorReading | None, str]:
+        """LF trigger + RF read over USB-TTL only."""
         try:
             self.cancel()
-            wait_s = FAST_TRIGGER_WAIT_S if self.uart_rx_active else TRIGGER_WAIT_S
-            before = (
-                self._jlink_before()
-                if (self.jlink_enabled and not self.uart_rx_active)
-                else set()
-            )
-
+            if wait_s is None:
+                wait_s = FAST_TRIGGER_WAIT_S if self.uart_rx_active else TRIGGER_WAIT_S
+            else:
+                wait_s = max(1.0, float(wait_s))
             self.send_codec(ReceiveRfCodec(True, code_a, code_b, code_c))
             self.send_codec(TriggerCodec(code_a, code_b, code_c))
 
             trigger_codec = TriggerCodec(code_a, code_b, code_c)
             deadline = time.monotonic() + wait_s
-            last_jlink = 0.0
             fallback: SensorReading | None = None
-            jlink_period = 0.22 if self.uart_rx_active else JLINK_POLL_S
 
             while time.monotonic() < deadline:
                 if self.should_stop():
@@ -880,50 +676,16 @@ class BoardSession:
                         return True, result.value, "trigger"
                     if result and result.is_pending:
                         break
-
-                if self.jlink_enabled and (time.monotonic() - last_jlink) >= jlink_period:
-                    last_jlink = time.monotonic()
-                    dump = jlink_ram.dump_sram_result()
-                    if dump.ok:
-                        reading = self._trigger_reading_from_ram(
-                            dump.blob,
-                            before if before else None,
-                            expected_id=expected_id,
-                        )
-                        if reading is not None:
-                            self.last_path = "J-Link RX"
-                            return True, reading, "trigger"
-                        if expected_id:
-                            any_reading = self._trigger_reading_from_ram(
-                                dump.blob,
-                                before if before else None,
-                                expected_id=None,
-                            )
-                            if any_reading is not None:
-                                fallback = fallback or any_reading
-                        for frame in reversed(self._frames_from_blob(dump.blob, before)):
-                            result = self._handle_frame(trigger_codec, frame)
-                            if result and result.is_success and isinstance(result.value, SensorReading):
-                                sid = result.value.sensor_id.hex().upper()
-                                if expected_id and sid != expected_id.upper():
-                                    fallback = fallback or result.value
-                                    continue
-                                self.last_path = "J-Link RX"
-                                return True, result.value, "trigger"
-
                 time.sleep(0.02)
 
             if fallback is not None:
                 self.last_path = self.last_path or "USB-TTL RX"
                 return True, fallback, "trigger"
 
-            # Skip slow LF-search when UART already answered quickly with nothing —
-            # only search when J-Link path is the primary RX.
-            if not self.uart_rx_active:
-                search = self.lf_search(code_a, code_b, code_c)
-                if search.is_success and isinstance(search.value, SearchProgress) and search.value.sensor_count >= 1:
-                    self.last_path = self.last_path or "J-Link RX"
-                    return True, None, "lf-search"
+            search = self.lf_search(code_a, code_b, code_c)
+            if search.is_success and isinstance(search.value, SearchProgress) and search.value.sensor_count >= 1:
+                self.last_path = self.last_path or "USB-TTL RX"
+                return True, None, "lf-search"
 
             return False, None, "trigger timeout"
         except Exception:
@@ -942,16 +704,12 @@ class BoardSession:
         return self.execute(ProgramSearchCodec(code_a, code_b, code_c), timeout=LF_SEARCH_TIMEOUT_S)
 
     def query(self, *, expected_id: str | None = None) -> CommandResult:
+        """Query sensor telemetry over USB-TTL RX only."""
         errors: list[str] = []
         fallback: QuerySensorReading | None = None
         for attempt in range(1, QUERY_RETRIES + 1):
             time.sleep(0.02 if attempt == 1 else 0.08)
-            before = (
-                self._jlink_before()
-                if (self.jlink_enabled and not self.uart_rx_active)
-                else set()
-            )
-            result = self.execute(QuerySensorCodec(), timeout=QUERY_TIMEOUT_S, jlink_poll_s=JLINK_POLL_S)
+            result = self.execute(QuerySensorCodec(), timeout=QUERY_TIMEOUT_S)
             if result.is_success and isinstance(result.value, QuerySensorReading):
                 reading = result.value
                 sid = reading.sensor_id.hex().upper()
@@ -962,26 +720,6 @@ class BoardSession:
                     return result
             else:
                 errors.append(result.message or "query failed")
-
-            if self.jlink_enabled:
-                dump = jlink_ram.dump_sram_result()
-                if dump.ok:
-                    reading = self._query_from_ram(
-                        dump.blob,
-                        before if before else None,
-                        expected_id=expected_id,
-                    )
-                    if reading is not None:
-                        self.last_path = "J-Link RX"
-                        return CommandResult.success(reading)
-                    if expected_id:
-                        any_reading = self._query_from_ram(
-                            dump.blob,
-                            before if before else None,
-                            expected_id=None,
-                        )
-                        if any_reading is not None:
-                            fallback = fallback or any_reading
 
         if fallback is not None:
             self.last_path = self.last_path or "USB-TTL RX"
@@ -1005,46 +743,104 @@ class BoardSession:
             return tel, empty_sdr
         requested_id = format_oeid(oeid) if oeid else None
 
-        self._emit_phase("program", "Programming ABC codes…")
-        program = self.program(code_a, code_b, code_c, oeid)
-        if self.should_stop() or (program.is_failure and (program.message or "") == "stopped"):
-            tel.reasons.append("stopped")
-            return tel, empty_sdr
         program_trusted = False
-        if program.is_success and isinstance(program.value, ProgramResult):
-            program_trusted = self.last_path in ("USB-TTL RX", "Board RX", "J-Link RX")
-            tel.program_ok = True
-            tel.frequency = program.value.frequency
-            tel.frequency_mhz = program.value.frequency_mhz
-            returned_id = program.value.sensor_id.hex().upper()
-            tel.sensor_id = returned_id
-            if program_trusted:
-                tel.programmed_id = returned_id
-            # A 28-bit protocol cannot hold a full 32-bit OEID, so the board
-            # choosing its own ID there is expected, not a fault.
-            id_bits = getattr(program.value, "id_bit_length", 0x20)
-            if requested_id and returned_id != requested_id and id_bits >= 0x20:
-                tel.reasons.append(
-                    f"program used ID {returned_id} (requested OEID {requested_id})"
+        program_attempts_used = 0
+        last_program_msg = "failed"
+        for attempt in range(1, PROGRAM_ATTEMPTS + 1):
+            program_attempts_used = attempt
+            if self.should_stop():
+                tel.reasons.append("stopped")
+                return tel, empty_sdr
+            if attempt == 1:
+                self._emit_phase("program", "Programming ABC codes…")
+            else:
+                self._emit_phase(
+                    "program",
+                    f"Program retry {attempt}/{PROGRAM_ATTEMPTS} (ACK miss / timeout)…",
                 )
-        else:
-            msg = program.message or "failed"
-            if "TRI database" not in msg:
-                tel.reasons.append(f"program: {msg}")
+                try:
+                    self.recover_link(code_a, code_b, code_c)
+                except Exception:
+                    pass
+                time.sleep(RETRY_SETTLE_S * attempt)
+
+            program = self.program(code_a, code_b, code_c, oeid)
+            if self.should_stop() or (program.is_failure and (program.message or "") == "stopped"):
+                tel.reasons.append("stopped")
+                return tel, empty_sdr
+
+            if program.is_success and isinstance(program.value, ProgramResult):
+                program_trusted = self.last_path in ("USB-TTL RX", "Board RX")
+                tel.program_ok = True
+                tel.frequency = program.value.frequency
+                tel.frequency_mhz = program.value.frequency_mhz
+                returned_id = program.value.sensor_id.hex().upper()
+                tel.sensor_id = returned_id
+                if program_trusted:
+                    tel.programmed_id = returned_id
+                # A 28-bit protocol cannot hold a full 32-bit OEID, so the board
+                # choosing its own ID there is expected, not a fault.
+                id_bits = getattr(program.value, "id_bit_length", 0x20)
+                if requested_id and returned_id != requested_id and id_bits >= 0x20:
+                    tel.reasons.append(
+                        f"program used ID {returned_id} (requested OEID {requested_id})"
+                    )
+                break
+
+            last_program_msg = program.message or "failed"
+            # TRI database errors will not recover by retrying the same ABC.
+            if "TRI database" in last_program_msg:
+                break
+
+        if not tel.program_ok and "TRI database" not in last_program_msg:
+            tel.reasons.append(f"program: {last_program_msg}")
+            if program_attempts_used > 1:
+                tel.reasons.append(f"program retries: {program_attempts_used}")
 
         sdr_proc = start_capture(iq_path, frequency_hz=frequency_hz, duration_s=sdr_duration) if iq_path else None
 
         expected_id = tel.programmed_id if program_trusted else None
-        self._emit_phase("trigger", "LF trigger — waiting for sensor…")
-        activated, trigger_reading, _note = self.lf_activate(
-            code_a, code_b, code_c, expected_id=expected_id
-        )
-        if activated:
-            tel.trigger_ok = True
-            if trigger_reading is not None:
-                _merge_sensor_reading(tel, trigger_reading)
-        else:
+        trigger_attempts_used = 0
+        for attempt in range(1, TRIGGER_ATTEMPTS + 1):
+            trigger_attempts_used = attempt
+            if self.should_stop():
+                tel.reasons.append("stopped")
+                if sdr_proc is not None and iq_path is not None:
+                    finish_capture(sdr_proc, iq_path, extra_wait_s=0.2)
+                return tel, empty_sdr
+            if attempt == 1:
+                self._emit_phase("trigger", "LF trigger — waiting for sensor…")
+                wait_s = None
+            else:
+                self._emit_phase(
+                    "trigger",
+                    f"LF trigger retry {attempt}/{TRIGGER_ATTEMPTS}…",
+                )
+                try:
+                    self.recover_link(code_a, code_b, code_c)
+                except Exception:
+                    pass
+                time.sleep(RETRY_SETTLE_S * attempt)
+                # Give later attempts a slightly longer RF window.
+                base = FAST_TRIGGER_WAIT_S if self.uart_rx_active else TRIGGER_WAIT_S
+                wait_s = base + 0.6 * (attempt - 1)
+
+            activated, trigger_reading, _note = self.lf_activate(
+                code_a, code_b, code_c, expected_id=expected_id, wait_s=wait_s
+            )
+            if activated:
+                tel.trigger_ok = True
+                tel.reasons = [
+                    r for r in tel.reasons if not str(r).startswith("trigger:")
+                ]
+                if trigger_reading is not None:
+                    _merge_sensor_reading(tel, trigger_reading)
+                break
+
+        if not tel.trigger_ok:
             tel.reasons.append("trigger: no sensor response")
+            if trigger_attempts_used > 1:
+                tel.reasons.append(f"trigger retries: {trigger_attempts_used}")
 
         heard = bool(tel.trigger_ok)
         trigger_complete = tel.qualifies_ok()
@@ -1068,10 +864,11 @@ class BoardSession:
                 if "stale query" not in (qmsg or ""):
                     tel.reasons.append(f"read: {qmsg}")
 
-        # One follow-up trigger only when we already heard the sensor (partial read).
+        # One follow-up trigger when we already heard the sensor (partial read).
         if not tel.qualifies_ok() and heard and not self.should_stop():
+            self._emit_phase("trigger", "Partial read — one more LF trigger…")
             activated2, trigger2, _ = self.lf_activate(
-                code_a, code_b, code_c, expected_id=None
+                code_a, code_b, code_c, expected_id=None, wait_s=TRIGGER_WAIT_S + 0.5
             )
             if activated2:
                 tel.trigger_ok = True

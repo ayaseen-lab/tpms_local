@@ -34,15 +34,24 @@ from themes import (
     COLOR_BTN_PRIMARY_TEXT,
     COLOR_BTN_SECONDARY,
     COLOR_BTN_SECONDARY_HOVER,
-    COLOR_BTN_STOP,
-    COLOR_BTN_STOP_HOVER,
+    COLOR_BTN_STOP_BORDER,
+    COLOR_BTN_STOP_OUTLINE,
+    COLOR_BTN_STOP_OUTLINE_HOVER,
+    COLOR_BTN_STOP_TEXT,
     COLOR_CYAN_BG,
     COLOR_GREEN,
     COLOR_GREEN_BG,
     COLOR_HEADER_ACCENT,
     COLOR_HEADER_BG,
+    COLOR_LIVE_BG,
+    COLOR_LIVE_CHIP,
+    COLOR_LIVE_FG,
+    COLOR_LIVE_MUTED,
+    COLOR_LIVE_TEAL,
     COLOR_ORANGE,
     COLOR_ORANGE_BG,
+    COLOR_PILL_OK_BG,
+    COLOR_PILL_OK_FG,
     COLOR_RED,
     COLOR_RED_BG,
     COLOR_TEXT,
@@ -57,6 +66,7 @@ from tpms_bench.paths import app_root
 from tpms_bench.report import build_pdf
 from tpms_bench.runner import OUT_XLSX, SPEC_XLSX, BenchRunner, ManualCode, ProgressEvent, get_out_xlsx, reset_session_db
 from tpms_bench.uart import default_port, find_serial_ports, port_device
+from activity_terminal import ActivityTerminalPanel
 from charts import BoardTrendCharts, ResultCharts
 from widgets import StatCard
 
@@ -158,6 +168,7 @@ class TpmsView(ctk.CTkFrame):
         self._sdr_disagree = 0
         # Current Board session only — used by Comparative export (not stale SQLite history).
         self._session_rows: list[dict] = []
+        self._last_board_tel: dict | None = None
 
         self._setup_styles()
         self._build_ui()
@@ -169,18 +180,24 @@ class TpmsView(ctk.CTkFrame):
         self.after(900, self._poll_live_sdr)
         self._notify_status()
         self.live_sdr_get = None
+        # Board-only sessions (USB-TTL) never prepare / wait on SDR.
+        self._session_skip_sdr = True
 
     def _toplevel(self):
         return self.winfo_toplevel()
+
+    def _sdr_enabled(self) -> bool:
+        """False for Board-only USB-TTL runs — TPMS Board and SDR stay separate."""
+        return not bool(getattr(self, "_session_skip_sdr", True))
 
     def _setup_styles(self) -> None:
         style = ttk.Style(self._toplevel())
         style.theme_use("clam")
         style.configure(
             "Combined.Treeview",
-            background=COLOR_BG,
+            background=COLOR_BG_CARD,
             foreground=COLOR_TEXT,
-            fieldbackground=COLOR_BG,
+            fieldbackground=COLOR_BG_CARD,
             rowheight=24,
             font=("Segoe UI", 10),
             bordercolor=COLOR_BORDER,
@@ -188,7 +205,7 @@ class TpmsView(ctk.CTkFrame):
         )
         style.configure(
             "Combined.Treeview.Heading",
-            background=COLOR_HEADER_BG,
+            background="#0B0F14",
             foreground="#ffffff",
             font=("Segoe UI", 9, "bold"),
             relief="flat",
@@ -196,7 +213,7 @@ class TpmsView(ctk.CTkFrame):
         )
         style.map(
             "Combined.Treeview.Heading",
-            background=[("active", "#2C3538")],
+            background=[("active", "#12263A")],
             foreground=[("active", "#ffffff")],
         )
         style.map(
@@ -221,81 +238,501 @@ class TpmsView(ctk.CTkFrame):
         )
 
     def _build_ui(self) -> None:
-        # Grid so the header never shrinks when the window is maximized.
+        """Scrollable Board page: live telemetry + session + full history."""
+        LIVE_BG = COLOR_LIVE_BG
+        LIVE_FG = COLOR_LIVE_FG
+        LIVE_MUTED = COLOR_LIVE_MUTED
+        LIVE_CHIP = COLOR_LIVE_CHIP
+        LIVE_TEAL = COLOR_LIVE_TEAL
+
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-        footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.grid(row=5, column=0, sticky="ew", padx=4, pady=(2, 4))
-        self.status_var = ctk.StringVar(value="Ready · Select an Excel database and/or enter custom CODE A / B / C")
+        # Whole Board view scrolls so history is always reachable.
+        self._page = ctk.CTkScrollableFrame(
+            self, fg_color="transparent", corner_radius=0,
+            scrollbar_button_color=COLOR_BORDER,
+            scrollbar_button_hover_color=COLOR_TEXT_MUTED,
+        )
+        self._page.grid(row=0, column=0, sticky="nsew")
+        self._page.grid_columnconfigure(0, weight=1)
+        root = self._page
+
+        # —— Metric cards ——
+        stats_row = ctk.CTkFrame(root, fg_color="transparent")
+        stats_row.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        for i in range(5):
+            stats_row.grid_columnconfigure(i, weight=1, minsize=120)
+        self.stat_pending = StatCard(
+            stats_row, "Pending", "—", COLOR_ORANGE, COLOR_ORANGE_BG, compact=True, subtitle="in queue"
+        )
+        self.stat_pending.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.stat_done = StatCard(
+            stats_row, "Tested", "0", COLOR_BLUE, COLOR_BLUE_BG, compact=True, subtitle="of 0 rows"
+        )
+        self.stat_done.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self.stat_ok = StatCard(
+            stats_row, "Passed (OK)", "0", COLOR_GREEN, COLOR_GREEN_BG, compact=True, subtitle="all codes matched"
+        )
+        self.stat_ok.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+        self.stat_nok = StatCard(
+            stats_row, "Failed (NOK)", "0", COLOR_RED, COLOR_RED_BG, compact=True, subtitle="no failures"
+        )
+        self.stat_nok.grid(row=0, column=3, sticky="ew", padx=(0, 8))
+        self.stat_rate = StatCard(
+            stats_row, "Pass rate", "0.0%", COLOR_GREEN, COLOR_GREEN_BG, compact=True, subtitle=""
+        )
+        self.stat_rate.grid(row=0, column=4, sticky="ew")
+
+        # —— Mid: live (left, fills height) + session (right) ——
+        # Left column stretches to match the taller session sidebar so
+        # telemetry occupies the space that used to look empty.
+        mid = ctk.CTkFrame(root, fg_color="transparent")
+        mid.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        mid.grid_columnconfigure(0, weight=3)
+        mid.grid_columnconfigure(1, weight=2)
+        mid.grid_rowconfigure(0, weight=1)
+
+        # Live dark card — fills mid height; telemetry expands into leftover space
+        live = ctk.CTkFrame(mid, fg_color=LIVE_BG, corner_radius=16)
+        live.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        live_in = ctk.CTkFrame(live, fg_color="transparent")
+        live_in.pack(fill="both", expand=True, padx=14, pady=12)
+
+        head = ctk.CTkFrame(live_in, fg_color="transparent")
+        head.pack(fill="x")
+        self.state_badge = ctk.CTkLabel(
+            head,
+            text="IDLE",
+            font=ui_font(11, "bold"),
+            text_color=COLOR_PILL_OK_FG,
+            fg_color=COLOR_PILL_OK_BG,
+            corner_radius=8,
+            height=26,
+            width=90,
+        )
+        self.state_badge.pack(side="left", padx=(0, 10))
+        self.row_counter = ctk.CTkLabel(
+            head, text="ROW —", font=ui_font(12, "bold"), text_color=LIVE_MUTED
+        )
+        self.row_counter.pack(side="right")
+
+        self.vehicle_var = ctk.StringVar(value="Ready — choose Excel or custom codes")
         ctk.CTkLabel(
-            footer,
-            textvariable=self.status_var,
-            font=ctk.CTkFont(size=10),
-            text_color=COLOR_TEXT_MUTED,
+            live_in,
+            textvariable=self.vehicle_var,
+            font=ui_font(20, "bold"),
+            text_color=LIVE_FG,
             anchor="w",
-        ).pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.ttl_led = ctk.CTkLabel(footer, text="● TTL", font=ctk.CTkFont(size=10, weight="bold"), text_color=LED_IDLE)
-        self.ttl_led.pack(side="right", padx=(0, 4))
-        self.rx_led = ctk.CTkLabel(footer, text="● Board RX", font=ctk.CTkFont(size=10, weight="bold"), text_color=LED_IDLE)
-        self.rx_led.pack(side="right", padx=(8, 4))
+        ).pack(fill="x", pady=(8, 6))
 
-        results = tk.Frame(self, bg=COLOR_BG, highlightbackground=COLOR_BORDER, highlightthickness=1)
-        results.grid(row=4, column=0, sticky="ew", pady=(6, 2))
+        self.meta_var = ctk.StringVar(value="OE: —   ·   Supplier: —   ·   Freq: —")
+        meta_row = ctk.CTkFrame(live_in, fg_color="transparent")
+        meta_row.pack(fill="x", pady=(0, 10))
+        self.meta_chip_oe = ctk.CTkLabel(
+            meta_row, text="OE —", font=ui_font(11, "bold"), text_color=LIVE_MUTED,
+            fg_color=LIVE_CHIP, corner_radius=8, height=26, padx=10,
+        )
+        self.meta_chip_oe.pack(side="left", padx=(0, 6))
+        self.meta_chip_supplier = ctk.CTkLabel(
+            meta_row, text="Supplier —", font=ui_font(11, "bold"), text_color=LIVE_MUTED,
+            fg_color=LIVE_CHIP, corner_radius=8, height=26, padx=10,
+        )
+        self.meta_chip_supplier.pack(side="left", padx=(0, 6))
+        self.meta_chip_freq = ctk.CTkLabel(
+            meta_row, text="Freq —", font=ui_font(11, "bold"), text_color=LIVE_MUTED,
+            fg_color=LIVE_CHIP, corner_radius=8, height=26, padx=10,
+        )
+        self.meta_chip_freq.pack(side="left")
+        # Keep meta_var for existing setters; sync chips via trace.
+        self.meta_var.trace_add("write", lambda *_: self._sync_meta_chips())
+
+        codes = ctk.CTkFrame(live_in, fg_color="transparent")
+        codes.pack(fill="x", pady=(0, 10))
+        self.code_vars = {"A": ctk.StringVar(value="—"), "B": ctk.StringVar(value="—"), "C": ctk.StringVar(value="—")}
+        for key, bg, fg, pad in (
+            ("A", "#1E3A42", "#7DD3E8", 8),
+            ("B", "#3A2E1E", "#E8C07D", 8),
+            ("C", "#1E3A32", "#7DE8C0", 0),
+        ):
+            box = ctk.CTkFrame(codes, fg_color=bg, corner_radius=12)
+            box.pack(side="left", expand=True, fill="both", padx=(0, pad))
+            inner = ctk.CTkFrame(box, fg_color="transparent")
+            inner.pack(fill="x", padx=12, pady=10)
+            topc = ctk.CTkFrame(inner, fg_color="transparent")
+            topc.pack(fill="x")
+            ctk.CTkLabel(topc, text=f"CODE {key}", font=ui_font(10, "bold"), text_color=fg).pack(side="left")
+            ctk.CTkButton(
+                topc, text="⎘", width=28, height=22, font=ui_font(12),
+                fg_color="transparent", hover_color=LIVE_CHIP, text_color=fg,
+                command=lambda k=key: self._copy_code(k),
+            ).pack(side="right")
+            ctk.CTkLabel(
+                inner, textvariable=self.code_vars[key],
+                font=ctk.CTkFont(family="Consolas", size=16, weight="bold"),
+                text_color=fg, anchor="w",
+            ).pack(anchor="w", pady=(4, 0))
+
+        # —— Board live telemetry fills remaining height under codes ——
+        tel = ctk.CTkFrame(live_in, fg_color=LIVE_CHIP, corner_radius=12)
+        tel.pack(fill="both", expand=True, pady=(0, 0))
+        tel_in = ctk.CTkFrame(tel, fg_color="transparent")
+        tel_in.pack(fill="both", expand=True, padx=12, pady=10)
+        tel_head = ctk.CTkFrame(tel_in, fg_color="transparent")
+        tel_head.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(
+            tel_head,
+            text="Board live telemetry",
+            font=ui_font(12, "bold"),
+            text_color=LIVE_TEAL,
+        ).pack(side="left")
+        self.tel_phase_var = ctk.StringVar(value="Waiting for Board read…")
+        ctk.CTkLabel(
+            tel_head,
+            textvariable=self.tel_phase_var,
+            font=ui_font(11),
+            text_color=LIVE_MUTED,
+        ).pack(side="right")
+
+        # Horizontal scroll so five metric cells stay readable in a narrow column
+        tel_scroll = ctk.CTkScrollableFrame(
+            tel_in,
+            fg_color="transparent",
+            corner_radius=0,
+            orientation="horizontal",
+            height=150,
+            scrollbar_button_color="#2A3340",
+            scrollbar_button_hover_color=LIVE_MUTED,
+        )
+        tel_scroll.pack(fill="both", expand=True, pady=(0, 4))
+
+        self.tel_id = ctk.StringVar(value="—")
+        self.tel_temp = ctk.StringVar(value="—")
+        self.tel_pressure = ctk.StringVar(value="—")
+        self.tel_rssi = ctk.StringVar(value="—")
+        self.tel_batt = ctk.StringVar(value="—")
+        self.reading_var = ctk.StringVar(value="Waiting for first reading…")
+        self._tel_value_labels: dict[str, ctk.CTkLabel] = {}
+
+        def _tel_cell(key: str, title: str, var: ctk.StringVar, accent: str = LIVE_FG, last: bool = False):
+            cell = ctk.CTkFrame(
+                tel_scroll,
+                fg_color=LIVE_BG,
+                corner_radius=10,
+                border_width=1,
+                border_color="#2A3340",
+                width=148,
+            )
+            cell.pack(side="left", fill="y", expand=True, padx=(0 if key == "id" else 6, 0 if last else 0))
+            cell.pack_propagate(False)
+            inner = ctk.CTkFrame(cell, fg_color="transparent")
+            inner.pack(fill="both", expand=True, padx=12, pady=12)
+            ctk.CTkLabel(inner, text=title, font=ui_font(10, "bold"), text_color=LIVE_MUTED).pack(
+                anchor="w"
+            )
+            val = ctk.CTkLabel(
+                inner,
+                textvariable=var,
+                font=ctk.CTkFont(family="Consolas", size=18, weight="bold"),
+                text_color=accent,
+                anchor="w",
+                wraplength=130,
+                justify="left",
+            )
+            val.pack(anchor="w", pady=(8, 0), fill="x")
+            self._tel_value_labels[key] = val
+
+        _tel_cell("id", "Sensor ID", self.tel_id, LIVE_TEAL)
+        _tel_cell("temp", "Temperature", self.tel_temp)
+        _tel_cell("pressure", "Pressure", self.tel_pressure)
+        _tel_cell("rssi", "RSSI", self.tel_rssi)
+        _tel_cell("batt", "Battery", self.tel_batt, last=True)
+
+        # Summary line uses leftover vertical space under the metric strip
+        self.tel_summary = ctk.CTkLabel(
+            tel_in,
+            textvariable=self.reading_var,
+            font=ui_font(12),
+            text_color=LIVE_MUTED,
+            anchor="w",
+            justify="left",
+        )
+        self.tel_summary.pack(fill="x", pady=(10, 0))
+
+        # Right: session setup + custom codes (content-sized, no stretch)
+        side = ctk.CTkFrame(mid, fg_color="transparent")
+        side.grid(row=0, column=1, sticky="nsew")
+
+        setup = ctk.CTkFrame(
+            side, fg_color=COLOR_BG_CARD, corner_radius=14, border_width=1, border_color=COLOR_BORDER
+        )
+        setup.pack(fill="x", pady=(0, 10))
+        setup_in = ctk.CTkFrame(setup, fg_color="transparent")
+        setup_in.pack(fill="x", padx=14, pady=12)
+
+        setup_head = ctk.CTkFrame(setup_in, fg_color="transparent")
+        setup_head.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(
+            setup_head, text="Session setup", font=ui_font(14, "bold"), text_color=COLOR_TEXT
+        ).pack(side="left")
+        ctk.CTkButton(
+            setup_head, text="Reset session", width=110, height=28, font=ui_font(11),
+            fg_color=COLOR_BG_PANEL, hover_color=COLOR_BORDER, text_color=COLOR_TEXT, corner_radius=8,
+            command=self.reset_session,
+        ).pack(side="right")
+
+        ctk.CTkLabel(
+            setup_in, text="USB serial port", font=ui_font(10, "bold"), text_color=COLOR_TEXT_MUTED
+        ).pack(anchor="w")
+        port_row = ctk.CTkFrame(setup_in, fg_color="transparent")
+        port_row.pack(fill="x", pady=(4, 10))
+        self.port_var = ctk.StringVar(value=default_port())
+        self.port_combo = ctk.CTkComboBox(
+            port_row, values=find_serial_ports() or [default_port()],
+            width=220, height=32, font=ui_font(12), **combo_colors(),
+        )
+        self.port_combo.set(self.port_var.get())
+        self.port_combo.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            port_row, text="↻", width=32, height=32, font=ui_font(13, "bold"),
+            fg_color=COLOR_BG_PANEL, hover_color=COLOR_BORDER, text_color=COLOR_TEXT, corner_radius=8,
+            command=self._refresh_ports,
+        ).pack(side="left", padx=(6, 0))
+
+        ctk.CTkLabel(
+            setup_in, text="Firmware", font=ui_font(10, "bold"), text_color=COLOR_TEXT_MUTED
+        ).pack(anchor="w")
+        fw_row = ctk.CTkFrame(setup_in, fg_color="transparent")
+        fw_row.pack(fill="x", pady=(4, 10))
+        self.version_var = ctk.StringVar(value="—")
+        ctk.CTkLabel(
+            fw_row, textvariable=self.version_var, font=ui_font(12, "bold"), text_color=COLOR_TEXT, anchor="w"
+        ).pack(side="left", fill="x", expand=True)
+        self.query_fw_btn = ctk.CTkButton(
+            fw_row, text="Details", width=72, height=28, font=ui_font(11, "bold"),
+            fg_color=COLOR_BG_CARD, hover_color=COLOR_BG_PANEL, text_color=COLOR_TEXT,
+            border_width=1, border_color=COLOR_BORDER, corner_radius=8,
+            command=self.query_firmware_version,
+        )
+        self.query_fw_btn.pack(side="right")
+
+        ctk.CTkLabel(
+            setup_in, text="Excel database", font=ui_font(10, "bold"), text_color=COLOR_TEXT_MUTED
+        ).pack(anchor="w")
+        self.file_label = ctk.CTkLabel(
+            setup_in, text="No file selected", font=ui_font(12, "bold"), text_color=COLOR_ORANGE, anchor="w"
+        )
+        self.file_label.pack(fill="x", pady=(4, 6))
+        excel_btns = ctk.CTkFrame(setup_in, fg_color="transparent")
+        excel_btns.pack(fill="x")
+        ctk.CTkButton(
+            excel_btns, text="Change file", width=100, height=30, font=ui_font(11, "bold"),
+            fg_color=COLOR_BG_CARD, hover_color=COLOR_BG_PANEL, text_color=COLOR_TEXT,
+            border_width=1, border_color=COLOR_BORDER, corner_radius=8, command=self.select_excel,
+        ).pack(side="left")
+        self.remove_excel_btn = ctk.CTkButton(
+            excel_btns, text="Remove", width=80, height=30, font=ui_font(11),
+            fg_color=COLOR_BG_CARD, hover_color=COLOR_RED_BG, text_color=COLOR_BTN_STOP_TEXT,
+            border_width=1, border_color=COLOR_BTN_STOP_BORDER, corner_radius=8,
+            command=self.remove_excel, state="disabled",
+        )
+        self.remove_excel_btn.pack(side="left", padx=(8, 0))
+
+        # Hidden control refs used by start/pause/stop state machine
+        ctrl = ctk.CTkFrame(setup_in, fg_color="transparent")
+        ctrl.pack(fill="x", pady=(12, 0))
+        self.full_btn = _ControlState()
+        self.transport_var = ctk.StringVar(value="USB-TTL TX/RX")
+        self.start_btn = ctk.CTkButton(
+            ctrl, text="Start Board", width=110, height=34, font=ui_font(12, "bold"),
+            fg_color=COLOR_BTN_PRIMARY, hover_color=COLOR_BTN_PRIMARY_HOVER,
+            text_color=COLOR_BTN_PRIMARY_TEXT, corner_radius=10,
+            command=lambda: self.start_test(skip_sdr=True, run_full=False),
+        )
+        self.start_btn.pack(side="left", padx=(0, 6))
+        self.pause_btn = ctk.CTkButton(
+            ctrl, text="Pause test", width=100, height=34, font=ui_font(12, "bold"),
+            fg_color=COLOR_BTN_PAUSE, hover_color=COLOR_BTN_PAUSE_HOVER, text_color="#FFFFFF",
+            corner_radius=10, state="disabled", command=self.toggle_pause,
+        )
+        self.pause_btn.pack(side="left", padx=(0, 6))
+        self.stop_btn = ctk.CTkButton(
+            ctrl, text="Stop", width=72, height=34, font=ui_font(12, "bold"),
+            fg_color=COLOR_BTN_STOP_OUTLINE, hover_color=COLOR_BTN_STOP_OUTLINE_HOVER,
+            text_color=COLOR_BTN_STOP_TEXT, border_width=2, border_color=COLOR_BTN_STOP_BORDER,
+            corner_radius=10, state="disabled", command=self.stop_test,
+        )
+        self.stop_btn.pack(side="left")
+
+        custom = ctk.CTkFrame(
+            side, fg_color=COLOR_BG_CARD, corner_radius=14, border_width=1, border_color=COLOR_BORDER
+        )
+        custom.pack(fill="x", expand=False)
+        custom_in = ctk.CTkFrame(custom, fg_color="transparent")
+        custom_in.pack(fill="x", expand=False, padx=12, pady=10)
+        ctk.CTkLabel(
+            custom_in, text="Custom codes", font=ui_font(13, "bold"), text_color=COLOR_TEXT
+        ).pack(anchor="w", pady=(0, 6))
+        self.manual_entries: dict[str, ctk.CTkEntry] = {}
+        for key in ("A", "B", "C"):
+            row = ctk.CTkFrame(custom_in, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row, text=f"Code {key}", width=58, anchor="w", font=ui_font(11), text_color=COLOR_TEXT_MUTED).pack(side="left")
+            entry = ctk.CTkEntry(row, height=30, placeholder_text=f"{key} hex", **entry_colors())
+            entry.pack(side="left", fill="x", expand=True)
+            entry.bind("<Return>", lambda _e: self.add_custom_code())
+            self.manual_entries[key] = entry
+        meta = ctk.CTkFrame(custom_in, fg_color="transparent")
+        meta.pack(fill="x", pady=(8, 0))
+        self.manual_make_entry = ctk.CTkEntry(meta, width=90, height=28, placeholder_text="Make", **entry_colors())
+        self.manual_make_entry.pack(side="left", padx=(0, 4))
+        self.manual_model_entry = ctk.CTkEntry(meta, width=90, height=28, placeholder_text="Model", **entry_colors())
+        self.manual_model_entry.pack(side="left", padx=(0, 4))
+        self.manual_freq_entry = ctk.CTkEntry(meta, width=70, height=28, placeholder_text="MHz", **entry_colors())
+        self.manual_freq_entry.pack(side="left", padx=(0, 4))
+        self.manual_label_entry = ctk.CTkEntry(meta, width=80, height=28, placeholder_text="Label", **entry_colors())
+        self.manual_label_entry.pack(side="left", padx=(0, 4))
+        self.manual_label_entry.bind("<Return>", lambda _e: self.add_custom_code())
+        ctk.CTkButton(
+            custom_in, text="Add code", width=100, height=30, font=ui_font(11, "bold"),
+            fg_color=COLOR_GREEN, hover_color="#15803d", corner_radius=8, command=self.add_custom_code,
+        ).pack(anchor="w", pady=(8, 0))
+        self.codes_list = ctk.CTkFrame(custom_in, fg_color="transparent")
+        self.codes_list.pack(fill="x", pady=(6, 0))
+        self.codes_hint = ctk.CTkLabel(
+            self.codes_list, text="No custom codes added yet.", font=ui_font(10),
+            text_color=COLOR_TEXT_MUTED, anchor="w",
+        )
+        self.codes_hint.pack(anchor="w")
+
+        # Charts kept for logic (hidden)
+        charts_anchor = ctk.CTkFrame(root, fg_color="transparent", height=1)
+        self.trend_charts = BoardTrendCharts(charts_anchor, height=1, title="")
+        self.charts = ResultCharts(charts_anchor, height=1, title="")
+
+        # —— Full-width progress (not beside Custom codes) ——
+        prog_card = ctk.CTkFrame(
+            root, fg_color=COLOR_LIVE_BG, corner_radius=12
+        )
+        prog_card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        prog_wrap = ctk.CTkFrame(prog_card, fg_color="transparent")
+        prog_wrap.pack(fill="x", padx=14, pady=10)
+        self.progress = ctk.CTkProgressBar(
+            prog_wrap, height=8, progress_color=COLOR_LIVE_TEAL, fg_color="#2A313A", corner_radius=4
+        )
+        self.progress.pack(fill="x")
+        self.progress.set(0)
+        prog_row = ctk.CTkFrame(prog_wrap, fg_color="transparent")
+        prog_row.pack(fill="x", pady=(6, 0))
+        self.progress_label = ctk.CTkLabel(
+            prog_row, text="Progress: 0.0% (0 of 0)", font=ui_font(11), text_color=COLOR_LIVE_MUTED
+        )
+        self.progress_label.pack(side="left")
+        self.eta_label = ctk.CTkLabel(prog_row, text="", font=ui_font(11), text_color=COLOR_LIVE_MUTED)
+        self.eta_label.pack(side="right")
+        self.elapsed_label = ctk.CTkLabel(prog_row, text="", font=ui_font(11), text_color=COLOR_LIVE_MUTED)
+        self.elapsed_label.pack(side="right", padx=(0, 12))
+        self.speed_label = ctk.CTkLabel(prog_row, text="", font=ui_font(11), text_color=COLOR_LIVE_MUTED)
+        self.speed_label.pack(side="right", padx=(0, 12))
+
+        # —— TPMS Board matches (same visual style as SDR matches) ——
+        results = tk.Frame(
+            root, bg=COLOR_BG, highlightbackground=COLOR_BORDER, highlightthickness=1
+        )
+        results.grid(row=3, column=0, sticky="ew", pady=(0, 6))
 
         table_header = tk.Frame(results, bg=COLOR_BG_PANEL)
         table_header.pack(fill="x")
         tk.Label(
             table_header,
-            text="Live OK / NOK results",
+            text="TPMS Board matches — one row per Board test (USB-TTL telemetry)",
             bg=COLOR_BG_PANEL,
             fg=COLOR_TEXT,
             font=("Segoe UI", 10, "bold"),
         ).pack(side="left", padx=8, pady=4)
         self.table_count_label = tk.Label(
-            table_header, text="0 rows", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_DIM, font=("Segoe UI", 9)
+            table_header, text="0 tests", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_DIM, font=("Segoe UI", 9)
         )
         self.table_count_label.pack(side="right", padx=8)
+
+        tools = ctk.CTkFrame(results, fg_color=COLOR_BG_PANEL)
+        tools.pack(fill="x", padx=4, pady=(0, 2))
+        self.history_filter = ctk.CTkComboBox(
+            tools,
+            values=["All results", "Passed only", "Failed only"],
+            width=130,
+            height=26,
+            font=ui_font(11),
+            command=self._apply_history_filter,
+            **combo_colors(),
+        )
+        self.history_filter.set("All results")
+        self.history_filter.pack(side="right", padx=(0, 4), pady=4)
+        self.history_search = ctk.CTkEntry(
+            tools, width=160, height=26, placeholder_text="Search vehicle…", **entry_colors()
+        )
+        self.history_search.pack(side="right", padx=(0, 6), pady=4)
+        self.history_search.bind("<KeyRelease>", lambda _e: self._apply_history_filter())
+        ctk.CTkButton(
+            tools, text="Export Excel", width=96, height=26, font=ui_font(11, "bold"),
+            fg_color=COLOR_BTN_EXPORT, hover_color=COLOR_BTN_EXPORT_HOVER, corner_radius=6,
+            command=self.export_excel,
+        ).pack(side="right", padx=(0, 6), pady=4)
+        ctk.CTkButton(
+            tools, text="Export PDF", width=88, height=26, font=ui_font(11, "bold"),
+            fg_color=COLOR_BTN_EXPORT, hover_color=COLOR_BTN_EXPORT_HOVER, corner_radius=6,
+            command=self.export_pdf,
+        ).pack(side="right", padx=(0, 4), pady=4)
 
         tree_host = tk.Frame(results, bg=COLOR_BG)
         tree_host.pack(fill="x", padx=4, pady=(0, 4))
         columns = (
-            "row",
+            "num",
             "vehicle",
             "codes",
-            "result",
             "id",
-            "temp",
-            "volt",
+            "result",
             "pressure",
+            "pressure_bar",
+            "temp",
+            "battery",
             "rssi",
+            "reads",
+            "time",
             "reason",
         )
-        self.tree = ttk.Treeview(tree_host, columns=columns, show="headings", height=4, style="Combined.Treeview")
+        self.tree = ttk.Treeview(
+            tree_host, columns=columns, show="headings", height=10, style="Combined.Treeview"
+        )
         headings = {
-            "row": "#",
+            "num": "#",
             "vehicle": "Vehicle",
             "codes": "CODE A / B / C",
-            "result": "Board",
             "id": "Sensor ID",
+            "result": "Result",
+            "pressure": "PSI",
+            "pressure_bar": "bar",
             "temp": "°C",
-            "volt": "Batt V",
-            "pressure": "Pressure",
+            "battery": "Batt",
             "rssi": "RSSI",
+            "reads": "Reads",
+            "time": "Seen",
             "reason": "Notes / NOK reason",
         }
-        # Proportional weights for fitting without a horizontal scrollbar.
         self._tree_col_weights = {
-            "row": 0.04,
-            "vehicle": 0.14,
-            "codes": 0.14,
+            "num": 0.04,
+            "vehicle": 0.12,
+            "codes": 0.12,
+            "id": 0.09,
             "result": 0.06,
-            "id": 0.10,
+            "pressure": 0.06,
+            "pressure_bar": 0.05,
             "temp": 0.05,
-            "volt": 0.07,
-            "pressure": 0.12,
-            "rssi": 0.10,
-            "reason": 0.18,
+            "battery": 0.06,
+            "rssi": 0.06,
+            "reads": 0.05,
+            "time": 0.07,
+            "reason": 0.17,
         }
         for col in columns:
             self.tree.heading(col, text=headings[col])
@@ -304,7 +741,7 @@ class TpmsView(ctk.CTkFrame):
                 width=80,
                 minwidth=36,
                 stretch=True,
-                anchor="center" if col in ("row", "result", "id", "temp", "volt", "pressure", "rssi") else "w",
+                anchor="center" if col not in ("reason", "vehicle", "codes") else "w",
             )
         scroll_y = ttk.Scrollbar(
             tree_host, orient="vertical", command=self.tree.yview, style="Combined.Vertical.TScrollbar"
@@ -319,330 +756,26 @@ class TpmsView(ctk.CTkFrame):
         self.tree.tag_configure("flash", background=COLOR_CYAN_BG)
         self.tree.bind("<Configure>", self._fit_tree_columns, add="+")
         self.after(50, self._fit_tree_columns)
+        self._history_all: list[tuple] = []
+        self._board_read_counts: dict[str, int] = {}
 
-        # Stats must be reserved on the bottom stack BEFORE top panels pack,
-        # otherwise PENDING / TESTED collapse to zero height.
-        stats_anchor = ctk.CTkFrame(self, fg_color="transparent")
-        stats_anchor.grid(row=3, column=0, sticky="ew", pady=(4, 0))
-        stats_row = ctk.CTkFrame(stats_anchor, fg_color="transparent")
-        stats_row.pack(fill="x", pady=(0, 2))
-        for i in range(5):
-            stats_row.grid_columnconfigure(i, weight=1, minsize=96)
-        self.stat_pending = StatCard(stats_row, "PENDING", "—", COLOR_ORANGE, COLOR_ORANGE_BG, compact=True)
-        self.stat_pending.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.stat_done = StatCard(stats_row, "TESTED", "0", COLOR_BLUE, COLOR_BLUE_BG, compact=True)
-        self.stat_done.grid(row=0, column=1, sticky="ew", padx=4)
-        self.stat_ok = StatCard(stats_row, "PASSED (OK)", "0", COLOR_GREEN, COLOR_GREEN_BG, compact=True)
-        self.stat_ok.grid(row=0, column=2, sticky="ew", padx=4)
-        self.stat_nok = StatCard(stats_row, "FAILED (NOK)", "0", COLOR_RED, COLOR_RED_BG, compact=True)
-        self.stat_nok.grid(row=0, column=3, sticky="ew", padx=4)
-        self.stat_rate = StatCard(stats_row, "PASS RATE", "0.0%", COLOR_HEADER_ACCENT, COLOR_CYAN_BG, compact=True)
-        self.stat_rate.grid(row=0, column=4, sticky="ew", padx=(4, 0))
+        # Activity terminal (same style as SDR tab)
+        self.activity_terminal = ActivityTerminalPanel(root, start_expanded=False)
+        self.activity_terminal.grid(row=4, column=0, sticky="ew", pady=(4, 0))
 
-        prog_row = ctk.CTkFrame(stats_anchor, fg_color="transparent")
-        prog_row.pack(fill="x")
-        self.progress_label = ctk.CTkLabel(prog_row, text="Progress: 0.0% (0 of 0)", font=ctk.CTkFont(size=10), text_color=COLOR_TEXT_MUTED)
-        self.progress_label.pack(side="left")
-        self.elapsed_label = ctk.CTkLabel(prog_row, text="", font=ctk.CTkFont(size=10), text_color=COLOR_TEXT_MUTED)
-        self.elapsed_label.pack(side="right")
-        self.speed_label = ctk.CTkLabel(prog_row, text="", font=ctk.CTkFont(size=10), text_color=COLOR_TEXT_MUTED)
-        self.speed_label.pack(side="right", padx=(0, 12))
-        self.progress = ctk.CTkProgressBar(stats_anchor, height=6, progress_color=COLOR_GREEN, fg_color=COLOR_BORDER)
-        self.progress.pack(fill="x", pady=(2, 4))
-        self.progress.set(0)
-
-        charts_anchor = ctk.CTkFrame(self, fg_color="transparent")
-        charts_anchor.grid(row=2, column=0, sticky="nsew", pady=(0, 4))
-        charts_anchor.grid_columnconfigure(0, weight=1)
-        charts_anchor.grid_rowconfigure(0, weight=1)
-        self.trend_charts = BoardTrendCharts(
-            charts_anchor, height=78, title="Board trend graphs  ·  pass rate / cumulative / battery"
+        footer = ctk.CTkFrame(root, fg_color="transparent")
+        footer.grid(row=5, column=0, sticky="ew", pady=(4, 8))
+        self.status_var = ctk.StringVar(
+            value="Ready · USB-TTL Board (SDR optional) · Select Excel and/or CODE A / B / C"
         )
-        self.trend_charts.grid(row=0, column=0, sticky="nsew", pady=(0, 2))
-        self.charts = ResultCharts(charts_anchor, height=70, title="Board results")
-        self.charts.grid(row=1, column=0, sticky="ew")
-
-        top = ctk.CTkFrame(self, fg_color=COLOR_BG_CARD, corner_radius=8, border_width=1, border_color=COLOR_BORDER)
-        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        top_inner = ctk.CTkFrame(top, fg_color="transparent")
-        top_inner.pack(fill="x", padx=12, pady=10)
-
-        title_row = ctk.CTkFrame(top_inner, fg_color="transparent")
-        title_row.pack(fill="x", pady=(0, 8))
-        ctk.CTkLabel(title_row, text="Fyrqom Board", font=ui_font(15, "bold"), text_color=COLOR_TEXT).pack(side="left")
-        self.state_badge = ctk.CTkLabel(
-            title_row, text="● IDLE", font=ui_font(12, "bold"), text_color=COLOR_TEXT_DIM
-        )
-        self.state_badge.pack(side="right")
-        self.transport_var = ctk.StringVar(value="")
-        ctk.CTkLabel(title_row, textvariable=self.transport_var, font=ui_font(11), text_color=COLOR_TEXT_DIM).pack(
-            side="right", padx=(0, 12)
-        )
-
-        # Chapter 4.0 Query Version (0x40) — firmware (TPMS software) is the primary field.
-        ver_row = ctk.CTkFrame(top_inner, fg_color=COLOR_BG_PANEL, corner_radius=8)
-        ver_row.pack(fill="x", pady=(0, 8))
         ctk.CTkLabel(
-            ver_row,
-            text="Firmware",
-            font=ui_font(10, "bold"),
-            text_color=COLOR_TEXT_MUTED,
-        ).pack(side="left", padx=(10, 8), pady=6)
-        self.version_var = ctk.StringVar(value="—  (Query firmware or START)")
-        ctk.CTkLabel(
-            ver_row,
-            textvariable=self.version_var,
-            font=ui_font(11, "bold"),
-            text_color=COLOR_TEXT,
-            anchor="w",
-        ).pack(side="left", fill="x", expand=True, padx=(0, 8), pady=6)
-        self.query_fw_btn = ctk.CTkButton(
-            ver_row,
-            text="Query firmware",
-            width=120,
-            height=28,
-            font=ui_font(11, "bold"),
-            fg_color=COLOR_BTN_PRIMARY,
-            hover_color=COLOR_BTN_PRIMARY_HOVER,
-            text_color=COLOR_BTN_PRIMARY_TEXT,
-            corner_radius=8,
-            command=self.query_firmware_version,
-        )
-        self.query_fw_btn.pack(side="right", padx=(0, 10), pady=4)
-
-        # Grid toolbar: buttons keep intrinsic size at any window width.
-        # Run chunk / Run full / Chunk live only in the top nav — do not repeat them here.
-        toolbar = ctk.CTkFrame(top_inner, fg_color=COLOR_BG_PANEL, corner_radius=8)
-        toolbar.pack(fill="x", pady=(0, 8))
-        toolbar.grid_columnconfigure(3, weight=1)
-
-        # Board-only START lives here; Run chunk / Run full (Board+SDR) stay in the top nav.
-        self.full_btn = _ControlState()
-        self.start_btn = ctk.CTkButton(
-            toolbar,
-            text="START",
-            width=96,
-            height=32,
-            font=ui_font(12, "bold"),
-            fg_color=COLOR_BTN_PRIMARY,
-            hover_color=COLOR_BTN_PRIMARY_HOVER,
-            text_color=COLOR_BTN_PRIMARY_TEXT,
-            corner_radius=8,
-            command=lambda: self.start_test(skip_sdr=True, run_full=False),
-        )
-        self.start_btn.grid(row=0, column=0, padx=(8, 6), pady=8, sticky="w")
-        self.pause_btn = ctk.CTkButton(
-            toolbar,
-            text="PAUSE",
-            width=96,
-            height=32,
-            font=ui_font(12, "bold"),
-            fg_color=COLOR_BTN_PAUSE,
-            hover_color=COLOR_BTN_PAUSE_HOVER,
-            text_color="#FFFFFF",
-            corner_radius=8,
-            state="disabled",
-            command=self.toggle_pause,
-        )
-        self.pause_btn.grid(row=0, column=1, padx=(0, 6), pady=8, sticky="w")
-        self.stop_btn = ctk.CTkButton(
-            toolbar,
-            text="STOP",
-            width=88,
-            height=32,
-            font=ui_font(12, "bold"),
-            fg_color=COLOR_BTN_STOP,
-            hover_color=COLOR_BTN_STOP_HOVER,
-            text_color="#FFFFFF",
-            corner_radius=8,
-            state="disabled",
-            command=self.stop_test,
-        )
-        self.stop_btn.grid(row=0, column=2, padx=(0, 8), pady=8, sticky="w")
-
-        ctk.CTkLabel(toolbar, text="Port", font=ui_font(11, "bold"), text_color=COLOR_TEXT_DIM).grid(
-            row=0, column=7, padx=(8, 4), pady=8, sticky="e"
-        )
-        self.port_var = ctk.StringVar(value=default_port())
-        self.port_combo = ctk.CTkComboBox(
-            toolbar,
-            values=find_serial_ports() or [default_port()],
-            width=220,
-            height=30,
-            font=ui_font(11),
-            **combo_colors(),
-        )
-        self.port_combo.set(self.port_var.get())
-        self.port_combo.grid(row=0, column=8, padx=(0, 4), pady=8, sticky="e")
-        ctk.CTkButton(
-            toolbar,
-            text="↻",
-            width=34,
-            height=30,
-            font=ui_font(12, "bold"),
-            fg_color=COLOR_BTN_SECONDARY,
-            hover_color=COLOR_BTN_SECONDARY_HOVER,
-            corner_radius=8,
-            command=self._refresh_ports,
-        ).grid(row=0, column=9, padx=(0, 10), pady=8, sticky="e")
-        ctk.CTkButton(
-            toolbar,
-            text="Export Excel",
-            width=112,
-            height=30,
-            font=ui_font(11, "bold"),
-            fg_color=COLOR_BTN_EXPORT,
-            hover_color=COLOR_BTN_EXPORT_HOVER,
-            corner_radius=8,
-            command=self.export_excel,
-        ).grid(row=0, column=10, padx=(0, 6), pady=8, sticky="e")
-        ctk.CTkButton(
-            toolbar,
-            text="Export PDF",
-            width=104,
-            height=30,
-            font=ui_font(11, "bold"),
-            fg_color=COLOR_BTN_EXPORT,
-            hover_color=COLOR_BTN_EXPORT_HOVER,
-            corner_radius=8,
-            command=self.export_pdf,
-        ).grid(row=0, column=11, padx=(0, 8), pady=8, sticky="e")
-
-        file_row = ctk.CTkFrame(top_inner, fg_color="transparent")
-        file_row.pack(fill="x", pady=(0, 6))
-        ctk.CTkLabel(file_row, text="Excel", font=ui_font(10, "bold"), text_color=COLOR_TEXT_DIM).pack(side="left")
-        self.file_label = ctk.CTkLabel(file_row, text="No file selected", font=ui_font(11, "bold"), text_color=COLOR_ORANGE)
-        self.file_label.pack(side="left", padx=(6, 10))
-        ctk.CTkButton(
-            file_row, text="Choose Excel…", width=120, height=28, font=ui_font(11, "bold"),
-            fg_color=COLOR_BTN_PRIMARY, hover_color=COLOR_BTN_PRIMARY_HOVER, corner_radius=8, command=self.select_excel,
-        ).pack(side="left")
-        self.remove_excel_btn = ctk.CTkButton(
-            file_row,
-            text="Remove",
-            width=78,
-            height=28,
-            font=ui_font(11, "bold"),
-            fg_color=COLOR_BTN_STOP,
-            hover_color=COLOR_BTN_STOP_HOVER,
-            text_color="#FFFFFF",
-            corner_radius=8,
-            command=self.remove_excel,
-            state="disabled",
-        )
-        self.remove_excel_btn.pack(side="left", padx=(6, 0))
-        ctk.CTkButton(
-            file_row, text="Reset", width=70, height=28, font=ui_font(11),
-            fg_color=COLOR_BTN_SECONDARY, hover_color=COLOR_BTN_SECONDARY_HOVER, corner_radius=8, command=self.reset_session,
-        ).pack(side="left", padx=(6, 0))
-
-        code_row = ctk.CTkFrame(top_inner, fg_color="transparent")
-        code_row.pack(fill="x")
-        self.manual_entries: dict[str, ctk.CTkEntry] = {}
-        for key in ("A", "B", "C"):
-            ctk.CTkLabel(code_row, text=f"CODE {key}", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_TEXT_DIM).pack(
-                side="left", padx=(0, 4)
-            )
-            entry = ctk.CTkEntry(code_row, width=110, height=28, placeholder_text=f"{key} hex", **entry_colors())
-            entry.pack(side="left", padx=(0, 8))
-            entry.bind("<Return>", lambda _e: self.add_custom_code())
-            self.manual_entries[key] = entry
-
-        meta_row = ctk.CTkFrame(top_inner, fg_color="transparent")
-        meta_row.pack(fill="x", pady=(4, 0))
-        ctk.CTkLabel(meta_row, text="Make", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_TEXT_DIM).pack(
-            side="left", padx=(0, 4)
-        )
-        self.manual_make_entry = ctk.CTkEntry(meta_row, width=110, height=28, placeholder_text="optional", **entry_colors())
-        self.manual_make_entry.pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(meta_row, text="Model", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_TEXT_DIM).pack(
-            side="left", padx=(0, 4)
-        )
-        self.manual_model_entry = ctk.CTkEntry(meta_row, width=110, height=28, placeholder_text="optional", **entry_colors())
-        self.manual_model_entry.pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(meta_row, text="Freq", font=ctk.CTkFont(size=10, weight="bold"), text_color=COLOR_TEXT_DIM).pack(
-            side="left", padx=(0, 4)
-        )
-        self.manual_freq_entry = ctk.CTkEntry(meta_row, width=90, height=28, placeholder_text="433.92", **entry_colors())
-        self.manual_freq_entry.pack(side="left", padx=(0, 8))
-        self.manual_label_entry = ctk.CTkEntry(meta_row, width=110, height=28, placeholder_text="label", **entry_colors())
-        self.manual_label_entry.pack(side="left", padx=(0, 6))
-        self.manual_label_entry.bind("<Return>", lambda _e: self.add_custom_code())
-        ctk.CTkButton(
-            meta_row, text="Add Code", width=90, height=28, font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color=COLOR_GREEN, hover_color="#15803d", command=self.add_custom_code,
-        ).pack(side="left")
-        self.codes_list = ctk.CTkFrame(top_inner, fg_color="transparent")
-        self.codes_list.pack(fill="x", pady=(4, 0))
-        self.codes_hint = ctk.CTkLabel(
-            self.codes_list, text="No custom codes added yet.", font=ctk.CTkFont(size=10), text_color=COLOR_TEXT_MUTED, anchor="w"
-        )
-        self.codes_hint.pack(anchor="w")
-
-        current = ctk.CTkFrame(self, fg_color=COLOR_BG_CARD, corner_radius=8, border_width=1, border_color=COLOR_BORDER)
-        current.grid(row=1, column=0, sticky="ew", pady=(0, 4))
-        current_inner = ctk.CTkFrame(current, fg_color="transparent")
-        current_inner.pack(fill="x", padx=8, pady=4)
-
-        top_row = ctk.CTkFrame(current_inner, fg_color="transparent")
-        top_row.pack(fill="x")
-        self.vehicle_var = ctk.StringVar(value="Ready — choose an Excel database and/or enter custom codes")
-        ctk.CTkLabel(
-            top_row, textvariable=self.vehicle_var, font=ctk.CTkFont(size=12, weight="bold"), text_color=COLOR_TEXT, anchor="w"
-        ).pack(side="left")
-        self.row_counter = ctk.CTkLabel(
-            top_row, text="", font=ctk.CTkFont(size=10, weight="bold"), fg_color=COLOR_BLUE, text_color="white",
-            corner_radius=5, width=84, height=20,
-        )
-        self.row_counter.pack(side="right")
-        self.meta_var = ctk.StringVar(value="OE: —   ·   Supplier: —   ·   Freq: —")
-        ctk.CTkLabel(current_inner, textvariable=self.meta_var, font=ctk.CTkFont(size=10), text_color=COLOR_TEXT_DIM, anchor="w").pack(
-            anchor="w", pady=(0, 2)
-        )
-
-        codes = ctk.CTkFrame(current_inner, fg_color="transparent")
-        codes.pack(fill="x")
-        self.code_vars = {"A": ctk.StringVar(value="—"), "B": ctk.StringVar(value="—"), "C": ctk.StringVar(value="—")}
-        for key, bg, fg, padx_right in (
-            ("A", CODE_A_BG, CODE_A_FG, 4),
-            ("B", CODE_B_BG, CODE_B_FG, 4),
-            ("C", CODE_C_BG, CODE_C_FG, 0),
-        ):
-            box = ctk.CTkFrame(codes, fg_color=bg, corner_radius=5)
-            box.pack(side="left", expand=True, fill="both", padx=(0, padx_right))
-            inner = ctk.CTkFrame(box, fg_color="transparent")
-            inner.pack(fill="x", padx=8, pady=3)
-            ctk.CTkLabel(
-                inner, text=f"CODE {key}", font=ctk.CTkFont(size=8, weight="bold"), text_color=fg, anchor="w"
-            ).pack(side="left", padx=(0, 8))
-            ctk.CTkLabel(
-                inner,
-                textvariable=self.code_vars[key],
-                font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
-                text_color=fg,
-                anchor="w",
-            ).pack(side="left", fill="x", expand=True)
-
-        tel = ctk.CTkFrame(current_inner, fg_color=TELEMETRY_BG, corner_radius=5)
-        tel.pack(fill="x", pady=(4, 0))
-        tel_inner = ctk.CTkFrame(tel, fg_color="transparent")
-        tel_inner.pack(fill="x", padx=8, pady=4)
-        ctk.CTkLabel(
-            tel_inner,
-            text="LIVE TELEMETRY",
-            font=ctk.CTkFont(size=8, weight="bold"),
-            text_color=TELEMETRY_FG,
-            anchor="w",
-        ).pack(anchor="w")
-        self.reading_var = ctk.StringVar(value="Waiting for first reading…")
-        ctk.CTkLabel(
-            tel_inner,
-            textvariable=self.reading_var,
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color=TELEMETRY_FG,
-            anchor="w",
-            justify="left",
-        ).pack(fill="x", anchor="w", pady=(1, 0))
+            footer, textvariable=self.status_var, font=ui_font(11),
+            text_color=COLOR_TEXT_MUTED, anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+        self.ttl_led = ctk.CTkLabel(footer, text="● TTL", font=ui_font(10, "bold"), text_color=LED_IDLE)
+        self.ttl_led.pack(side="right", padx=(0, 4))
+        self.rx_led = ctk.CTkLabel(footer, text="● USB RX", font=ui_font(10, "bold"), text_color=LED_IDLE)
+        self.rx_led.pack(side="right", padx=(8, 4))
 
     def _refresh_ports(self) -> None:
         ports = find_serial_ports() or [default_port()]
@@ -651,33 +784,316 @@ class TpmsView(ctk.CTkFrame):
             self.port_combo.set(ports[0])
             self.port_var.set(ports[0])
 
+    def _copy_code(self, key: str) -> None:
+        text = str(self.code_vars.get(key, ctk.StringVar()).get() or "").strip()
+        if not text or text == "—":
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.status_var.set(f"Copied CODE {key}: {text}")
+        except Exception:
+            pass
+
+    def _sync_meta_chips(self) -> None:
+        raw = str(self.meta_var.get() or "")
+        oe = supplier = freq = "—"
+        # Formats: "OE: x  ·  Supplier: y  ·  Freq: z" or similar
+        parts = [p.strip() for p in raw.replace("·", "|").split("|")]
+        for part in parts:
+            low = part.lower()
+            if low.startswith("oe"):
+                oe = part.split(":", 1)[-1].strip() or "—"
+            elif "supplier" in low:
+                supplier = part.split(":", 1)[-1].strip() or "—"
+            elif "freq" in low:
+                freq = part.split(":", 1)[-1].strip() or "—"
+        if hasattr(self, "meta_chip_oe"):
+            self.meta_chip_oe.configure(text=f"OE {oe}")
+            self.meta_chip_supplier.configure(text=f"Supplier {supplier}")
+            self.meta_chip_freq.configure(text=f"Freq {freq}")
+
+    def _clear_telemetry(self, phase: str = "Waiting for Board read…") -> None:
+        """Hard-reset tiles (session reset only). Prefer keeping last reading during a run."""
+        if hasattr(self, "tel_id"):
+            self.tel_id.set("—")
+            self.tel_temp.set("—")
+            self.tel_pressure.set("—")
+            self.tel_rssi.set("— needs SDR" if not self._sdr_enabled() else "—")
+            self.tel_batt.set("—")
+            self.reading_var.set("Waiting for Board telemetry…")
+        if hasattr(self, "tel_phase_var"):
+            self.tel_phase_var.set(phase)
+        self._last_board_tel = None
+
+    @staticmethod
+    def _tel_blank(val: str | None) -> bool:
+        t = str(val or "").strip()
+        return (not t) or t.lower() in {"na", "n/a", "—", "-", "none", "null"}
+
+    def _set_telemetry(
+        self,
+        *,
+        sensor_id: str | None = None,
+        temperature: str | None = None,
+        pressure: str | None = None,
+        rssi: str | None = None,
+        voltage: str | None = None,
+        battery_percentage: str | None = None,
+        phase: str | None = None,
+        replace: bool = False,
+        keep_last_on_empty: bool = True,
+    ) -> None:
+        """Push Board USB-TTL live values into the telemetry tiles."""
+        if replace:
+            self._clear_telemetry(phase or "Board reading…")
+
+        sid = str(sensor_id or "").strip()
+        temp = str(temperature or "").strip()
+        press = str(pressure or "").strip()
+        rs = str(rssi or "").strip()
+        batt = _fmt_batt(voltage, battery_percentage)
+        batt_disp = (
+            batt.removeprefix("Batt ").strip()
+            if batt and batt not in {"Batt —", "Batt na"}
+            else ""
+        )
+        has_any = (
+            not self._tel_blank(sid)
+            or not self._tel_blank(temp)
+            or not self._tel_blank(press)
+            or not self._tel_blank(rs)
+            or bool(batt_disp)
+        )
+
+        # No new values (e.g. trigger miss mid-row): keep last good Board reading visible.
+        if not has_any:
+            if keep_last_on_empty and getattr(self, "_last_board_tel", None):
+                if phase and hasattr(self, "tel_phase_var"):
+                    self.tel_phase_var.set(phase)
+                return
+            if phase and hasattr(self, "tel_phase_var"):
+                self.tel_phase_var.set(phase or "No Board telemetry yet")
+            return
+
+        if not self._tel_blank(sid):
+            self.tel_id.set(sid.upper() if len(sid) <= 16 else sid)
+        if not self._tel_blank(temp):
+            if "°" in temp or "C" in temp.upper():
+                self.tel_temp.set(temp)
+            else:
+                try:
+                    self.tel_temp.set(f"{float(temp):.0f} °C")
+                except ValueError:
+                    self.tel_temp.set(f"{temp} °C")
+        if not self._tel_blank(press):
+            # Compact tile text — avoid truncated "… bar / kPa" overflow.
+            psi, bar = self._split_pressure(press)
+            if psi != "na" and bar != "na":
+                self.tel_pressure.set(f"{psi} PSI · {bar} bar")
+            elif psi != "na":
+                self.tel_pressure.set(f"{psi} PSI")
+            else:
+                self.tel_pressure.set(press.split("/")[0].strip() or press)
+        if not self._tel_blank(rs):
+            self.tel_rssi.set(rs)
+        elif not self._sdr_enabled() and self.tel_rssi.get() in {"—", ""}:
+            self.tel_rssi.set("— needs SDR")
+        if batt_disp:
+            self.tel_batt.set(batt_disp)
+
+        self._last_board_tel = {
+            "id": self.tel_id.get(),
+            "temp": self.tel_temp.get(),
+            "pressure": self.tel_pressure.get(),
+            "rssi": self.tel_rssi.get(),
+            "batt": self.tel_batt.get(),
+        }
+        if phase and hasattr(self, "tel_phase_var"):
+            self.tel_phase_var.set(phase)
+        elif hasattr(self, "tel_phase_var"):
+            self.tel_phase_var.set("Board live · USB-TTL")
+
+        self.reading_var.set(
+            f"ID  {self.tel_id.get()}  ·  {self.tel_temp.get()}  ·  "
+            f"{self.tel_pressure.get()}  ·  RSSI {self.tel_rssi.get()}  ·  {self.tel_batt.get()}"
+        )
+
+    @staticmethod
+    def _split_pressure(raw: str | None) -> tuple[str, str]:
+        """Return (PSI, bar) display strings from Board pressure text."""
+        text = str(raw or "").strip()
+        if not text or text.lower() in {"na", "n/a", "—", "-"}:
+            return "na", "na"
+        psi = "na"
+        bar = "na"
+        # Formats: "12.34 PSI / 0.850 bar / 85.00 kPa" or "12.34 PSI" or bare number
+        import re
+
+        m_psi = re.search(r"([-+]?\d+(?:\.\d+)?)\s*PSI", text, re.I)
+        m_bar = re.search(r"([-+]?\d+(?:\.\d+)?)\s*bar", text, re.I)
+        m_kpa = re.search(r"([-+]?\d+(?:\.\d+)?)\s*kPa", text, re.I)
+        if m_psi:
+            psi = f"{float(m_psi.group(1)):.2f}"
+        if m_bar:
+            bar = f"{float(m_bar.group(1)):.3f}"
+        if psi == "na" and m_kpa:
+            kpa = float(m_kpa.group(1))
+            psi = f"{kpa * 0.1450377377:.2f}"
+            bar = f"{kpa / 100.0:.3f}"
+        if psi != "na" and bar == "na":
+            bar = f"{float(psi) / 14.50377377:.3f}"
+        if psi == "na":
+            try:
+                # Bare PSI number
+                n = float(text.split()[0])
+                psi = f"{n:.2f}"
+                bar = f"{n / 14.50377377:.3f}"
+            except (TypeError, ValueError, IndexError):
+                pass
+        return psi, bar
+
+    def _board_match_values(
+        self,
+        *,
+        excel_row: int,
+        vehicle: str,
+        codes: str,
+        sensor_id: str,
+        performance: str,
+        temperature: str,
+        voltage: str,
+        pressure: str,
+        rssi: str,
+        reason: str,
+        seen: str | None = None,
+        count_read: bool = True,
+    ) -> tuple:
+        """Build one SDR-style match row for the Board history table."""
+        sid = (sensor_id or "na").strip() or "na"
+        psi, bar = self._split_pressure(pressure)
+        temp = str(temperature or "na").strip() or "na"
+        if temp.lower() not in {"na", "n/a"} and "°" not in temp:
+            try:
+                temp = f"{float(temp):.0f}"
+            except ValueError:
+                pass
+        batt = str(voltage or "na").strip() or "na"
+        rs = str(rssi or "").strip()
+        if not rs or rs.lower() in {"na", "n/a", "—", "-"}:
+            rs = "na"
+        elif rs.isdigit():
+            rs = f"board {rs}"
+        key = sid.upper() if sid.lower() not in {"na", "n/a", ""} else f"row:{excel_row}"
+        if not hasattr(self, "_board_read_counts"):
+            self._board_read_counts = {}
+        if count_read:
+            self._board_read_counts[key] = int(self._board_read_counts.get(key, 0)) + 1
+            reads = self._board_read_counts[key]
+        else:
+            reads = 1
+        stamp = seen if seen is not None else datetime.now().strftime("%H:%M:%S")
+        if not stamp:
+            stamp = "—"
+        return (
+            excel_row,
+            vehicle or "—",
+            codes or "—",
+            sid,
+            (performance or "SKIP").upper(),
+            psi,
+            bar,
+            temp,
+            batt,
+            rs,
+            reads,
+            stamp,
+            reason or "",
+        )
+
+    def _log_board(self, message: str, level: str = "info") -> None:
+        if hasattr(self, "activity_terminal"):
+            try:
+                self.activity_terminal.write(message, level=level)
+            except Exception:
+                pass
+
+    def _apply_history_filter(self, *_args) -> None:
+        """Rebuild the tree from full history using filter + search."""
+        if not hasattr(self, "tree"):
+            return
+        filt = ""
+        try:
+            filt = str(self.history_filter.get() or "")
+        except Exception:
+            filt = "All results"
+        q = ""
+        try:
+            q = str(self.history_search.get() or "").strip().lower()
+        except Exception:
+            q = ""
+        rows = list(getattr(self, "_history_all", []) or [])
+        if not rows:
+            for iid in self.tree.get_children():
+                vals = self.tree.item(iid, "values")
+                tags = self.tree.item(iid, "tags")
+                rows.append((vals, tags))
+            self._history_all = list(rows)
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        shown = 0
+        for vals, tags in rows:
+            # result column index 4 in SDR-style Board matches table
+            result = str((vals[4] if len(vals) > 4 else "") or "").upper()
+            if filt.startswith("Passed") and result != "OK":
+                continue
+            if filt.startswith("Failed") and result != "NOK":
+                continue
+            if q:
+                hay = " ".join(str(v) for v in vals).lower()
+                if q not in hay:
+                    continue
+            self.tree.insert("", "end", values=vals, tags=tags)
+            shown += 1
+        if hasattr(self, "table_count_label"):
+            total = len(rows)
+            label = (
+                f"{shown} of {total} test{'s' if total != 1 else ''}"
+                if shown != total
+                else f"{total} test{'s' if total != 1 else ''}"
+            )
+            self.table_count_label.configure(text=label)
+
     def _refresh_ready_banner(self) -> None:
         if self.source_xlsx and self.source_xlsx.is_file():
             n = vehicle_row_count(self.source_xlsx)
             port = port_device(self.port_combo.get()) or port_device(default_port()) or "COM?"
             if n > 0:
                 self.vehicle_var.set(
-                    f"{self.source_xlsx.name} — {n:,} vehicles loaded · use Run chunk / Run full (top bar)"
+                    f"{self.source_xlsx.name} — {n:,} vehicles · Run chunk / Run full"
                 )
                 self.status_var.set(f"Ready on {port} — {n:,} catalog rows · waiting for Run")
             else:
                 self.vehicle_var.set(f"{self.source_xlsx.name} loaded — no catalog rows found")
                 self.status_var.set(f"Ready on {port} — check Excel or add custom codes")
         else:
-            self.vehicle_var.set("Ready — choose an Excel database and/or enter custom codes")
+            self.vehicle_var.set("Ready — choose Excel or enter custom codes")
             self.status_var.set("Choose an Excel database and/or enter custom CODE A / B / C")
 
     def _reset_display(self) -> None:
         self._update_stat_labels(pending=0, done=0, ok=0, nok=0, total=0)
         self.meta_var.set("OE: —   ·   Supplier: —   ·   Freq: —")
-        self.row_counter.configure(text="")
-        self.reading_var.set("Waiting for first reading…")
+        self.row_counter.configure(text="ROW —")
+        self._clear_telemetry("Ready — start a Board run")
         for key in self.code_vars:
             self.code_vars[key].set("—")
         self.progress.set(0)
         self.progress_label.configure(text="Progress: 0.0% (0 of 0)")
         self.speed_label.configure(text="")
         self.elapsed_label.configure(text="")
+        if hasattr(self, "eta_label"):
+            self.eta_label.configure(text="")
+        self._history_all = []
         self._refresh_table_count()
         self._refresh_ready_banner()
 
@@ -700,9 +1116,9 @@ class TpmsView(ctk.CTkFrame):
             self.tree.column(col, width=col_w)
 
     def _refresh_table_count(self) -> None:
-        n = len(self.tree.get_children())
+        n = len(getattr(self, "_history_all", None) or self.tree.get_children())
         if hasattr(self, "table_count_label"):
-            self.table_count_label.configure(text=f"{n} row{'s' if n != 1 else ''}")
+            self.table_count_label.configure(text=f"{n} test{'s' if n != 1 else ''}")
 
     def _note_sdr_compare(self, sdr_compare: str) -> None:
         cmp = (sdr_compare or "").strip().upper()
@@ -714,12 +1130,15 @@ class TpmsView(ctk.CTkFrame):
             self._sdr_disagree += 1
 
     def _clear_readings(self) -> None:
+        self._history_all = []
+        self._board_read_counts = {}
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._sdr_agree = 0
         self._sdr_disagree = 0
         self._session_rows.clear()
         self._refresh_table_count()
+        self._log_board("Session cleared — previous Board readings cleared.", level="dim")
         if hasattr(self, "charts"):
             self.charts.reset()
         if hasattr(self, "trend_charts"):
@@ -816,6 +1235,7 @@ class TpmsView(ctk.CTkFrame):
             return 0
 
         self._session_rows.clear()
+        self._history_all = []
         for item in self.tree.get_children():
             self.tree.delete(item)
 
@@ -844,23 +1264,23 @@ class TpmsView(ctk.CTkFrame):
             rssi = str(row["rssi"] if "rssi" in row.keys() else "na") or "na"
             reason = str(row["nok_reason"] or "")
             excel_row = int(row["excel_row"] or 0)
-            self.tree.insert(
-                "",
-                0,
-                values=(
-                    excel_row,
-                    f"{make} {model}".strip(),
-                    f"{code_a}  {code_b}  {code_c}".strip(),
-                    perf,
-                    sid_disp,
-                    temp,
-                    volt,
-                    press,
-                    rssi,
-                    reason,
-                ),
-                tags=(perf,),
+            vals = self._board_match_values(
+                excel_row=excel_row,
+                vehicle=f"{make} {model}".strip(),
+                codes=f"{code_a}  {code_b}  {code_c}".strip(),
+                sensor_id=sid_disp,
+                performance=perf,
+                temperature=temp,
+                voltage=volt,
+                pressure=press,
+                rssi=rssi,
+                reason=reason,
+                seen="—",
+                count_read=False,
             )
+            tags = (perf,)
+            self._history_all.insert(0, (vals, tags))
+            self.tree.insert("", 0, values=vals, tags=tags)
             shown += 1
             if perf in ("OK", "NOK"):
                 self._session_rows.append(
@@ -883,6 +1303,22 @@ class TpmsView(ctk.CTkFrame):
         nok = int(stats.get("NOK") or 0)
         self._update_stat_labels(pending=0, done=done, ok=ok, nok=nok, total=done)
         self._refresh_table_count()
+        # Seed live tiles from the newest row that has a real sensor ID.
+        # columns: num,vehicle,codes,id,result,psi,bar,temp,batt,rssi,reads,time,reason
+        for vals, _tags in list(getattr(self, "_history_all", []) or []):
+            sid = str(vals[3] if len(vals) > 3 else "")
+            if self._tel_blank(sid):
+                continue
+            psi = str(vals[5] if len(vals) > 5 else "")
+            self._set_telemetry(
+                sensor_id=sid,
+                temperature=str(vals[7] if len(vals) > 7 else ""),
+                pressure=f"{psi} PSI" if psi and psi != "na" else "",
+                rssi=str(vals[9] if len(vals) > 9 else ""),
+                voltage=str(vals[8] if len(vals) > 8 else ""),
+                phase="Restored · last Board reading",
+            )
+            break
         if hasattr(self, "charts"):
             history = [str(r.get("board_performance") or "") for r in self._session_rows]
             self.charts.set_counts(ok, nok, history)
@@ -1181,8 +1617,17 @@ class TpmsView(ctk.CTkFrame):
             )
             return False
 
+        # Board-only (USB-TTL): start immediately — SDR is optional and never blocks.
+        if skip_sdr:
+            return self._start_test_now(
+                skip_sdr=True,
+                chunk_size=chunk_size,
+                run_full=run_full,
+                extra_codes=extra_codes,
+            )
+
         freq_mhz = self._preferred_sdr_freq_mhz(extra_codes)
-        # Custom-code / Board runs need live SDR — start + tune before ABC if needed.
+        # Board+SDR mode only: arm rtl_433 before ABC when a dongle is present.
         if callable(self.on_prepare_sdr):
             try:
                 ready = bool(self.on_prepare_sdr(freq_mhz=freq_mhz))
@@ -1199,7 +1644,7 @@ class TpmsView(ctk.CTkFrame):
                 self.after(
                     4500,
                     lambda: self._start_test_now(
-                        skip_sdr=skip_sdr,
+                        skip_sdr=False,
                         chunk_size=chunk_size,
                         run_full=run_full,
                         extra_codes=extra_codes,
@@ -1208,7 +1653,7 @@ class TpmsView(ctk.CTkFrame):
                 return True
 
         return self._start_test_now(
-            skip_sdr=skip_sdr,
+            skip_sdr=False,
             chunk_size=chunk_size,
             run_full=run_full,
             extra_codes=extra_codes,
@@ -1288,12 +1733,14 @@ class TpmsView(ctk.CTkFrame):
         self.start_btn.configure(state="disabled")
         if hasattr(self, "full_btn"):
             self.full_btn.configure(state="disabled")
-        self.pause_btn.configure(state="normal", text="PAUSE")
+        self.pause_btn.configure(state="normal", text="Pause test")
         self.stop_btn.configure(state="normal")
         self._set_state_badge("RUNNING")
 
         size = 0 if run_full else (chunk_size if chunk_size is not None else self.selected_chunk_size())
         port = port_device(self.port_combo.get()) or port_device(default_port())
+        self._session_skip_sdr = bool(skip_sdr)
+        # Board-only: do not wire live SDR callbacks (otherwise the runner waits on rtl_433).
         self.runner = BenchRunner(
             port=port,
             source_xlsx=self.source_xlsx,
@@ -1306,18 +1753,16 @@ class TpmsView(ctk.CTkFrame):
             retest_from=None,
             require_agree=False,
             agree_retries=1,
-            live_sdr_get=self.live_sdr_get,
-            live_sdr_prepare=self.live_sdr_prepare,
+            live_sdr_get=None if skip_sdr else self.live_sdr_get,
+            live_sdr_prepare=None if skip_sdr else self.live_sdr_prepare,
         )
         if skip_sdr:
             self.status_var.set(
-                f"Starting TPMS Board test · USB-TTL on {port} · "
-                "SDR Receiver handles RF (Board live IQ capture off so the dongle is free)…"
+                f"Board-only · USB-TTL on {port} · no SDR required · programming ABC…"
             )
         else:
             self.status_var.set(
-                f"Starting TPMS Board test · USB-TTL on {port} · live SDR compare = "
-                "ID + OK/NOK in trigger window (PSI/°C may differ; stop SDR Receiver if dongle busy)…"
+                f"Board + SDR · USB-TTL on {port} · live rtl_433 compare enabled…"
             )
         self.worker = threading.Thread(target=self._run_safe, daemon=True, name="tpms-board")
         self.worker.start()
@@ -1329,19 +1774,19 @@ class TpmsView(ctk.CTkFrame):
         if not self.is_paused:
             self.runner.pause()
             self.is_paused = True
-            self.pause_btn.configure(text="RESUME")
+            self.pause_btn.configure(text="Resume")
             self._set_state_badge("PAUSED")
         else:
             self.runner.resume_run()
             self.is_paused = False
-            self.pause_btn.configure(text="PAUSE")
+            self.pause_btn.configure(text="Pause test")
             self._set_state_badge("RUNNING")
 
     def stop_test(self) -> None:
         if self.runner:
             self.runner.request_stop()
         self.stop_btn.configure(state="disabled")
-        self.pause_btn.configure(state="disabled", text="PAUSE")
+        self.pause_btn.configure(state="disabled", text="Pause test")
         self.is_paused = False
         self._set_state_badge("STOPPED")
         self.status_var.set("Stopping — aborting COM wait…")
@@ -1357,7 +1802,7 @@ class TpmsView(ctk.CTkFrame):
             self.start_btn.configure(state="normal")
             if hasattr(self, "full_btn"):
                 self.full_btn.configure(state="normal")
-            self.pause_btn.configure(state="disabled", text="PAUSE")
+            self.pause_btn.configure(state="disabled", text="Pause test")
             self.stop_btn.configure(state="disabled")
             self.is_paused = False
             if self._state_label in ("RUNNING", "PAUSED"):
@@ -1366,16 +1811,27 @@ class TpmsView(ctk.CTkFrame):
 
     def _set_state_badge(self, text: str) -> None:
         self._state_label = text
-        colors = {
-            "RUNNING": COLOR_GREEN,
+        fg = {
+            "RUNNING": COLOR_PILL_OK_FG,
             "PAUSED": COLOR_ORANGE,
             "STOPPED": COLOR_TEXT_DIM,
             "COMPLETED": COLOR_BLUE,
-            "IDLE": COLOR_TEXT_DIM,
+            "IDLE": COLOR_TEXT_MUTED,
             "ERROR": COLOR_RED,
         }
-        sym = {"RUNNING": "●", "PAUSED": "❚❚", "STOPPED": "■", "COMPLETED": "✔", "IDLE": "●", "ERROR": "✕"}.get(text, "●")
-        self.state_badge.configure(text=f"{sym}  {text}", text_color=colors.get(text, COLOR_TEXT_DIM))
+        bg = {
+            "RUNNING": COLOR_PILL_OK_BG,
+            "PAUSED": COLOR_ORANGE_BG,
+            "STOPPED": COLOR_BG_PANEL,
+            "COMPLETED": COLOR_BLUE_BG,
+            "IDLE": COLOR_BG_PANEL,
+            "ERROR": COLOR_RED_BG,
+        }
+        self.state_badge.configure(
+            text=text,
+            text_color=fg.get(text, COLOR_TEXT_MUTED),
+            fg_color=bg.get(text, COLOR_BG_PANEL),
+        )
         self._notify_status()
 
     def _notify_status(self) -> None:
@@ -1415,7 +1871,11 @@ class TpmsView(ctk.CTkFrame):
     def _poll_live_sdr(self) -> None:
         """Show SDR packets on the telemetry bar so a silent Board still looks alive."""
         try:
-            snap = self.live_sdr_get() if self.live_sdr_get else None
+            snap = (
+                self.live_sdr_get()
+                if self._sdr_enabled() and self.live_sdr_get
+                else None
+            )
         except Exception:
             snap = None
         if snap:
@@ -1431,8 +1891,11 @@ class TpmsView(ctk.CTkFrame):
                 temp = getattr(latest, "display_temp", None) or "—"
                 psi = getattr(latest, "display_pressure", None) or "—"
                 rssi = getattr(latest, "display_rssi", None) or "—"
-                self.reading_var.set(
-                    f"SDR  {sid}  ·  {temp}  ·  {psi}  ·  RSSI {rssi}  ·  {len(snap)} ID(s) live"
+                self._set_telemetry(
+                    sensor_id=str(sid),
+                    temperature=str(temp),
+                    pressure=str(psi),
+                    rssi=str(rssi),
                 )
         try:
             delay = 400 if self.winfo_ismapped() else 1200
@@ -1564,7 +2027,7 @@ class TpmsView(ctk.CTkFrame):
         self.start_btn.configure(state="normal")
         if hasattr(self, "full_btn"):
             self.full_btn.configure(state="normal")
-        self.pause_btn.configure(state="disabled", text="PAUSE")
+        self.pause_btn.configure(state="disabled", text="Pause test")
         self.stop_btn.configure(state="disabled")
         self.is_paused = False
         self._set_state_badge(label)
@@ -1576,15 +2039,15 @@ class TpmsView(ctk.CTkFrame):
         except Exception:
             pass
         self.status_var.set(message)
-        # Board run settled — stop SDR listening (dongle idle until next Start).
-        if callable(self.on_sdr_release):
+        # Only stop SDR when this session actually used it.
+        if self._sdr_enabled() and callable(self.on_sdr_release):
             try:
                 self.on_sdr_release(reason=label, message=message or "")
             except Exception:
                 pass
 
     def _release_sdr_after_chunk(self, message: str = "") -> None:
-        if callable(self.on_sdr_release):
+        if self._sdr_enabled() and callable(self.on_sdr_release):
             try:
                 self.on_sdr_release(reason="CHUNK", message=message or "Chunk complete")
             except Exception:
@@ -1757,13 +2220,9 @@ class TpmsView(ctk.CTkFrame):
         if event.kind == "comm":
             if event.path == "ttl":
                 self._blink_led(self.ttl_led, LED_TTL_ON)
-            elif event.path in ("uart", "jlink"):
-                if event.path == "uart":
-                    self.rx_led.configure(text="● USB RX")
-                    self._blink_led(self.rx_led, LED_TTL_ON)
-                else:
-                    self.rx_led.configure(text="● J-Link")
-                    self._blink_led(self.rx_led, LED_JLINK_ON)
+            elif event.path == "uart":
+                self.rx_led.configure(text="● USB RX")
+                self._blink_led(self.rx_led, LED_TTL_ON)
             elif event.message:
                 self.status_var.set(event.message)
             return
@@ -1772,13 +2231,19 @@ class TpmsView(ctk.CTkFrame):
             phase = str(event.path or "").lower()
             label = {
                 "program": "Programming ABC…",
-                "trigger": "Triggering sensor…",
-                "query": "Querying sensor…",
+                "trigger": "LF trigger — waiting for sensor…",
+                "query": "Querying Board telemetry…",
             }.get(phase, event.message or phase)
             if event.message:
                 self.status_var.set(event.message)
             else:
                 self.status_var.set(label)
+            if hasattr(self, "tel_phase_var"):
+                if getattr(self, "_last_board_tel", None) and phase in {"program", "trigger"}:
+                    self.tel_phase_var.set(f"{label} · last reading held")
+                else:
+                    self.tel_phase_var.set(label)
+            self._log_board(label, level="dim")
             return
 
         if event.kind == "started":
@@ -1790,25 +2255,29 @@ class TpmsView(ctk.CTkFrame):
             if event.transport:
                 self.transport_var.set(event.transport)
                 t = event.transport.upper()
-                if "USB-TTL TX/RX" in t or "USB-TTL RX" in t:
+                if "USB" in t:
                     self.rx_led.configure(text="● USB RX")
-                elif "J-LINK" in t:
-                    self.rx_led.configure(text="● J-Link")
                 else:
-                    self.rx_led.configure(text="● Board RX")
+                    self.rx_led.configure(text="● USB RX")
             self._update_stat_labels(event.pending, event.done, event.ok, event.nok, event.total)
             self.status_var.set(event.message)
 
         elif event.kind == "row_start":
             self.vehicle_var.set(f"{event.make} {event.model} ({event.year})" if event.year else f"{event.make} {event.model}")
             self.meta_var.set(f"OE: {event.oe or '—'}  ·  Supplier: {event.supplier or '—'}  ·  Freq: {event.freq or '—'}")
-            self.row_counter.configure(text=f"Row {event.excel_row} / {event.total}")
+            self.row_counter.configure(text=f"ROW {event.excel_row} / {event.total}")
             self.code_vars["A"].set(event.code_a or "—")
             self.code_vars["B"].set(event.code_b or "—")
             self.code_vars["C"].set(event.code_c or "—")
+            # Keep last Board telemetry on screen while the next row programs/triggers.
+            if getattr(self, "_last_board_tel", None) and hasattr(self, "tel_phase_var"):
+                self.tel_phase_var.set("Programming ABC… · showing last Board reading")
+            elif hasattr(self, "tel_phase_var"):
+                self.tel_phase_var.set("Programming ABC…")
             self._update_stat_labels(event.pending, event.done, event.ok, event.nok, event.total)
             self.status_var.set(f"Testing row {event.excel_row}: {event.make} {event.model} · {event.pending} pending")
-            if callable(self.on_prepare_sdr):
+            # Board-only USB-TTL: never start/retune rtl_433 (TPMS Board ≠ SDR).
+            if self._sdr_enabled() and callable(self.on_prepare_sdr):
                 try:
                     from tpms_bench.rtl433 import parse_freq_hz
 
@@ -1816,7 +2285,7 @@ class TpmsView(ctk.CTkFrame):
                     self.on_prepare_sdr(freq_mhz=mhz)
                 except Exception:
                     pass
-            if self.on_board_trigger:
+            if self._sdr_enabled() and self.on_board_trigger:
                 try:
                     self.on_board_trigger(
                         sensor_id=str(event.sensor_id or ""),
@@ -1827,23 +2296,34 @@ class TpmsView(ctk.CTkFrame):
                     pass
 
         elif event.kind == "board_ok":
-            # Board ABC finished — show reading now; SDR decode may still be in flight.
-            if event.sensor_id and event.sensor_id != "na":
-                batt = _fmt_batt(event.voltage, event.battery_percentage)
-                self.reading_var.set(
-                    f"ID  {event.sensor_id}  ·  {event.temperature} °C  ·  {batt}"
-                )
-            self._push_tpms_range(event)
+            # Board ABC finished — always refresh live telemetry tiles from USB-TTL.
             perf = (event.performance or "").upper()
-            self.status_var.set(
-                event.message
-                or (
-                    f"Row {event.excel_row} Board {perf or '—'} — "
-                    "waiting rtl_433 before next ABC…"
-                )
+            self._set_telemetry(
+                sensor_id=event.sensor_id,
+                temperature=str(event.temperature or ""),
+                pressure=str(event.pressure or ""),
+                rssi=str(event.rssi or ""),
+                voltage=event.voltage,
+                battery_percentage=event.battery_percentage,
+                phase=f"Board {perf or 'read'} · USB-TTL live",
             )
-            self._note_sdr_compare("PENDING")
-            if self.on_board_rf and event.sensor_id and str(event.sensor_id).lower() not in {"na", "n/a"}:
+            self._push_tpms_range(event)
+            if self._sdr_enabled():
+                self.status_var.set(
+                    event.message
+                    or (
+                        f"Row {event.excel_row} Board {perf or '—'} — "
+                        "waiting rtl_433 before next ABC…"
+                    )
+                )
+                self._note_sdr_compare("PENDING")
+            else:
+                self.status_var.set(
+                    event.message
+                    or f"Row {event.excel_row} Board {perf or '—'} · USB-TTL telemetry updated"
+                )
+                self._note_sdr_compare("na")
+            if self._sdr_enabled() and self.on_board_rf and event.sensor_id and str(event.sensor_id).lower() not in {"na", "n/a"}:
                 try:
                     self.on_board_rf(
                         event.sensor_id,
@@ -1856,7 +2336,7 @@ class TpmsView(ctk.CTkFrame):
                     )
                 except Exception:
                     pass
-            if self.on_board_trigger:
+            if self._sdr_enabled() and self.on_board_trigger:
                 try:
                     self.on_board_trigger(
                         sensor_id=str(event.sensor_id or ""),
@@ -1868,35 +2348,51 @@ class TpmsView(ctk.CTkFrame):
 
         elif event.kind == "row_done":
             self._update_stat_labels(event.pending, event.done, event.ok, event.nok, event.total)
-            if event.sensor_id and event.sensor_id != "na":
-                self.reading_var.set(
-                    f"ID  {event.sensor_id}  ·  {event.temperature} °C  ·  "
-                    f"{event.pressure or 'P na'}  ·  RSSI {event.rssi or 'na'}  ·  "
-                    f"{_fmt_batt(event.voltage, event.battery_percentage)}"
-                )
-            self._push_tpms_range(event)
-            item = self.tree.insert(
-                "",
-                0,
-                values=(
-                    event.excel_row,
-                    f"{event.make} {event.model}".strip(),
-                    f"{event.code_a}  {event.code_b}  {event.code_c}".strip(),
-                    event.performance,
-                    event.sensor_id or "na",
-                    event.temperature or "na",
-                    _fmt_batt(event.voltage, event.battery_percentage).removeprefix("Batt ").strip() or "na",
-                    event.pressure or "na",
-                    event.rssi or "na",
-                    event.reason or event.message or "",
-                ),
-                tags=(event.performance or "SKIP",),
+            perf = (event.performance or "").upper()
+            self._set_telemetry(
+                sensor_id=event.sensor_id,
+                temperature=str(event.temperature or ""),
+                pressure=str(event.pressure or ""),
+                rssi=str(event.rssi or ""),
+                voltage=event.voltage,
+                battery_percentage=event.battery_percentage,
+                phase=f"Row done · Board {perf or '—'}",
             )
+            self._push_tpms_range(event)
+            vals = self._board_match_values(
+                excel_row=int(event.excel_row or 0),
+                vehicle=f"{event.make} {event.model}".strip(),
+                codes=f"{event.code_a}  {event.code_b}  {event.code_c}".strip(),
+                sensor_id=str(event.sensor_id or "na"),
+                performance=str(event.performance or "SKIP"),
+                temperature=str(event.temperature or "na"),
+                voltage=_fmt_batt(event.voltage, event.battery_percentage).removeprefix("Batt ").strip()
+                or "na",
+                pressure=str(event.pressure or "na"),
+                rssi=str(event.rssi or "na"),
+                reason=str(event.reason or event.message or ""),
+            )
+            tags = (event.performance or "SKIP",)
+            if not hasattr(self, "_history_all"):
+                self._history_all = []
+            self._history_all.insert(0, (vals, tags))
+            item = self.tree.insert("", 0, values=vals, tags=tags)
             self._flash_row(item, event.performance or "SKIP")
             self.tree.see(item)
             self._record_session_row(event)
             self._note_sdr_compare(event.sdr_compare)
-            self._refresh_table_count()
+            self._apply_history_filter()
+            level = "ok" if (event.performance or "").upper() == "OK" else (
+                "error" if (event.performance or "").upper() == "NOK" else "info"
+            )
+            self._log_board(
+                f"Row {event.excel_row}  {event.performance or '—'}  "
+                f"ID {event.sensor_id or 'na'}  "
+                f"{event.temperature or '—'}°C  "
+                f"{event.pressure or '—'}  "
+                f"{_fmt_batt(event.voltage, event.battery_percentage)}",
+                level=level,
+            )
             if hasattr(self, "charts"):
                 self.charts.add_result(event.performance or "")
             if hasattr(self, "trend_charts"):
@@ -1922,11 +2418,9 @@ class TpmsView(ctk.CTkFrame):
                     )
                 except Exception:
                     pass
-            # Stamp final rtl_433 library decoder (or SDR FAIL) onto the Board match row.
-            finalize = getattr(self.sdr_view if hasattr(self, "sdr_view") else None, "finalize_board_match", None)
-            # Combined shell wires on_board_rf; finalize via optional callback.
+            # Stamp final rtl_433 library decoder only when this session uses SDR.
             finalize_cb = getattr(self, "on_sdr_finalize", None)
-            if callable(finalize_cb):
+            if self._sdr_enabled() and callable(finalize_cb):
                 try:
                     finalize_cb(
                         excel_row=event.excel_row,
@@ -1937,11 +2431,16 @@ class TpmsView(ctk.CTkFrame):
                     )
                 except Exception:
                     pass
-            sdr = (event.sdr_compare or "").upper()
-            self.status_var.set(
-                f"Row {event.excel_row} Board {event.performance or '—'} · SDR {sdr or '—'} "
-                f"— next ABC…"
-            )
+            if self._sdr_enabled():
+                sdr = (event.sdr_compare or "").upper()
+                self.status_var.set(
+                    f"Row {event.excel_row} Board {event.performance or '—'} · SDR {sdr or '—'} "
+                    f"— next ABC…"
+                )
+            else:
+                self.status_var.set(
+                    f"Row {event.excel_row} Board {event.performance or '—'} · USB-TTL — next ABC…"
+                )
 
         elif event.kind == "stopping":
             self._set_state_badge("STOPPED")
@@ -1949,7 +2448,7 @@ class TpmsView(ctk.CTkFrame):
 
         elif event.kind == "chunk_complete":
             self.is_paused = True
-            self.pause_btn.configure(text="RESUME")
+            self.pause_btn.configure(text="Resume")
             self._set_state_badge("PAUSED")
             self.status_var.set(event.message or "Chunk complete — review Comparison")
             self._release_sdr_after_chunk(event.message or "")
@@ -1969,7 +2468,7 @@ class TpmsView(ctk.CTkFrame):
                 self.start_btn.configure(state="normal")
                 if hasattr(self, "full_btn"):
                     self.full_btn.configure(state="normal")
-                self.pause_btn.configure(state="disabled", text="PAUSE")
+                self.pause_btn.configure(state="disabled", text="Pause test")
                 self.stop_btn.configure(state="disabled")
                 self.is_paused = False
                 self._set_state_badge("ERROR")
@@ -1977,11 +2476,18 @@ class TpmsView(ctk.CTkFrame):
                 self.status_var.set(event.message or "Error")
 
     def _update_stat_labels(self, pending: int, done: int, ok: int, nok: int, total: int) -> None:
-        self.stat_pending.set_value(str(pending))
+        self.stat_pending.set_value(f"{pending:,}" if isinstance(pending, int) else str(pending))
         self.stat_done.set_value(str(done))
         self.stat_ok.set_value(str(ok))
         self.stat_nok.set_value(str(nok))
-        self.stat_rate.set_value(f"{(ok / done * 100.0) if done else 0.0:.1f}%")
+        rate_pct = (ok / done * 100.0) if done else 0.0
+        self.stat_rate.set_value(f"{rate_pct:.1f}%")
+        if hasattr(self.stat_pending, "set_subtitle"):
+            self.stat_pending.set_subtitle("in queue")
+            self.stat_done.set_subtitle(f"of {total:,} rows" if total else "of 0 rows")
+            self.stat_ok.set_subtitle("all codes matched" if nok == 0 and ok > 0 else "OK rows")
+            self.stat_nok.set_subtitle("no failures" if nok == 0 else "need review")
+            self.stat_rate.set_subtitle("")
         if total > 0:
             pct = done / total
             self.progress.set(min(1.0, pct))
@@ -1991,7 +2497,16 @@ class TpmsView(ctk.CTkFrame):
                 mins, secs = divmod(int(elapsed_s), 60)
                 rate = done / (elapsed_s / 60.0) if elapsed_s > 0 else 0
                 self.speed_label.configure(text=f"{rate:.1f} tests/min")
-                self.elapsed_label.configure(text=f"Elapsed: {mins}:{secs:02d}")
+                self.elapsed_label.configure(text=f"Elapsed {mins}:{secs:02d}")
+                if hasattr(self, "eta_label") and rate > 0 and pending > 0:
+                    eta_m = pending / rate
+                    if eta_m >= 60:
+                        h, m = divmod(int(eta_m), 60)
+                        self.eta_label.configure(text=f"ETA ~{h} h {m:02d} m")
+                    else:
+                        self.eta_label.configure(text=f"ETA ~{int(eta_m)} m")
+                elif hasattr(self, "eta_label"):
+                    self.eta_label.configure(text="")
         else:
             self.progress.set(0)
 

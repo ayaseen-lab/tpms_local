@@ -660,8 +660,8 @@ class BenchApp(tk.Tk):
         if event.kind == "comm":
             if event.path == "ttl":
                 self._blink_led(self.ttl_led, LED_TTL_ON)
-            elif event.path == "jlink":
-                self._blink_led(self.rx_led, LED_JLINK_ON)
+            elif event.path == "uart":
+                self._blink_led(self.rx_led, LED_TTL_ON)
             return
 
         if event.kind == "started":

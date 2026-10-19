@@ -13,7 +13,7 @@ Switching tabs only changes the view. SDR listening and board tests keep running
 
 **Packaged installer (full .exe app):** on a Windows PC run `Build_Windows_Installer.bat`, or download the CI artifact from the `windows-installer` GitHub Action. That produces `dist_installer\TPMS_Suite_Setup_4.0.0.exe`.
 
-Board USB RX works without J-Link / JTAG. Plug the Hamaton USB board + RTL-SDR and start.
+Board RX is USB-TTL only. Plug the Hamaton USB board + RTL-SDR and start.
 
 ## Run from source (macOS / Linux / Windows)
 
@@ -65,8 +65,7 @@ A manual triple is tested in addition to Excel rows. If no Excel file is selecte
 
 - SDR tab: RTL-SDR dongle (WinUSB via Zadig). Bundled rtl_433 is under `sdr_ui/vendor/rtl_433`.
 - Board tab: USB-TTL adapter on the Hamaton board. Select the COM port, then Start Test.
-- **Windows client (typical):** the board replies on USB-TTL RX. J-Link / JTAG is **not** required — if USB RX works, the suite uses that path automatically.
-- **Lab fallback:** when USB-TTL is TX-only, replies are read from board SRAM via SEGGER J-Link SWD (optional). Set `FYRQOM_FORCE_JTAG_RX=1` only to force that path.
+- **Board path:** USB-TTL TX **and** RX only. J-Link / JTAG is not used.
 
 ## Windows installer
 
@@ -78,6 +77,6 @@ That script downloads official **rtl_433** (MSVC x64 25.12) and **Zadig 2.9**, b
 
 Or double-click `Build_Windows_Installer.bat`.
 
-SEGGER J-Link is **not** bundled (separate vendor license). It is only needed as a lab fallback when the board does not reply on USB-TTL RX. Windows client machines with working USB RX do not need J-Link.
+J-Link / JTAG support has been removed. The board must reply on USB-TTL RX.
 
 Unsigned installers can still show SmartScreen (“Windows protected your PC”). A paid Authenticode code-signing certificate is what removes that warning; the build is set up so you can sign with `signtool` once you have a cert. Do not disable Defender to hide the warning.

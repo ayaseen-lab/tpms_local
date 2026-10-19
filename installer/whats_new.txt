@@ -13,8 +13,7 @@ What's new
 Notes
 -----
 Windows clients: plug USB board + RTL-SDR, run Setup_Windows.bat once, then
-Start TPMS Suite.bat (or Fyrqom_TPMS_Suite.exe). J-Link is not required when the
-board replies on USB RX.
+Start TPMS Suite.bat (or Fyrqom_TPMS_Suite.exe). Board RX is USB-TTL only (J-Link removed).
 
 To build the full packaged installer on a Windows PC:
   Build_Windows_Installer.bat

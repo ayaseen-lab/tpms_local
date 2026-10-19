@@ -722,14 +722,14 @@ class ProgressView(ctk.CTkFrame):
         sid = str(extra.get("sensor_id") or self._board_ctx.get("sensor_id") or "").strip()
 
         if kind == "comm":
-            how = msg or path or "USB-TTL / J-Link"
+            how = msg or path or "USB-TTL"
             self.board.set_active(
                 "connect",
                 summary=how,
                 info={
                     "input": "Board USB link",
                     "decoded": how,
-                    "tool": "Hamaton Board (USB-TTL / J-Link)",
+                    "tool": "Hamaton Board (USB-TTL)",
                     "path": how,
                     "note": "Checking board connection",
                 },
@@ -748,7 +748,7 @@ class ProgressView(ctk.CTkFrame):
                     "input": "Query Version (0x40)",
                     "decoded": version_line,
                     "tool": "Hamaton Query Version",
-                    "path": tool or "USB-TTL / J-Link",
+                    "path": tool or "USB-TTL",
                     "note": "Chapter 4.0 — HW / Boot / SW / Trigger / Prog DB",
                 },
                 headline="Connect",
@@ -760,7 +760,7 @@ class ProgressView(ctk.CTkFrame):
                     "input": "Query Version (0x40)",
                     "decoded": version_line,
                     "tool": "Hamaton Query Version",
-                    "path": tool or "USB-TTL / J-Link",
+                    "path": tool or "USB-TTL",
                     "note": "Board firmware versions reported",
                 },
             )

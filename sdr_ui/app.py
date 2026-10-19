@@ -821,8 +821,11 @@ class SdrView(ctk.CTkFrame):
       self.restart_listen()
       return False
 
+    # Quiet start: Board prep must never pop the "could not start rtl_433" dialog.
+    # Only the SDR tab START button uses the interactive error path.
     self._log("Starting SDR listen for Board / custom-code compare…")
-    self.start_listen()
+    self._want_listening = True
+    self._start_listen(auto=True)
     return False
 
   def restart_listen(self) -> None:

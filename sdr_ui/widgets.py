@@ -49,12 +49,13 @@ class StatCard(ctk.CTkFrame):
     accent: str,
     bg: str,
     compact: bool = False,
+    subtitle: str = "",
     on_click=None,
     hover_bg: str | None = None,
     **kwargs,
   ):
     kwargs.setdefault("fg_color", bg)
-    kwargs.setdefault("corner_radius", 8)
+    kwargs.setdefault("corner_radius", 12)
     kwargs.setdefault("border_width", 1)
     kwargs.setdefault("border_color", COLOR_BORDER)
     super().__init__(master, **kwargs)
@@ -62,14 +63,14 @@ class StatCard(ctk.CTkFrame):
     self._bg = bg
     self._hover_bg = hover_bg or bg
     self._on_click = on_click
-    pad_x = 10 if compact else 12
-    pad_y = 8 if compact else 10
+    pad_x = 12 if compact else 14
+    pad_y = 10 if compact else 12
     body = ctk.CTkFrame(self, fg_color="transparent")
     body.pack(fill="both", expand=True, padx=pad_x, pady=pad_y)
     self.title_label = ctk.CTkLabel(
       body,
       text=title,
-      font=ctk.CTkFont(size=10 if compact else 11, weight="bold"),
+      font=ctk.CTkFont(size=11 if compact else 12, weight="bold"),
       text_color=accent,
       anchor="w",
     )
@@ -77,14 +78,22 @@ class StatCard(ctk.CTkFrame):
     self.value_label = ctk.CTkLabel(
       body,
       text=str(value),
-      font=ctk.CTkFont(size=18 if compact else 22, weight="bold"),
+      font=ctk.CTkFont(size=22 if compact else 26, weight="bold"),
       text_color="#102226",
       anchor="w",
     )
     self.value_label.pack(fill="x", pady=(2, 0))
+    self.subtitle_label = ctk.CTkLabel(
+      body,
+      text=subtitle or "",
+      font=ctk.CTkFont(size=10),
+      text_color=COLOR_TEXT_MUTED,
+      anchor="w",
+    )
+    self.subtitle_label.pack(fill="x", pady=(2, 0))
     if on_click is not None:
       self.configure(cursor="hand2")
-      for widget in (self, body, self.title_label, self.value_label):
+      for widget in (self, body, self.title_label, self.value_label, self.subtitle_label):
         widget.bind("<Button-1>", self._handle_click)
         widget.bind("<Enter>", self._on_enter)
         widget.bind("<Leave>", self._on_leave)
@@ -112,6 +121,9 @@ class StatCard(ctk.CTkFrame):
 
   def set_value(self, value: str):
     self.value_label.configure(text=str(value), text_color="#102226")
+
+  def set_subtitle(self, text: str):
+    self.subtitle_label.configure(text=str(text or ""))
 
 
 class LiveTelemetryBar(ctk.CTkFrame):

@@ -10,6 +10,9 @@ from typing import Callable
 
 from .board import BoardSession, BoardTelemetry
 from .compare import best_packet, compare
+
+# After per-command retries inside run_row, one more full ABC pass for wedged UART.
+ROW_TRANSIENT_RETRIES = 1
 from .excel_io import (
     append_manual_code_row,
     copy_workbook,
@@ -749,8 +752,8 @@ class BenchRunner:
 
                 started = time.monotonic()
                 row_wall = time.time()
-                # Live Receiver owns the dongle — never spawn a second rtl_433 per row.
-                use_live = self.live_sdr_get is not None
+                # Board-only (skip_sdr): never wait on rtl_433. Live SDR compare only when asked.
+                use_live = (not self.skip_sdr) and self.live_sdr_get is not None
                 iq_path = None if (self.skip_sdr or use_live) else (IQ_DIR / f"row_{excel_row}.cu8")
                 oeid = 0
                 freq_hz = parse_freq_hz(freq_cell)
@@ -778,6 +781,59 @@ class BenchRunner:
                     sdr_duration=self.sdr_timeout,
                     frequency_hz=freq_hz,
                 )
+                # Transient program-ACK / LF misses: recover link and re-run ABC once.
+                for row_try in range(1, ROW_TRANSIENT_RETRIES + 1):
+                    if self.stop_flag or "stopped" in (tel.reasons or []):
+                        break
+                    if tel.qualifies_ok():
+                        break
+                    if not _is_transient_board_fail(tel):
+                        break
+                    self._emit(
+                        ProgressEvent(
+                            kind="phase",
+                            path="row_retry",
+                            excel_row=excel_row,
+                            make=make,
+                            model=model,
+                            code_a=code_a_s,
+                            code_b=code_b_s,
+                            code_c=code_c_s,
+                            freq=freq_cell,
+                            message=(
+                                f"Row {excel_row}: transient fail "
+                                f"({tel.status_note()}) — recover + retry "
+                                f"{row_try}/{ROW_TRANSIENT_RETRIES}…"
+                            ),
+                        )
+                    )
+                    try:
+                        session.recover_link(code_a, code_b, code_c)
+                    except Exception:
+                        pass
+                    time.sleep(0.45 * row_try)
+                    if self.stop_flag:
+                        break
+                    tel2, sdr2 = session.run_row(
+                        code_a,
+                        code_b,
+                        code_c,
+                        oeid=oeid,
+                        iq_path=iq_path,
+                        sdr_duration=self.sdr_timeout,
+                        frequency_hz=freq_hz,
+                    )
+                    if "stopped" in (tel2.reasons or []):
+                        tel, sdr = tel2, sdr2
+                        break
+                    if tel2.qualifies_ok() or _board_reading_score(tel2) >= _board_reading_score(tel):
+                        tel, sdr = tel2, sdr2
+                        if not tel.qualifies_ok():
+                            tel.reasons.append(f"row retry: {row_try}")
+                        break
+                    tel, sdr = tel2, sdr2
+                    tel.reasons.append(f"row retry: {row_try}")
+
                 if self.stop_flag or "stopped" in (tel.reasons or []):
                     stopped = True
                     self._emit(ProgressEvent(kind="stopped", message="Stopped by operator"))
@@ -844,7 +900,7 @@ class BenchRunner:
                     # Per-row rtl_433 already finished inside run_row.
                     pass
                 else:
-                    sdr = SdrCaptureResult(False, [], None, "SDR skipped")
+                    sdr = SdrCaptureResult(False, [], None, "Board-only (USB-TTL) — SDR not used")
 
                 if self.stop_flag:
                     stopped = True
@@ -951,10 +1007,16 @@ class BenchRunner:
                 voltage=str(values.get("Baterry voltage") or ""),
                 transport=session.transport_mode,
                 path=session.last_path,
-                message="Board result ready — waiting for rtl_433 decode…",
-                sdr_compare="pending",
-                sdr_reason="waiting for rtl_433",
-                rtl433_decoder="rtl_433 · waiting for decode",
+                message=(
+                    "Board telemetry ready — waiting for rtl_433…"
+                    if not self.skip_sdr
+                    else "Board telemetry ready · USB-TTL"
+                ),
+                sdr_compare="pending" if not self.skip_sdr else "na",
+                sdr_reason="waiting for rtl_433" if not self.skip_sdr else "Board-only",
+                rtl433_decoder=(
+                    "rtl_433 · waiting for decode" if not self.skip_sdr else "Board-only (no SDR)"
+                ),
                 pressure=str(values.get("Pressure") or ""),
                 battery_percentage=str(values.get("Battery percentage") or ""),
                 rssi=str(values.get("RSSI") or ""),
@@ -1032,6 +1094,52 @@ def reset_session_db() -> None:
     db.close()
 
 
+def _is_transient_board_fail(tel: BoardTelemetry) -> bool:
+    """True when NOK looks like UART/link flake rather than a hard catalog miss."""
+    if tel.qualifies_ok():
+        return False
+    note = (tel.status_note() or "").lower()
+    reasons = " ".join(str(r or "") for r in (tel.reasons or [])).lower()
+    blob = f"{note} {reasons}"
+    markers = (
+        "program ack timeout",
+        "timeout waiting for board",
+        "trigger failed",
+        "no sensor response",
+        "no lf/rf",
+        "program: timeout",
+        "program failed — board did not acknowledge",
+    )
+    if any(m in blob for m in markers):
+        # TRI / codec catalog rejects won't recover by retrying.
+        if "tri database" in blob:
+            return False
+        return True
+    return False
+
+
+def _board_reading_score(tel: BoardTelemetry) -> int:
+    """Prefer the attempt that collected more of a real sensor reading."""
+    score = 0
+    if tel.program_ok:
+        score += 1
+    if tel.trigger_ok:
+        score += 2
+    if tel.read_ok:
+        score += 2
+    if (tel.sensor_id or "").strip():
+        score += 2
+    if tel.temperature_c is not None:
+        score += 1
+    if tel.pressure_raw is not None:
+        score += 1
+    if tel.battery_voltage_v is not None or tel.battery_percentage is not None:
+        score += 1
+    if tel.qualifies_ok():
+        score += 5
+    return score
+
+
 def _decoder_from_sdr(sdr: SdrCaptureResult | None, sensor_id: str | None) -> str:
     if sdr is None or not sdr.packets:
         return "na"
@@ -1085,7 +1193,7 @@ def _telemetry_values(
 ) -> dict:
     ok = tel.qualifies_ok()
     if skip_sdr or sdr is None:
-        sdr_compare, sdr_reason, iq_file = "na", "SDR skipped", "na"
+        sdr_compare, sdr_reason, iq_file = "na", "Board-only (USB-TTL) — SDR not used", "na"
         decoder = "na"
     else:
         sdr_compare, sdr_reason = compare(tel, sdr)

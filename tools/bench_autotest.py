@@ -2,7 +2,7 @@
 
 Run:  python tools/bench_autotest.py [rows] [strategy ...]
 
-TX goes out on USB-TTL; board replies are read back over J-Link SWD.
+TX and RX both go over USB-TTL (J-Link removed).
 """
 
 from __future__ import annotations

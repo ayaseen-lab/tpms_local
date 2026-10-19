@@ -3,6 +3,10 @@
 Run:  python tools/bench_scan.py [first_row] [last_row] [wait_s]
 """
 
+raise SystemExit("J-Link lab tool removed — Board RX is USB-TTL only. Use main.py.")
+
+
+
 from __future__ import annotations
 
 import sys

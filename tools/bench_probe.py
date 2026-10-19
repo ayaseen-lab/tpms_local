@@ -3,6 +3,10 @@
 Run:  python tools/bench_probe.py <excel_row> [seconds]
 """
 
+raise SystemExit("J-Link lab tool removed — Board RX is USB-TTL only. Use main.py.")
+
+
+
 from __future__ import annotations
 
 import sys

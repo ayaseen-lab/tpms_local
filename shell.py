@@ -30,29 +30,30 @@ from range_view import RangeView
 from themes import (
     COLOR_BG,
     COLOR_BG_CARD,
+    COLOR_BG_PANEL,
     COLOR_BORDER,
     COLOR_BTN_EXPORT,
     COLOR_BTN_EXPORT_HOVER,
-    COLOR_BTN_FULL,
-    COLOR_BTN_FULL_HOVER,
     COLOR_BTN_PRIMARY,
     COLOR_BTN_PRIMARY_HOVER,
     COLOR_BTN_PRIMARY_TEXT,
     COLOR_GREEN,
     COLOR_HEADER_ACCENT,
-    COLOR_HEADER_BG,
-    COLOR_HEADER_SUB,
-    COLOR_HEADER_TEXT,
     COLOR_ORANGE,
+    COLOR_ORANGE_BG,
+    COLOR_PILL_MUTED_BG,
+    COLOR_PILL_MUTED_FG,
+    COLOR_PILL_OK_BG,
+    COLOR_PILL_OK_FG,
     COLOR_RED,
-    COLOR_TAB_ACTIVE,
-    COLOR_TAB_ACTIVE_TEXT,
-    COLOR_TAB_BAR,
-    COLOR_TAB_IDLE,
-    COLOR_TAB_IDLE_HOVER,
-    COLOR_TAB_IDLE_TEXT,
+    COLOR_SIDEBAR_ACTIVE,
+    COLOR_SIDEBAR_BG,
+    COLOR_SIDEBAR_HOVER,
+    COLOR_SIDEBAR_MUTED,
+    COLOR_SIDEBAR_TEXT,
     COLOR_TEXT,
     COLOR_TEXT_DIM,
+    COLOR_TEXT_MUTED,
     COMPANY_NAME,
     FYRQOM_LOGOTYPE,
     PRODUCT_NAME,
@@ -62,7 +63,15 @@ from themes import (
 from tpms_view import TpmsView
 
 APP_TITLE = PRODUCT_NAME
-APP_SUBTITLE = "Board programs codes   ·   SDR listens live   ·   USB / J-Link RX"
+APP_SUBTITLE = "USB-TTL diagnostics"
+PAGE_TITLES = {
+    "board": ("Board testing", "USB-TTL diagnostics"),
+    "sdr": ("SDR Receiver", "rtl_433 live decode"),
+    "progress": ("Progress", "Live Board + SDR timeline"),
+    "compare": ("Comparison", "Board vs SDR results"),
+    "range": ("Range Radar", "RF proximity view"),
+    "iq": ("IQ / URH", "Capture and analyze"),
+}
 
 
 class CombinedApp(ctk.CTk):
@@ -81,96 +90,143 @@ class CombinedApp(ctk.CTk):
         self._build_views()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._pulse_status)
+        self.after(600, self._refresh_sdr_optional_badge)
         if os.environ.get("FYRQOM_AUTOSTART") == "1":
-            # Full catalog by default when launching a clean automated run.
+            # Board-only full catalog — SDR never required.
             full = os.environ.get("FYRQOM_RUN_FULL", "1") == "1"
-            self.after(1800, lambda: self._start_both(run_full=full))
+            with_sdr = os.environ.get("FYRQOM_WITH_SDR", "0") == "1"
+            self.after(1800, lambda: self._start_board_run(run_full=full, with_sdr=with_sdr))
         else:
             self.after(350, self._prompt_session_choice)
 
     def _build_chrome(self) -> None:
-        header = ctk.CTkFrame(self, fg_color=COLOR_HEADER_BG, corner_radius=0, height=72)
-        header.pack(fill="x")
-        header.pack_propagate(False)
+        shell = ctk.CTkFrame(self, fg_color=COLOR_BG, corner_radius=0)
+        shell.pack(fill="both", expand=True)
+        shell.grid_columnconfigure(1, weight=1)
+        shell.grid_rowconfigure(0, weight=1)
 
-        left = ctk.CTkFrame(header, fg_color="transparent")
-        left.pack(side="left", padx=18, pady=8)
+        # —— Dark left sidebar ——
+        sidebar = ctk.CTkFrame(shell, fg_color=COLOR_SIDEBAR_BG, corner_radius=0, width=210)
+        sidebar.grid(row=0, column=0, sticky="nsw")
+        sidebar.grid_propagate(False)
+        sidebar.grid_rowconfigure(2, weight=1)
+
+        brand = ctk.CTkFrame(sidebar, fg_color="transparent")
+        brand.grid(row=0, column=0, sticky="ew", padx=18, pady=(22, 18))
         if FYRQOM_LOGOTYPE.is_file():
             from PIL import Image
 
             img = Image.open(FYRQOM_LOGOTYPE)
-            self._logo_image = ctk.CTkImage(light_image=img, dark_image=img, size=(148, 44))
-            ctk.CTkLabel(left, image=self._logo_image, text="").pack(side="left", padx=(0, 16))
+            self._logo_image = ctk.CTkImage(light_image=img, dark_image=img, size=(132, 38))
+            ctk.CTkLabel(brand, image=self._logo_image, text="").pack(anchor="w")
         else:
             ctk.CTkLabel(
-                left,
-                text=COMPANY_NAME,
-                font=ui_font(22, "bold"),
-                text_color=COLOR_HEADER_TEXT,
-            ).pack(side="left", padx=(0, 16))
-        titles = ctk.CTkFrame(left, fg_color="transparent")
-        titles.pack(side="left")
+                brand, text=COMPANY_NAME.lower(), font=ui_font(22, "bold"), text_color="#FFFFFF"
+            ).pack(anchor="w")
         ctk.CTkLabel(
-            titles, text="TPMS Suite 4.0", font=ui_font(16, "bold"), text_color=COLOR_HEADER_TEXT
-        ).pack(anchor="w")
-        ctk.CTkLabel(titles, text=APP_SUBTITLE, font=ui_font(11), text_color=COLOR_HEADER_SUB).pack(anchor="w")
+            brand, text="TPMS Suite 4.0", font=ui_font(12), text_color=COLOR_SIDEBAR_MUTED
+        ).pack(anchor="w", pady=(4, 0))
 
-        right = ctk.CTkFrame(header, fg_color="transparent")
-        right.pack(side="right", padx=18)
-        self.sdr_status = ctk.CTkLabel(
-            right, text="SDR  ·  STOPPED", font=ui_font(12, "bold"), text_color=COLOR_HEADER_SUB,
-            fg_color="#1C2426", corner_radius=12, width=140, height=28,
+        nav = ctk.CTkFrame(sidebar, fg_color="transparent")
+        nav.grid(row=1, column=0, sticky="ew", padx=12)
+
+        def _nav_btn(text: str, view: str) -> ctk.CTkButton:
+            btn = ctk.CTkButton(
+                nav,
+                text=f"  {text}",
+                anchor="w",
+                height=40,
+                font=ui_font(13, "bold"),
+                corner_radius=10,
+                fg_color="transparent",
+                hover_color=COLOR_SIDEBAR_HOVER,
+                text_color=COLOR_SIDEBAR_TEXT,
+                command=lambda v=view: self.show_view(v),
+            )
+            btn.pack(fill="x", pady=3)
+            return btn
+
+        self.board_tab = _nav_btn("Board", "board")
+        self.sdr_tab = _nav_btn("SDR Receiver", "sdr")
+        self.progress_tab = _nav_btn("Progress", "progress")
+        self.compare_tab = _nav_btn("Comparison", "compare")
+        self.range_tab = _nav_btn("Range Radar", "range")
+        self.iq_tab = _nav_btn("IQ / URH", "iq")
+
+        # Spacer so Settings stays at the bottom
+        ctk.CTkFrame(sidebar, fg_color="transparent").grid(row=2, column=0, sticky="nsew")
+
+        foot = ctk.CTkFrame(sidebar, fg_color="transparent")
+        foot.grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 18))
+        ctk.CTkButton(
+            foot,
+            text="  Settings",
+            anchor="w",
+            height=38,
+            font=ui_font(13),
+            corner_radius=10,
+            fg_color="transparent",
+            hover_color=COLOR_SIDEBAR_HOVER,
+            text_color=COLOR_SIDEBAR_MUTED,
+            command=lambda: self.show_view("board"),
+        ).pack(fill="x")
+
+        # —— Main column ——
+        main = ctk.CTkFrame(shell, fg_color=COLOR_BG, corner_radius=0)
+        main.grid(row=0, column=1, sticky="nsew")
+        main.grid_rowconfigure(2, weight=1)
+        main.grid_columnconfigure(0, weight=1)
+
+        page_bar = ctk.CTkFrame(main, fg_color="transparent")
+        page_bar.grid(row=0, column=0, sticky="ew", padx=22, pady=(18, 6))
+        titles = ctk.CTkFrame(page_bar, fg_color="transparent")
+        titles.pack(side="left")
+        self.page_title = ctk.CTkLabel(
+            titles, text="Board testing", font=ui_font(26, "bold"), text_color=COLOR_TEXT
         )
-        self.sdr_status.pack(side="right", padx=(10, 0))
+        self.page_title.pack(anchor="w")
+        self.page_subtitle = ctk.CTkLabel(
+            titles, text=APP_SUBTITLE, font=ui_font(13), text_color=COLOR_TEXT_MUTED
+        )
+        self.page_subtitle.pack(anchor="w")
+
+        badges = ctk.CTkFrame(page_bar, fg_color="transparent")
+        badges.pack(side="right")
         self.board_status = ctk.CTkLabel(
-            right, text="BOARD  ·  IDLE", font=ui_font(12, "bold"), text_color=COLOR_HEADER_SUB,
-            fg_color="#1C2426", corner_radius=12, width=140, height=28,
+            badges,
+            text="●  Board connected  ·  USB-TTL TX/RX",
+            font=ui_font(12, "bold"),
+            text_color=COLOR_PILL_OK_FG,
+            fg_color=COLOR_PILL_OK_BG,
+            corner_radius=16,
+            height=32,
+            padx=14,
         )
-        self.board_status.pack(side="right")
+        self.board_status.pack(side="left", padx=(0, 8))
+        self.sdr_status = ctk.CTkLabel(
+            badges,
+            text="●  SDR optional  ·  No J-Link",
+            font=ui_font(12, "bold"),
+            text_color=COLOR_PILL_MUTED_FG,
+            fg_color=COLOR_PILL_MUTED_BG,
+            corner_radius=16,
+            height=32,
+            padx=14,
+        )
+        self.sdr_status.pack(side="left")
 
-        nav = ctk.CTkFrame(self, fg_color=COLOR_BG)
-        nav.pack(fill="x", padx=12, pady=(10, 0))
-
-        tabs = ctk.CTkFrame(nav, fg_color=COLOR_TAB_BAR, corner_radius=12, border_width=1, border_color=COLOR_BORDER)
-        tabs.pack(side="left", padx=(0, 10))
-        self.board_tab = ctk.CTkButton(
-            tabs, text="Board", width=112, height=34, font=ui_font(13, "bold"),
-            corner_radius=10, command=lambda: self.show_view("board"),
+        # Compact run strip — matches mockup: run controls + COMPARE / EXPORT
+        run_strip = ctk.CTkFrame(
+            main, fg_color=COLOR_BG_CARD, corner_radius=12, border_width=1, border_color=COLOR_BORDER
         )
-        self.board_tab.pack(side="left", padx=4, pady=4)
-        self.sdr_tab = ctk.CTkButton(
-            tabs, text="SDR Receiver", width=130, height=34, font=ui_font(13, "bold"),
-            corner_radius=10, command=lambda: self.show_view("sdr"),
-        )
-        self.sdr_tab.pack(side="left", padx=(0, 4), pady=4)
-        self.progress_tab = ctk.CTkButton(
-            tabs, text="Progress", width=108, height=34, font=ui_font(13, "bold"),
-            corner_radius=10, command=lambda: self.show_view("progress"),
-        )
-        self.progress_tab.pack(side="left", padx=(0, 4), pady=4)
-        self.compare_tab = ctk.CTkButton(
-            tabs, text="Comparison", width=120, height=34, font=ui_font(13, "bold"),
-            corner_radius=10, command=lambda: self.show_view("compare"),
-        )
-        self.compare_tab.pack(side="left", padx=(0, 4), pady=4)
-        self.range_tab = ctk.CTkButton(
-            tabs, text="Range Radar", width=120, height=34, font=ui_font(13, "bold"),
-            corner_radius=10, command=lambda: self.show_view("range"),
-        )
-        self.range_tab.pack(side="left", padx=(0, 4), pady=4)
-        self.iq_tab = ctk.CTkButton(
-            tabs, text="IQ / URH", width=100, height=34, font=ui_font(13, "bold"),
-            corner_radius=10, command=lambda: self.show_view("iq"),
-        )
-        self.iq_tab.pack(side="left", padx=(0, 4), pady=4)
-
-        run_box = ctk.CTkFrame(nav, fg_color=COLOR_BG_CARD, corner_radius=12, border_width=1, border_color=COLOR_BORDER)
-        run_box.pack(side="left")
-        ctk.CTkLabel(run_box, text="Chunk", font=ui_font(11, "bold"), text_color=COLOR_TEXT_DIM).pack(
-            side="left", padx=(10, 4)
+        run_strip.grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 8))
+        inner = ctk.CTkFrame(run_strip, fg_color="transparent")
+        inner.pack(fill="x", padx=12, pady=8)
+        ctk.CTkLabel(inner, text="Chunk", font=ui_font(11, "bold"), text_color=COLOR_TEXT_DIM).pack(
+            side="left", padx=(0, 6)
         )
         self.chunk_combo = ctk.CTkComboBox(
-            run_box,
+            inner,
             values=["10", "25", "50", "100", "200", "500"],
             width=72,
             height=30,
@@ -178,36 +234,131 @@ class CombinedApp(ctk.CTk):
             **combo_colors(),
         )
         self.chunk_combo.set("100")
-        self.chunk_combo.pack(side="left", padx=(0, 6), pady=4)
+        self.chunk_combo.pack(side="left", padx=(0, 10))
         ctk.CTkButton(
-            run_box, text="Run chunk", width=108, height=30, font=ui_font(12, "bold"),
-            fg_color=COLOR_BTN_PRIMARY, hover_color=COLOR_BTN_PRIMARY_HOVER,
+            inner,
+            text="Run chunk",
+            width=100,
+            height=30,
+            font=ui_font(12, "bold"),
+            fg_color=COLOR_BTN_PRIMARY,
+            hover_color=COLOR_BTN_PRIMARY_HOVER,
             text_color=COLOR_BTN_PRIMARY_TEXT,
-            command=lambda: self._start_both(run_full=False),
-        ).pack(side="left", padx=(0, 4), pady=4)
+            corner_radius=8,
+            command=lambda: self._start_board_run(run_full=False, with_sdr=False),
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
-            run_box, text="Run full", width=96, height=30, font=ui_font(12, "bold"),
-            fg_color=COLOR_BTN_FULL, hover_color=COLOR_BTN_FULL_HOVER,
+            inner,
+            text="Run full",
+            width=90,
+            height=30,
+            font=ui_font(12, "bold"),
+            fg_color="#1A1D21",
+            hover_color="#000000",
             text_color="#FFFFFF",
-            command=lambda: self._start_both(run_full=True),
-        ).pack(side="left", padx=(0, 8), pady=4)
-
+            corner_radius=8,
+            command=lambda: self._start_board_run(run_full=True, with_sdr=False),
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
-            nav, text="Compare PDF", width=118, height=32, font=ui_font(11, "bold"),
-            fg_color=COLOR_BTN_EXPORT, hover_color=COLOR_BTN_EXPORT_HOVER,
-            command=lambda: self._export_comparative("pdf"),
+            inner,
+            text="With SDR",
+            width=90,
+            height=30,
+            font=ui_font(11, "bold"),
+            fg_color=COLOR_BG,
+            hover_color=COLOR_BORDER,
+            text_color=COLOR_TEXT,
+            corner_radius=8,
+            command=lambda: self._start_board_run(run_full=False, with_sdr=True),
+        ).pack(side="left", padx=(0, 6))
+
+        # Divider
+        ctk.CTkFrame(inner, fg_color=COLOR_BORDER, width=1, height=22).pack(side="left", padx=10)
+
+        self.shell_pause_btn = ctk.CTkButton(
+            inner,
+            text="Pause",
+            width=78,
+            height=30,
+            font=ui_font(11, "bold"),
+            fg_color=COLOR_BTN_PRIMARY,
+            hover_color=COLOR_BTN_PRIMARY_HOVER,
+            text_color="#FFFFFF",
+            corner_radius=8,
+            command=self._shell_pause,
+        )
+        self.shell_pause_btn.pack(side="left", padx=(0, 6))
+        self.shell_stop_btn = ctk.CTkButton(
+            inner,
+            text="Stop",
+            width=70,
+            height=30,
+            font=ui_font(11, "bold"),
+            fg_color="#FFFFFF",
+            hover_color="#FCECEC",
+            text_color=COLOR_RED,
+            border_width=1,
+            border_color=COLOR_RED,
+            corner_radius=8,
+            command=self._shell_stop,
+        )
+        self.shell_stop_btn.pack(side="left")
+
+        # COMPARE + EXPORT on the right
+        ctk.CTkButton(
+            inner,
+            text="Export PDF",
+            width=96,
+            height=28,
+            font=ui_font(11, "bold"),
+            fg_color=COLOR_BTN_EXPORT,
+            hover_color=COLOR_BTN_EXPORT_HOVER,
+            corner_radius=8,
+            command=lambda: self.board_view.export_pdf() if hasattr(self, "board_view") else None,
         ).pack(side="right")
         ctk.CTkButton(
-            nav, text="Compare Excel", width=128, height=32, font=ui_font(11, "bold"),
-            fg_color=COLOR_BTN_EXPORT, hover_color=COLOR_BTN_EXPORT_HOVER,
+            inner,
+            text="Export Excel",
+            width=108,
+            height=28,
+            font=ui_font(11, "bold"),
+            fg_color=COLOR_BTN_EXPORT,
+            hover_color=COLOR_BTN_EXPORT_HOVER,
+            corner_radius=8,
+            command=lambda: self.board_view.export_excel() if hasattr(self, "board_view") else None,
+        ).pack(side="right", padx=(0, 6))
+        ctk.CTkButton(
+            inner,
+            text="Compare PDF",
+            width=108,
+            height=28,
+            font=ui_font(11, "bold"),
+            fg_color=COLOR_BG,
+            hover_color=COLOR_BORDER,
+            text_color=COLOR_TEXT,
+            border_width=1,
+            border_color=COLOR_BORDER,
+            corner_radius=8,
+            command=lambda: self._export_comparative("pdf"),
+        ).pack(side="right", padx=(0, 10))
+        ctk.CTkButton(
+            inner,
+            text="Compare Excel",
+            width=118,
+            height=28,
+            font=ui_font(11, "bold"),
+            fg_color=COLOR_BG,
+            hover_color=COLOR_BORDER,
+            text_color=COLOR_TEXT,
+            border_width=1,
+            border_color=COLOR_BORDER,
+            corner_radius=8,
             command=lambda: self._export_comparative("xlsx"),
         ).pack(side="right", padx=(0, 6))
 
-        self._accent = ctk.CTkFrame(self, fg_color=COLOR_HEADER_ACCENT, height=3, corner_radius=0)
-        self._accent.pack(fill="x", pady=(8, 0))
-
-        self.content = ctk.CTkFrame(self, fg_color=COLOR_BG)
-        self.content.pack(fill="both", expand=True, padx=12, pady=8)
+        self._accent = ctk.CTkFrame(main, fg_color=COLOR_HEADER_ACCENT, height=0, corner_radius=0)
+        self.content = ctk.CTkFrame(main, fg_color=COLOR_BG)
+        self.content.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 14))
         self.content.grid_rowconfigure(0, weight=1)
         self.content.grid_columnconfigure(0, weight=1)
 
@@ -356,6 +507,12 @@ class CombinedApp(ctk.CTk):
 
     def show_view(self, name: str) -> None:
         self._active = name
+        title, subtitle = PAGE_TITLES.get(name, ("TPMS Suite", APP_SUBTITLE))
+        try:
+            self.page_title.configure(text=title)
+            self.page_subtitle.configure(text=subtitle)
+        except Exception:
+            pass
         self.board_view.grid_remove()
         self.sdr_view.grid_remove()
         self.progress_view.grid_remove()
@@ -392,35 +549,71 @@ class CombinedApp(ctk.CTk):
     def _paint_tab(self, button: ctk.CTkButton, active: bool) -> None:
         if active:
             button.configure(
-                fg_color=COLOR_TAB_ACTIVE,
-                hover_color=COLOR_BG_CARD,
-                text_color=COLOR_TAB_ACTIVE_TEXT,
-                border_width=2,
-                border_color=COLOR_HEADER_ACCENT,
+                fg_color=COLOR_SIDEBAR_ACTIVE,
+                hover_color=COLOR_BTN_PRIMARY_HOVER,
+                text_color="#FFFFFF",
             )
         else:
             button.configure(
-                fg_color=COLOR_TAB_IDLE,
-                hover_color=COLOR_TAB_IDLE_HOVER,
-                text_color=COLOR_TAB_IDLE_TEXT,
-                border_width=0,
+                fg_color="transparent",
+                hover_color=COLOR_SIDEBAR_HOVER,
+                text_color=COLOR_SIDEBAR_TEXT,
             )
 
     def _on_sdr_status(self, running: bool, label: str) -> None:
-        colors = {"RUNNING": COLOR_GREEN, "PAUSED": COLOR_ORANGE, "ERROR": COLOR_RED}
-        self.sdr_status.configure(text=f"SDR  ·  {label}", text_color=colors.get(label, COLOR_HEADER_SUB))
+        upper = (label or "").upper()
+        if upper in {"RUNNING", "LISTENING"}:
+            self.sdr_status.configure(
+                text=f"●  SDR listening  ·  {label}",
+                text_color=COLOR_PILL_OK_FG,
+                fg_color=COLOR_PILL_OK_BG,
+            )
+        elif upper in {"PAUSED", "ERROR"}:
+            color = COLOR_ORANGE if upper == "PAUSED" else COLOR_RED
+            self.sdr_status.configure(
+                text=f"●  SDR  ·  {label}",
+                text_color=color,
+                fg_color=COLOR_PILL_MUTED_BG,
+            )
+        else:
+            self.sdr_status.configure(
+                text="●  SDR optional  ·  No J-Link",
+                text_color=COLOR_PILL_MUTED_FG,
+                fg_color=COLOR_PILL_MUTED_BG,
+            )
 
     def _on_board_status(self, running: bool, label: str) -> None:
-        color = COLOR_HEADER_SUB
-        if label == "RUNNING":
-            color = COLOR_GREEN
-        elif label == "PAUSED":
-            color = COLOR_ORANGE
-        elif label == "ERROR":
-            color = COLOR_RED
-        elif label == "COMPLETED":
-            color = COLOR_HEADER_ACCENT
-        self.board_status.configure(text=f"BOARD  ·  {label}", text_color=color)
+        upper = (label or "").upper()
+        if upper == "RUNNING":
+            self.board_status.configure(
+                text="●  Board running  ·  USB-TTL TX/RX",
+                text_color=COLOR_PILL_OK_FG,
+                fg_color=COLOR_PILL_OK_BG,
+            )
+        elif upper == "PAUSED":
+            self.board_status.configure(
+                text="●  Board paused  ·  USB-TTL",
+                text_color=COLOR_ORANGE,
+                fg_color=COLOR_ORANGE_BG,
+            )
+        elif upper == "ERROR":
+            self.board_status.configure(
+                text="●  Board error",
+                text_color=COLOR_RED,
+                fg_color=COLOR_PILL_MUTED_BG,
+            )
+        elif upper == "COMPLETED":
+            self.board_status.configure(
+                text="●  Board complete  ·  USB-TTL",
+                text_color=COLOR_PILL_OK_FG,
+                fg_color=COLOR_PILL_OK_BG,
+            )
+        else:
+            self.board_status.configure(
+                text="●  Board connected  ·  USB-TTL TX/RX",
+                text_color=COLOR_PILL_OK_FG,
+                fg_color=COLOR_PILL_OK_BG,
+            )
 
     def _on_chunk_complete(self, message: str) -> None:
         self.show_view("compare")
@@ -436,33 +629,92 @@ class CombinedApp(ctk.CTk):
         self._pulse = (self._pulse + 1) % 24
         bright = self._pulse < 12
         try:
-            if "RUNNING" in (self.board_status.cget("text") or ""):
-                self.board_status.configure(text_color=COLOR_GREEN if bright else "#7EE0C3")
-            if "RUNNING" in (self.sdr_status.cget("text") or ""):
-                self.sdr_status.configure(text_color=COLOR_GREEN if bright else "#7EE0C3")
-            if hasattr(self, "_accent"):
-                self._accent.configure(fg_color=COLOR_HEADER_ACCENT if bright else "#3ECFBE")
+            text_b = self.board_status.cget("text") or ""
+            if "running" in text_b.lower():
+                self.board_status.configure(
+                    text_color=COLOR_PILL_OK_FG if bright else COLOR_GREEN
+                )
+            text_s = self.sdr_status.cget("text") or ""
+            if "listening" in text_s.lower() or "RUNNING" in text_s:
+                self.sdr_status.configure(
+                    text_color=COLOR_PILL_OK_FG if bright else COLOR_GREEN
+                )
         except Exception:
             pass
-        self.after(90, self._pulse_status)
+        self.after(120, self._pulse_status)
 
-    def _start_both(self, run_full: bool = False) -> None:
-        """Start live SDR (reclaim dongle), then the Board bench."""
+    def _sdr_dongle_present(self) -> bool:
+        try:
+            from tpms_bench.hardware import check_hardware_trio
+
+            return bool(check_hardware_trio().sdr.ok)
+        except Exception:
+            return False
+
+    def _refresh_sdr_optional_badge(self) -> None:
+        """Keep header honest: SDR is optional unless a dongle is listening."""
+        try:
+            text = str(self.sdr_status.cget("text") or "")
+            if "LISTEN" in text.upper() or "RUNNING" in text.upper():
+                return
+            if self._sdr_dongle_present():
+                self.sdr_status.configure(
+                    text="●  SDR ready  ·  Dongle present",
+                    text_color=COLOR_PILL_OK_FG,
+                    fg_color=COLOR_PILL_OK_BG,
+                )
+            else:
+                self.sdr_status.configure(
+                    text="●  SDR optional  ·  No J-Link",
+                    text_color=COLOR_PILL_MUTED_FG,
+                    fg_color=COLOR_PILL_MUTED_BG,
+                )
+        except Exception:
+            pass
+        self.after(8000, self._refresh_sdr_optional_badge)
+
+    def _shell_pause(self) -> None:
+        if hasattr(self, "board_view"):
+            self.board_view.toggle_pause()
+
+    def _shell_stop(self) -> None:
+        if hasattr(self, "board_view"):
+            self.board_view.stop_test()
+
+    def _start_board_run(self, run_full: bool = False, *, with_sdr: bool = False) -> None:
+        """Start Board over USB-TTL. SDR compare is opt-in only."""
         if self.board_view.is_running():
             messagebox.showinfo("Start test", "Board test is already running.", parent=self)
             return
-        # Always restart SDR so a replugged dongle is reopened before ABC codes.
-        self.show_view("sdr")
-        self.sdr_view.restart_listen()
-        self.after(4500, lambda: self._start_board_after_sdr(run_full))
+        self.show_view("board")
+        if with_sdr:
+            if not self._sdr_dongle_present():
+                messagebox.showinfo(
+                    "SDR optional",
+                    "No RTL-SDR dongle detected.\n\n"
+                    "Starting Board-only on USB-TTL. Plug an SDR later and use With SDR if you want compare.",
+                    parent=self,
+                )
+                self.board_view.start_test(skip_sdr=True, run_full=run_full)
+                return
+            self.show_view("sdr")
+            self.sdr_view.restart_listen()
+            self.after(3500, lambda: self._start_board_after_sdr(run_full))
+            return
+        # Default: Board-only — no SDR start, no wait.
+        self.board_view.start_test(skip_sdr=True, run_full=run_full)
+
+    def _start_both(self, run_full: bool = False) -> None:
+        """Backward-compatible alias — Board-only unless FYRQOM_WITH_SDR=1."""
+        with_sdr = os.environ.get("FYRQOM_WITH_SDR", "0") == "1"
+        self._start_board_run(run_full=run_full, with_sdr=with_sdr)
 
     def _start_board_after_sdr(self, run_full: bool) -> None:
         if not self.sdr_view.is_running():
-            # One more try if the first open raced the USB re-enumerate.
             self.sdr_view.restart_listen()
-            self.after(2000, lambda: self.board_view.start_test(skip_sdr=True, run_full=run_full))
+            self.after(2000, lambda: self.board_view.start_test(skip_sdr=False, run_full=run_full))
             return
-        self.board_view.start_test(skip_sdr=True, run_full=run_full)
+        self.board_view.start_test(skip_sdr=False, run_full=run_full)
 
     def _build_comparison(self):
         sdr = self.sdr_view.get_sensor_snapshot()
