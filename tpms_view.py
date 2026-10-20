@@ -44,6 +44,7 @@ from themes import (
     COLOR_HEADER_ACCENT,
     COLOR_HEADER_BG,
     COLOR_LIVE_BG,
+    COLOR_LIVE_BORDER,
     COLOR_LIVE_CHIP,
     COLOR_LIVE_FG,
     COLOR_LIVE_MUTED,
@@ -59,6 +60,7 @@ from themes import (
     COLOR_TEXT_MUTED,
     combo_colors,
     entry_colors,
+    mono_font,
     ui_font,
 )
 from tpms_bench.excel_io import parse_code, stamp_board_report_info, vehicle_row_count
@@ -111,18 +113,23 @@ def _fmt_batt(voltage: str | None, percentage: str | None = None) -> str:
 
 
 class _ControlState:
-    """Stand-in for hidden RUN CHUNK / RUN FULL so Pause/Stop still track session state."""
+    """Stand-in for hidden controls so session state still tracks without on-screen buttons."""
 
-    def __init__(self) -> None:
-        self._state = "normal"
+    def __init__(self, *, state: str = "normal", text: str = "") -> None:
+        self._state = state
+        self._text = text
 
     def configure(self, **kwargs) -> None:
         if "state" in kwargs:
             self._state = kwargs["state"]
+        if "text" in kwargs:
+            self._text = kwargs["text"]
 
     def cget(self, key: str):
         if key == "state":
             return self._state
+        if key == "text":
+            return self._text
         return ""
 
 
@@ -198,18 +205,18 @@ class TpmsView(ctk.CTkFrame):
             background=COLOR_BG_CARD,
             foreground=COLOR_TEXT,
             fieldbackground=COLOR_BG_CARD,
-            rowheight=24,
-            font=("Segoe UI", 10),
+            rowheight=28,
+            font=("Helvetica Neue", 11) if __import__("sys").platform == "darwin" else ("Segoe UI", 10),
             bordercolor=COLOR_BORDER,
             borderwidth=0,
         )
         style.configure(
             "Combined.Treeview.Heading",
-            background="#0B0F14",
+            background="#0A0E13",
             foreground="#ffffff",
-            font=("Segoe UI", 9, "bold"),
+            font=("Helvetica Neue", 10, "bold") if __import__("sys").platform == "darwin" else ("Segoe UI", 9, "bold"),
             relief="flat",
-            padding=6,
+            padding=8,
         )
         style.map(
             "Combined.Treeview.Heading",
@@ -260,7 +267,7 @@ class TpmsView(ctk.CTkFrame):
 
         # —— Metric cards ——
         stats_row = ctk.CTkFrame(root, fg_color="transparent")
-        stats_row.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        stats_row.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         for i in range(5):
             stats_row.grid_columnconfigure(i, weight=1, minsize=120)
         self.stat_pending = StatCard(
@@ -284,20 +291,24 @@ class TpmsView(ctk.CTkFrame):
         )
         self.stat_rate.grid(row=0, column=4, sticky="ew")
 
-        # —— Mid: live (left, fills height) + session (right) ——
-        # Left column stretches to match the taller session sidebar so
-        # telemetry occupies the space that used to look empty.
+        # —— Mid: live+progress (left) + session (right) ——
         mid = ctk.CTkFrame(root, fg_color="transparent")
-        mid.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        mid.grid(row=1, column=0, sticky="ew", pady=(0, 12))
         mid.grid_columnconfigure(0, weight=3)
         mid.grid_columnconfigure(1, weight=2)
         mid.grid_rowconfigure(0, weight=1)
 
-        # Live dark card — fills mid height; telemetry expands into leftover space
-        live = ctk.CTkFrame(mid, fg_color=LIVE_BG, corner_radius=16)
-        live.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        # Left column: live card on top, session progress fills leftover space
+        left_col = ctk.CTkFrame(mid, fg_color="transparent")
+        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+
+        live = ctk.CTkFrame(
+            left_col, fg_color=LIVE_BG, corner_radius=16, border_width=1, border_color=COLOR_LIVE_BORDER
+        )
+        live.pack(fill="x", expand=False, pady=(0, 10))
+        ctk.CTkFrame(live, fg_color=LIVE_TEAL, height=3, corner_radius=0).pack(fill="x")
         live_in = ctk.CTkFrame(live, fg_color="transparent")
-        live_in.pack(fill="both", expand=True, padx=14, pady=12)
+        live_in.pack(fill="x", expand=False, padx=16, pady=14)
 
         head = ctk.CTkFrame(live_in, fg_color="transparent")
         head.pack(fill="x")
@@ -312,6 +323,9 @@ class TpmsView(ctk.CTkFrame):
             width=90,
         )
         self.state_badge.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(
+            head, text="LIVE BOARD", font=ui_font(10, "bold"), text_color=LIVE_TEAL
+        ).pack(side="left")
         self.row_counter = ctk.CTkLabel(
             head, text="ROW —", font=ui_font(12, "bold"), text_color=LIVE_MUTED
         )
@@ -321,10 +335,10 @@ class TpmsView(ctk.CTkFrame):
         ctk.CTkLabel(
             live_in,
             textvariable=self.vehicle_var,
-            font=ui_font(20, "bold"),
+            font=ui_font(22, "bold"),
             text_color=LIVE_FG,
             anchor="w",
-        ).pack(fill="x", pady=(8, 6))
+        ).pack(fill="x", pady=(10, 6))
 
         self.meta_var = ctk.StringVar(value="OE: —   ·   Supplier: —   ·   Freq: —")
         meta_row = ctk.CTkFrame(live_in, fg_color="transparent")
@@ -344,18 +358,17 @@ class TpmsView(ctk.CTkFrame):
             fg_color=LIVE_CHIP, corner_radius=8, height=26, padx=10,
         )
         self.meta_chip_freq.pack(side="left")
-        # Keep meta_var for existing setters; sync chips via trace.
         self.meta_var.trace_add("write", lambda *_: self._sync_meta_chips())
 
         codes = ctk.CTkFrame(live_in, fg_color="transparent")
-        codes.pack(fill="x", pady=(0, 10))
+        codes.pack(fill="x", pady=(0, 12))
         self.code_vars = {"A": ctk.StringVar(value="—"), "B": ctk.StringVar(value="—"), "C": ctk.StringVar(value="—")}
         for key, bg, fg, pad in (
-            ("A", "#1E3A42", "#7DD3E8", 8),
-            ("B", "#3A2E1E", "#E8C07D", 8),
-            ("C", "#1E3A32", "#7DE8C0", 0),
+            ("A", "#1A3340", "#7DD3E8", 8),
+            ("B", "#3A2E1A", "#E8C07D", 8),
+            ("C", "#1A3A32", "#7DE8C0", 0),
         ):
-            box = ctk.CTkFrame(codes, fg_color=bg, corner_radius=12)
+            box = ctk.CTkFrame(codes, fg_color=bg, corner_radius=12, border_width=1, border_color=COLOR_LIVE_BORDER)
             box.pack(side="left", expand=True, fill="both", padx=(0, pad))
             inner = ctk.CTkFrame(box, fg_color="transparent")
             inner.pack(fill="x", padx=12, pady=10)
@@ -369,21 +382,21 @@ class TpmsView(ctk.CTkFrame):
             ).pack(side="right")
             ctk.CTkLabel(
                 inner, textvariable=self.code_vars[key],
-                font=ctk.CTkFont(family="Consolas", size=16, weight="bold"),
+                font=mono_font(15),
                 text_color=fg, anchor="w",
             ).pack(anchor="w", pady=(4, 0))
 
-        # —— Board live telemetry fills remaining height under codes ——
-        tel = ctk.CTkFrame(live_in, fg_color=LIVE_CHIP, corner_radius=12)
-        tel.pack(fill="both", expand=True, pady=(0, 0))
+        # —— Board live telemetry — compact single row ——
+        tel = ctk.CTkFrame(live_in, fg_color=LIVE_CHIP, corner_radius=12, border_width=1, border_color=COLOR_LIVE_BORDER)
+        tel.pack(fill="x", expand=False)
         tel_in = ctk.CTkFrame(tel, fg_color="transparent")
-        tel_in.pack(fill="both", expand=True, padx=12, pady=10)
+        tel_in.pack(fill="x", padx=10, pady=10)
         tel_head = ctk.CTkFrame(tel_in, fg_color="transparent")
         tel_head.pack(fill="x", pady=(0, 8))
         ctk.CTkLabel(
             tel_head,
-            text="Board live telemetry",
-            font=ui_font(12, "bold"),
+            text="BOARD LIVE TELEMETRY",
+            font=ui_font(11, "bold"),
             text_color=LIVE_TEAL,
         ).pack(side="left")
         self.tel_phase_var = ctk.StringVar(value="Waiting for Board read…")
@@ -394,17 +407,10 @@ class TpmsView(ctk.CTkFrame):
             text_color=LIVE_MUTED,
         ).pack(side="right")
 
-        # Horizontal scroll so five metric cells stay readable in a narrow column
-        tel_scroll = ctk.CTkScrollableFrame(
-            tel_in,
-            fg_color="transparent",
-            corner_radius=0,
-            orientation="horizontal",
-            height=150,
-            scrollbar_button_color="#2A3340",
-            scrollbar_button_hover_color=LIVE_MUTED,
-        )
-        tel_scroll.pack(fill="both", expand=True, pady=(0, 4))
+        grid = ctk.CTkFrame(tel_in, fg_color="transparent")
+        grid.pack(fill="x")
+        for i in range(6):
+            grid.grid_columnconfigure(i, weight=1, uniform="tel")
 
         self.tel_id = ctk.StringVar(value="—")
         self.tel_temp = ctk.StringVar(value="—")
@@ -414,69 +420,101 @@ class TpmsView(ctk.CTkFrame):
         self.reading_var = ctk.StringVar(value="Waiting for first reading…")
         self._tel_value_labels: dict[str, ctk.CTkLabel] = {}
 
-        def _tel_cell(key: str, title: str, var: ctk.StringVar, accent: str = LIVE_FG, last: bool = False):
+        def _tel_cell(col: int, key: str, title: str, var: ctk.StringVar, accent: str = LIVE_FG):
             cell = ctk.CTkFrame(
-                tel_scroll,
+                grid,
                 fg_color=LIVE_BG,
                 corner_radius=10,
                 border_width=1,
-                border_color="#2A3340",
-                width=148,
+                border_color=COLOR_LIVE_BORDER,
             )
-            cell.pack(side="left", fill="y", expand=True, padx=(0 if key == "id" else 6, 0 if last else 0))
-            cell.pack_propagate(False)
+            cell.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 5, 0))
             inner = ctk.CTkFrame(cell, fg_color="transparent")
-            inner.pack(fill="both", expand=True, padx=12, pady=12)
-            ctk.CTkLabel(inner, text=title, font=ui_font(10, "bold"), text_color=LIVE_MUTED).pack(
+            inner.pack(fill="x", padx=8, pady=8)
+            ctk.CTkLabel(inner, text=title.upper(), font=ui_font(9, "bold"), text_color=LIVE_MUTED).pack(
                 anchor="w"
             )
             val = ctk.CTkLabel(
                 inner,
                 textvariable=var,
-                font=ctk.CTkFont(family="Consolas", size=18, weight="bold"),
+                font=mono_font(14),
                 text_color=accent,
                 anchor="w",
-                wraplength=130,
                 justify="left",
             )
-            val.pack(anchor="w", pady=(8, 0), fill="x")
+            val.pack(anchor="w", pady=(4, 0), fill="x")
             self._tel_value_labels[key] = val
 
-        _tel_cell("id", "Sensor ID", self.tel_id, LIVE_TEAL)
-        _tel_cell("temp", "Temperature", self.tel_temp)
-        _tel_cell("pressure", "Pressure", self.tel_pressure)
-        _tel_cell("rssi", "RSSI", self.tel_rssi)
-        _tel_cell("batt", "Battery", self.tel_batt, last=True)
+        _tel_cell(0, "id", "Sensor ID", self.tel_id, LIVE_TEAL)
+        _tel_cell(1, "temp", "Temp", self.tel_temp)
+        _tel_cell(2, "pressure", "Pressure", self.tel_pressure)
+        _tel_cell(3, "rssi", "RSSI", self.tel_rssi)
+        _tel_cell(4, "batt", "Battery", self.tel_batt)
+        _tel_cell(5, "status", "Status", self.reading_var, LIVE_FG)
+        self.tel_summary = self._tel_value_labels.get("status")
 
-        # Summary line uses leftover vertical space under the metric strip
-        self.tel_summary = ctk.CTkLabel(
-            tel_in,
-            textvariable=self.reading_var,
-            font=ui_font(12),
-            text_color=LIVE_MUTED,
-            anchor="w",
-            justify="left",
+        # Progress fills empty space under live (beside Custom codes)
+        prog_card = ctk.CTkFrame(
+            left_col, fg_color=COLOR_LIVE_BG, corner_radius=14, border_width=1, border_color=COLOR_LIVE_BORDER
         )
-        self.tel_summary.pack(fill="x", pady=(10, 0))
+        prog_card.pack(fill="both", expand=True)
+        prog_wrap = ctk.CTkFrame(prog_card, fg_color="transparent")
+        prog_wrap.pack(fill="both", expand=True, padx=16, pady=14)
+        prog_top = ctk.CTkFrame(prog_wrap, fg_color="transparent")
+        prog_top.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(
+            prog_top, text="SESSION PROGRESS", font=ui_font(10, "bold"), text_color=COLOR_LIVE_TEAL
+        ).pack(side="left")
+        self.progress = ctk.CTkProgressBar(
+            prog_wrap, height=12, progress_color=COLOR_LIVE_TEAL, fg_color="#2A313A", corner_radius=6
+        )
+        self.progress.pack(fill="x")
+        self.progress.set(0)
+        prog_row = ctk.CTkFrame(prog_wrap, fg_color="transparent")
+        prog_row.pack(fill="x", pady=(10, 0))
+        self.progress_label = ctk.CTkLabel(
+            prog_row, text="Progress: 0.0% (0 of 0)", font=ui_font(13, "bold"), text_color=COLOR_LIVE_FG
+        )
+        self.progress_label.pack(side="left")
+        self.eta_label = ctk.CTkLabel(prog_row, text="", font=ui_font(11), text_color=COLOR_LIVE_MUTED)
+        self.eta_label.pack(side="right")
+        self.elapsed_label = ctk.CTkLabel(prog_row, text="", font=ui_font(11), text_color=COLOR_LIVE_MUTED)
+        self.elapsed_label.pack(side="right", padx=(0, 14))
+        self.speed_label = ctk.CTkLabel(prog_row, text="", font=ui_font(11), text_color=COLOR_LIVE_MUTED)
+        self.speed_label.pack(side="right", padx=(0, 14))
+        # Extra status line so the card uses vertical space cleanly
+        self.progress_hint = ctk.CTkLabel(
+            prog_wrap,
+            text="USB-TTL Board run · progress updates live while testing",
+            font=ui_font(11),
+            text_color=COLOR_LIVE_MUTED,
+            anchor="w",
+        )
+        self.progress_hint.pack(fill="x", pady=(16, 0), side="bottom")
 
-        # Right: session setup + custom codes (content-sized, no stretch)
+        # Right: session setup + custom codes
         side = ctk.CTkFrame(mid, fg_color="transparent")
         side.grid(row=0, column=1, sticky="nsew")
 
         setup = ctk.CTkFrame(
-            side, fg_color=COLOR_BG_CARD, corner_radius=14, border_width=1, border_color=COLOR_BORDER
+            side, fg_color=COLOR_BG_CARD, corner_radius=16, border_width=1, border_color=COLOR_BORDER
         )
         setup.pack(fill="x", pady=(0, 10))
         setup_in = ctk.CTkFrame(setup, fg_color="transparent")
-        setup_in.pack(fill="x", padx=14, pady=12)
+        setup_in.pack(fill="x", padx=16, pady=14)
 
         setup_head = ctk.CTkFrame(setup_in, fg_color="transparent")
-        setup_head.pack(fill="x", pady=(0, 10))
+        setup_head.pack(fill="x", pady=(0, 12))
+        head_titles = ctk.CTkFrame(setup_head, fg_color="transparent")
+        head_titles.pack(side="left")
         ctk.CTkLabel(
-            setup_head, text="Session setup", font=ui_font(14, "bold"), text_color=COLOR_TEXT
-        ).pack(side="left")
+            head_titles, text="SESSION SETUP", font=ui_font(10, "bold"), text_color=COLOR_HEADER_ACCENT
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            head_titles, text="Port · firmware · catalog", font=ui_font(12, "bold"), text_color=COLOR_TEXT
+        ).pack(anchor="w")
         ctk.CTkButton(
-            setup_head, text="Reset session", width=110, height=28, font=ui_font(11),
+            setup_head, text="Reset", width=72, height=28, font=ui_font(11),
             fg_color=COLOR_BG_PANEL, hover_color=COLOR_BORDER, text_color=COLOR_TEXT, corner_radius=8,
             command=self.reset_session,
         ).pack(side="right")
@@ -538,67 +576,53 @@ class TpmsView(ctk.CTkFrame):
         )
         self.remove_excel_btn.pack(side="left", padx=(8, 0))
 
-        # Hidden control refs used by start/pause/stop state machine
-        ctrl = ctk.CTkFrame(setup_in, fg_color="transparent")
-        ctrl.pack(fill="x", pady=(12, 0))
+        # Hidden stand-ins — visible Start/Pause/Stop live in the top toolbar
         self.full_btn = _ControlState()
         self.transport_var = ctk.StringVar(value="USB-TTL TX/RX")
-        self.start_btn = ctk.CTkButton(
-            ctrl, text="Start Board", width=110, height=34, font=ui_font(12, "bold"),
-            fg_color=COLOR_BTN_PRIMARY, hover_color=COLOR_BTN_PRIMARY_HOVER,
-            text_color=COLOR_BTN_PRIMARY_TEXT, corner_radius=10,
-            command=lambda: self.start_test(skip_sdr=True, run_full=False),
-        )
-        self.start_btn.pack(side="left", padx=(0, 6))
-        self.pause_btn = ctk.CTkButton(
-            ctrl, text="Pause test", width=100, height=34, font=ui_font(12, "bold"),
-            fg_color=COLOR_BTN_PAUSE, hover_color=COLOR_BTN_PAUSE_HOVER, text_color="#FFFFFF",
-            corner_radius=10, state="disabled", command=self.toggle_pause,
-        )
-        self.pause_btn.pack(side="left", padx=(0, 6))
-        self.stop_btn = ctk.CTkButton(
-            ctrl, text="Stop", width=72, height=34, font=ui_font(12, "bold"),
-            fg_color=COLOR_BTN_STOP_OUTLINE, hover_color=COLOR_BTN_STOP_OUTLINE_HOVER,
-            text_color=COLOR_BTN_STOP_TEXT, border_width=2, border_color=COLOR_BTN_STOP_BORDER,
-            corner_radius=10, state="disabled", command=self.stop_test,
-        )
-        self.stop_btn.pack(side="left")
+        self.start_btn = _ControlState(state="normal", text="Start Board")
+        self.pause_btn = _ControlState(state="disabled", text="Pause test")
+        self.stop_btn = _ControlState(state="disabled", text="Stop")
 
         custom = ctk.CTkFrame(
-            side, fg_color=COLOR_BG_CARD, corner_radius=14, border_width=1, border_color=COLOR_BORDER
+            side, fg_color=COLOR_BG_CARD, corner_radius=16, border_width=1, border_color=COLOR_BORDER
         )
         custom.pack(fill="x", expand=False)
         custom_in = ctk.CTkFrame(custom, fg_color="transparent")
-        custom_in.pack(fill="x", expand=False, padx=12, pady=10)
+        custom_in.pack(fill="x", expand=False, padx=16, pady=14)
         ctk.CTkLabel(
-            custom_in, text="Custom codes", font=ui_font(13, "bold"), text_color=COLOR_TEXT
-        ).pack(anchor="w", pady=(0, 6))
+            custom_in, text="CUSTOM CODES", font=ui_font(10, "bold"), text_color=COLOR_HEADER_ACCENT
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            custom_in, text="Add one-off ABC rows", font=ui_font(12, "bold"), text_color=COLOR_TEXT
+        ).pack(anchor="w", pady=(0, 8))
         self.manual_entries: dict[str, ctk.CTkEntry] = {}
         for key in ("A", "B", "C"):
             row = ctk.CTkFrame(custom_in, fg_color="transparent")
-            row.pack(fill="x", pady=2)
+            row.pack(fill="x", pady=3)
             ctk.CTkLabel(row, text=f"Code {key}", width=58, anchor="w", font=ui_font(11), text_color=COLOR_TEXT_MUTED).pack(side="left")
-            entry = ctk.CTkEntry(row, height=30, placeholder_text=f"{key} hex", **entry_colors())
+            entry = ctk.CTkEntry(row, height=32, placeholder_text=f"{key} hex", **entry_colors())
             entry.pack(side="left", fill="x", expand=True)
             entry.bind("<Return>", lambda _e: self.add_custom_code())
             self.manual_entries[key] = entry
         meta = ctk.CTkFrame(custom_in, fg_color="transparent")
-        meta.pack(fill="x", pady=(8, 0))
-        self.manual_make_entry = ctk.CTkEntry(meta, width=90, height=28, placeholder_text="Make", **entry_colors())
-        self.manual_make_entry.pack(side="left", padx=(0, 4))
-        self.manual_model_entry = ctk.CTkEntry(meta, width=90, height=28, placeholder_text="Model", **entry_colors())
-        self.manual_model_entry.pack(side="left", padx=(0, 4))
-        self.manual_freq_entry = ctk.CTkEntry(meta, width=70, height=28, placeholder_text="MHz", **entry_colors())
-        self.manual_freq_entry.pack(side="left", padx=(0, 4))
-        self.manual_label_entry = ctk.CTkEntry(meta, width=80, height=28, placeholder_text="Label", **entry_colors())
-        self.manual_label_entry.pack(side="left", padx=(0, 4))
+        meta.pack(fill="x", pady=(10, 0))
+        for col in range(4):
+            meta.grid_columnconfigure(col, weight=1)
+        self.manual_make_entry = ctk.CTkEntry(meta, height=30, placeholder_text="Make", **entry_colors())
+        self.manual_make_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.manual_model_entry = ctk.CTkEntry(meta, height=30, placeholder_text="Model", **entry_colors())
+        self.manual_model_entry.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        self.manual_freq_entry = ctk.CTkEntry(meta, height=30, placeholder_text="MHz", **entry_colors())
+        self.manual_freq_entry.grid(row=0, column=2, sticky="ew", padx=(0, 4))
+        self.manual_label_entry = ctk.CTkEntry(meta, height=30, placeholder_text="Label", **entry_colors())
+        self.manual_label_entry.grid(row=0, column=3, sticky="ew")
         self.manual_label_entry.bind("<Return>", lambda _e: self.add_custom_code())
         ctk.CTkButton(
-            custom_in, text="Add code", width=100, height=30, font=ui_font(11, "bold"),
+            custom_in, text="Add code", width=110, height=32, font=ui_font(12, "bold"),
             fg_color=COLOR_GREEN, hover_color="#15803d", corner_radius=8, command=self.add_custom_code,
-        ).pack(anchor="w", pady=(8, 0))
+        ).pack(anchor="w", pady=(10, 0))
         self.codes_list = ctk.CTkFrame(custom_in, fg_color="transparent")
-        self.codes_list.pack(fill="x", pady=(6, 0))
+        self.codes_list.pack(fill="x", pady=(8, 0))
         self.codes_hint = ctk.CTkLabel(
             self.codes_list, text="No custom codes added yet.", font=ui_font(10),
             text_color=COLOR_TEXT_MUTED, anchor="w",
@@ -610,82 +634,61 @@ class TpmsView(ctk.CTkFrame):
         self.trend_charts = BoardTrendCharts(charts_anchor, height=1, title="")
         self.charts = ResultCharts(charts_anchor, height=1, title="")
 
-        # —— Full-width progress (not beside Custom codes) ——
-        prog_card = ctk.CTkFrame(
-            root, fg_color=COLOR_LIVE_BG, corner_radius=12
+        # —— TPMS Board matches ——
+        results = ctk.CTkFrame(
+            root, fg_color=COLOR_BG_CARD, corner_radius=16, border_width=1, border_color=COLOR_BORDER
         )
-        prog_card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        prog_wrap = ctk.CTkFrame(prog_card, fg_color="transparent")
-        prog_wrap.pack(fill="x", padx=14, pady=10)
-        self.progress = ctk.CTkProgressBar(
-            prog_wrap, height=8, progress_color=COLOR_LIVE_TEAL, fg_color="#2A313A", corner_radius=4
-        )
-        self.progress.pack(fill="x")
-        self.progress.set(0)
-        prog_row = ctk.CTkFrame(prog_wrap, fg_color="transparent")
-        prog_row.pack(fill="x", pady=(6, 0))
-        self.progress_label = ctk.CTkLabel(
-            prog_row, text="Progress: 0.0% (0 of 0)", font=ui_font(11), text_color=COLOR_LIVE_MUTED
-        )
-        self.progress_label.pack(side="left")
-        self.eta_label = ctk.CTkLabel(prog_row, text="", font=ui_font(11), text_color=COLOR_LIVE_MUTED)
-        self.eta_label.pack(side="right")
-        self.elapsed_label = ctk.CTkLabel(prog_row, text="", font=ui_font(11), text_color=COLOR_LIVE_MUTED)
-        self.elapsed_label.pack(side="right", padx=(0, 12))
-        self.speed_label = ctk.CTkLabel(prog_row, text="", font=ui_font(11), text_color=COLOR_LIVE_MUTED)
-        self.speed_label.pack(side="right", padx=(0, 12))
+        results.grid(row=2, column=0, sticky="ew", pady=(0, 8))
 
-        # —— TPMS Board matches (same visual style as SDR matches) ——
-        results = tk.Frame(
-            root, bg=COLOR_BG, highlightbackground=COLOR_BORDER, highlightthickness=1
+        table_header = ctk.CTkFrame(results, fg_color="transparent")
+        table_header.pack(fill="x", padx=14, pady=(12, 4))
+        titles = ctk.CTkFrame(table_header, fg_color="transparent")
+        titles.pack(side="left")
+        ctk.CTkLabel(
+            titles, text="BOARD MATCHES", font=ui_font(10, "bold"), text_color=COLOR_HEADER_ACCENT
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            titles,
+            text="One row per Board test · USB-TTL telemetry",
+            font=ui_font(13, "bold"),
+            text_color=COLOR_TEXT,
+        ).pack(anchor="w")
+        self.table_count_label = ctk.CTkLabel(
+            table_header, text="0 tests", font=ui_font(11, "bold"), text_color=COLOR_TEXT_MUTED
         )
-        results.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        self.table_count_label.pack(side="right")
 
-        table_header = tk.Frame(results, bg=COLOR_BG_PANEL)
-        table_header.pack(fill="x")
-        tk.Label(
-            table_header,
-            text="TPMS Board matches — one row per Board test (USB-TTL telemetry)",
-            bg=COLOR_BG_PANEL,
-            fg=COLOR_TEXT,
-            font=("Segoe UI", 10, "bold"),
-        ).pack(side="left", padx=8, pady=4)
-        self.table_count_label = tk.Label(
-            table_header, text="0 tests", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_DIM, font=("Segoe UI", 9)
-        )
-        self.table_count_label.pack(side="right", padx=8)
-
-        tools = ctk.CTkFrame(results, fg_color=COLOR_BG_PANEL)
-        tools.pack(fill="x", padx=4, pady=(0, 2))
+        tools = ctk.CTkFrame(results, fg_color="transparent")
+        tools.pack(fill="x", padx=14, pady=(4, 6))
         self.history_filter = ctk.CTkComboBox(
             tools,
             values=["All results", "Passed only", "Failed only"],
             width=130,
-            height=26,
+            height=30,
             font=ui_font(11),
             command=self._apply_history_filter,
             **combo_colors(),
         )
         self.history_filter.set("All results")
-        self.history_filter.pack(side="right", padx=(0, 4), pady=4)
+        self.history_filter.pack(side="right", padx=(0, 0))
         self.history_search = ctk.CTkEntry(
-            tools, width=160, height=26, placeholder_text="Search vehicle…", **entry_colors()
+            tools, width=180, height=30, placeholder_text="Search vehicle…", **entry_colors()
         )
-        self.history_search.pack(side="right", padx=(0, 6), pady=4)
+        self.history_search.pack(side="right", padx=(0, 8))
         self.history_search.bind("<KeyRelease>", lambda _e: self._apply_history_filter())
         ctk.CTkButton(
-            tools, text="Export Excel", width=96, height=26, font=ui_font(11, "bold"),
-            fg_color=COLOR_BTN_EXPORT, hover_color=COLOR_BTN_EXPORT_HOVER, corner_radius=6,
+            tools, text="Export Excel", width=104, height=30, font=ui_font(11, "bold"),
+            fg_color=COLOR_BTN_EXPORT, hover_color=COLOR_BTN_EXPORT_HOVER, corner_radius=8,
             command=self.export_excel,
-        ).pack(side="right", padx=(0, 6), pady=4)
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
-            tools, text="Export PDF", width=88, height=26, font=ui_font(11, "bold"),
-            fg_color=COLOR_BTN_EXPORT, hover_color=COLOR_BTN_EXPORT_HOVER, corner_radius=6,
+            tools, text="Export PDF", width=96, height=30, font=ui_font(11, "bold"),
+            fg_color=COLOR_BTN_EXPORT, hover_color=COLOR_BTN_EXPORT_HOVER, corner_radius=8,
             command=self.export_pdf,
-        ).pack(side="right", padx=(0, 4), pady=4)
+        ).pack(side="left")
 
-        tree_host = tk.Frame(results, bg=COLOR_BG)
-        tree_host.pack(fill="x", padx=4, pady=(0, 4))
+        tree_host = tk.Frame(results, bg=COLOR_BG_CARD)
+        tree_host.pack(fill="x", padx=10, pady=(0, 10))
         columns = (
             "num",
             "vehicle",
@@ -761,12 +764,12 @@ class TpmsView(ctk.CTkFrame):
 
         # Activity terminal (same style as SDR tab)
         self.activity_terminal = ActivityTerminalPanel(root, start_expanded=False)
-        self.activity_terminal.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        self.activity_terminal.grid(row=3, column=0, sticky="ew", pady=(4, 0))
 
         footer = ctk.CTkFrame(root, fg_color="transparent")
-        footer.grid(row=5, column=0, sticky="ew", pady=(4, 8))
+        footer.grid(row=4, column=0, sticky="ew", pady=(4, 8))
         self.status_var = ctk.StringVar(
-            value="Ready · USB-TTL Board (SDR optional) · Select Excel and/or CODE A / B / C"
+            value="Ready · USB-TTL Board · Select Excel and/or CODE A / B / C"
         )
         ctk.CTkLabel(
             footer, textvariable=self.status_var, font=ui_font(11),

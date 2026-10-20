@@ -1,4 +1,4 @@
-"""Fyrqom palette — polished dashboard for TPMS Suite 4.0."""
+"""Fyrqom palette — polished dashboard for TPMS Suite 5.0."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ FYRQOM_MARK = _ASSETS / "fyrqom_logo.png"
 COMPANY_NAME = "Fyrqom"
 PRODUCT_NAME = "Fyrqom TPMS Suite"
 UI_FONT = "Helvetica Neue" if sys.platform == "darwin" else "Segoe UI"
+UI_MONO = "SF Mono" if sys.platform == "darwin" else "Consolas"
 
 # Brand
 FYRQOM_BLACK = "#0E1116"
@@ -24,11 +25,11 @@ FYRQOM_DARK = "#161A20"
 FYRQOM_MID = "#3A424C"
 
 # Sidebar
-COLOR_SIDEBAR_BG = "#0B0F14"
+COLOR_SIDEBAR_BG = "#0A0E13"
 COLOR_SIDEBAR_ACTIVE = "#00C9B1"
-COLOR_SIDEBAR_HOVER = "#151B22"
-COLOR_SIDEBAR_TEXT = "#B8C2CC"
-COLOR_SIDEBAR_MUTED = "#6E7A86"
+COLOR_SIDEBAR_HOVER = "#141A22"
+COLOR_SIDEBAR_TEXT = "#C2CBD4"
+COLOR_SIDEBAR_MUTED = "#6B7682"
 
 # Header aliases
 COLOR_HEADER_BG = COLOR_SIDEBAR_BG
@@ -43,19 +44,20 @@ COLOR_TAB_ACTIVE = "#FFFFFF"
 COLOR_TAB_ACTIVE_TEXT = "#007A6E"
 
 # Surfaces
-COLOR_BG = "#E8ECF0"
+COLOR_BG = "#E6EAEF"
 COLOR_BG_CARD = "#FFFFFF"
-COLOR_BG_PANEL = "#F4F6F8"
-COLOR_BORDER = "#D7DEE5"
+COLOR_BG_PANEL = "#F3F5F8"
+COLOR_BORDER = "#D4DBE3"
 COLOR_ROW_OK = "#E4F9F5"
 COLOR_ROW_ALT = "#F5F7F7"
 
 # Live dark panel
-COLOR_LIVE_BG = "#141A22"
+COLOR_LIVE_BG = "#12181F"
 COLOR_LIVE_FG = "#F5F7FA"
 COLOR_LIVE_MUTED = "#8B97A3"
-COLOR_LIVE_CHIP = "#1E2630"
+COLOR_LIVE_CHIP = "#1A222C"
 COLOR_LIVE_TEAL = FYRQOM_TEAL
+COLOR_LIVE_BORDER = "#2A3440"
 
 # Soft pills
 COLOR_PILL_OK_BG = "#E5F7EE"
@@ -68,9 +70,9 @@ COLOR_PILL_ERR_BG = "#FCECEC"
 COLOR_PILL_ERR_FG = "#C53030"
 
 # Text
-COLOR_TEXT = "#10151A"
+COLOR_TEXT = "#0F1419"
 COLOR_TEXT_DIM = "#55606B"
-COLOR_TEXT_MUTED = "#84909A"
+COLOR_TEXT_MUTED = "#7E8A95"
 
 # Status
 COLOR_CYAN = FYRQOM_TEAL
@@ -122,6 +124,10 @@ RADIUS_CTRL = 10
 
 def ui_font(size: int = 13, weight: str = "normal") -> ctk.CTkFont:
     return ctk.CTkFont(family=UI_FONT, size=size, weight=weight)
+
+
+def mono_font(size: int = 14, weight: str = "bold") -> ctk.CTkFont:
+    return ctk.CTkFont(family=UI_MONO, size=size, weight=weight)
 
 
 def combo_colors() -> dict:

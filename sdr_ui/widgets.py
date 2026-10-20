@@ -54,23 +54,30 @@ class StatCard(ctk.CTkFrame):
     hover_bg: str | None = None,
     **kwargs,
   ):
-    kwargs.setdefault("fg_color", bg)
-    kwargs.setdefault("corner_radius", 12)
+    kwargs.setdefault("fg_color", COLOR_BG_CARD)
+    kwargs.setdefault("corner_radius", 14)
     kwargs.setdefault("border_width", 1)
     kwargs.setdefault("border_color", COLOR_BORDER)
     super().__init__(master, **kwargs)
     self._accent = accent
-    self._bg = bg
+    self._bg = COLOR_BG_CARD
+    self._tint = bg
     self._hover_bg = hover_bg or bg
     self._on_click = on_click
+    shell = ctk.CTkFrame(self, fg_color="transparent")
+    shell.pack(fill="both", expand=True, padx=1, pady=1)
+    # Left accent rail
+    ctk.CTkFrame(shell, fg_color=accent, width=4, corner_radius=2).pack(
+      side="left", fill="y", padx=(2, 0), pady=6
+    )
     pad_x = 12 if compact else 14
     pad_y = 10 if compact else 12
-    body = ctk.CTkFrame(self, fg_color="transparent")
-    body.pack(fill="both", expand=True, padx=pad_x, pady=pad_y)
+    body = ctk.CTkFrame(shell, fg_color="transparent")
+    body.pack(side="left", fill="both", expand=True, padx=(pad_x - 4, pad_x), pady=pad_y)
     self.title_label = ctk.CTkLabel(
       body,
-      text=title,
-      font=ctk.CTkFont(size=11 if compact else 12, weight="bold"),
+      text=title.upper(),
+      font=ctk.CTkFont(size=10 if compact else 11, weight="bold"),
       text_color=accent,
       anchor="w",
     )
@@ -78,8 +85,8 @@ class StatCard(ctk.CTkFrame):
     self.value_label = ctk.CTkLabel(
       body,
       text=str(value),
-      font=ctk.CTkFont(size=22 if compact else 26, weight="bold"),
-      text_color="#102226",
+      font=ctk.CTkFont(size=24 if compact else 28, weight="bold"),
+      text_color=COLOR_TEXT,
       anchor="w",
     )
     self.value_label.pack(fill="x", pady=(2, 0))
@@ -90,7 +97,7 @@ class StatCard(ctk.CTkFrame):
       text_color=COLOR_TEXT_MUTED,
       anchor="w",
     )
-    self.subtitle_label.pack(fill="x", pady=(2, 0))
+    self.subtitle_label.pack(fill="x", pady=(1, 0))
     if on_click is not None:
       self.configure(cursor="hand2")
       for widget in (self, body, self.title_label, self.value_label, self.subtitle_label):
