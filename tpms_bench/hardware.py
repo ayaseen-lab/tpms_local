@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from .uart import find_serial_ports, list_serial_port_choices, port_device
 
@@ -78,54 +80,121 @@ def _ttl_status() -> PathStatus:
     return PathStatus(False, "—", "No CH340/USB-TTL adapter found")
 
 
-def _sdr_status() -> PathStatus:
-    for binary in ("rtl_test", "rtl_433"):
-        path = shutil.which(binary)
-        if not path:
-            continue
-        try:
-            if binary == "rtl_test":
-                proc = subprocess.run(
-                    [path, "-t"],
-                    capture_output=True,
-                    text=True,
-                    timeout=8,
-                    check=False,
-                )
-            else:
-                proc = subprocess.run(
-                    [path, "-f", "433.92M", "-T", "2", "-F", "log"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
-            text = (proc.stdout or "") + (proc.stderr or "")
-            if "No supported devices found" in text or "Failed to open" in text:
-                if "Found 1 device" in text or "Found 2 device" in text or "Using device" in text:
-                    return PathStatus(True, path, "RTL-SDR present (may be in use)")
-                return PathStatus(False, path, "dongle not detected")
-            if "Using device" in text or "Found 1 device" in text or "Tuned to" in text or "Rafael Micro" in text:
-                name = "RTL-SDR"
-                for line in text.splitlines():
-                    if "NESDR" in line or "Nooelec" in line or "RTL2832" in line:
-                        name = line.strip()[:60]
-                        break
-                return PathStatus(True, path, name)
-            if "claimed by second instance" in text or "usb_claim_interface" in text:
-                return PathStatus(True, path, "RTL-SDR present (in use by another process)")
-        except Exception as exc:
-            return PathStatus(False, path, str(exc))
+def _no_window_kwargs() -> dict:
+    if sys.platform != "win32":
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+
+
+def _sdr_probe_candidates() -> list[tuple[str, Path | None]]:
+    """Ordered (exe, cwd) pairs. Bundled rtl_433 first — PATH is often empty on Windows."""
+    seen: set[str] = set()
+    out: list[tuple[str, Path | None]] = []
+
+    def add(exe: str, cwd: Path | None = None) -> None:
+        path = Path(exe)
+        key = str(path.resolve()) if path.is_file() else exe
+        if key in seen:
+            return
+        seen.add(key)
+        out.append((exe, cwd))
 
     try:
-        from config import get_rtl433_exe
+        from config import get_rtl433_dir, get_rtl433_exe
 
-        exe = get_rtl433_exe()
-        if exe.is_file():
-            return PathStatus(False, str(exe), "rtl_433 found but no RTL-SDR dongle")
+        bundled = get_rtl433_exe()
+        if bundled.is_file():
+            add(str(bundled), get_rtl433_dir())
     except Exception:
         pass
-    return PathStatus(False, "—", "rtl_433 / rtl_test not installed")
+
+    try:
+        from .rtl433 import rtl_433_path
+
+        path = rtl_433_path()
+        if path:
+            add(path, Path(path).parent)
+    except Exception:
+        pass
+
+    for name in ("rtl_test", "rtl_433-rtlsdr", "rtl_433"):
+        found = shutil.which(name)
+        if found:
+            add(found, Path(found).parent)
+
+    return out
+
+
+def _interpret_sdr_probe(path: str, text: str) -> PathStatus | None:
+    """Return a PathStatus when the probe output is conclusive; else None."""
+    lower = text.lower()
+    if "claimed by second instance" in text or "usb_claim_interface" in text:
+        return PathStatus(True, path, "RTL-SDR present (in use by another process)")
+    if "No supported devices found" in text:
+        return PathStatus(
+            False,
+            path,
+            "dongle not detected — plug in RTL-SDR or install WinUSB with Zadig",
+        )
+    if "Failed to open" in text or "usb_open" in lower:
+        if "Found 1 device" in text or "Found 2 device" in text or "Using device" in text:
+            return PathStatus(True, path, "RTL-SDR present (may be in use)")
+        return PathStatus(False, path, "dongle not detected — check Zadig WinUSB driver")
+    if "Using device" in text or "Found 1 device" in text or "Tuned to" in text or "Rafael Micro" in text:
+        name = "RTL-SDR"
+        for line in text.splitlines():
+            if "NESDR" in line or "Nooelec" in line or "RTL2832" in line:
+                name = line.strip()[:60]
+                break
+        return PathStatus(True, path, name)
+    return None
+
+
+def _sdr_status() -> PathStatus:
+    candidates = _sdr_probe_candidates()
+    if not candidates:
+        return PathStatus(False, "—", "rtl_433 / rtl_test not installed")
+
+    last_detail = "dongle not detected"
+    last_path = candidates[0][0]
+    for path, cwd in candidates:
+        last_path = path
+        is_rtl_test = Path(path).stem.lower() == "rtl_test"
+        cmd = [path, "-t"] if is_rtl_test else [path, "-f", "433.92M", "-T", "2", "-F", "null"]
+        timeout = 8 if is_rtl_test else 12
+        run_cwd = str(cwd) if cwd and cwd.is_dir() else None
+        env = None
+        if run_cwd and sys.platform == "win32":
+            # Companion DLLs (rtlsdr.dll, libusb) live next to the bundled exe.
+            env = os.environ.copy()
+            env["PATH"] = run_cwd + os.pathsep + env.get("PATH", "")
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                cwd=run_cwd,
+                env=env,
+                **_no_window_kwargs(),
+            )
+        except subprocess.TimeoutExpired:
+            # Device opened long enough to hang the short probe — treat as present.
+            return PathStatus(True, path, "RTL-SDR (probe timed out — device likely OK)")
+        except Exception as exc:
+            last_detail = str(exc)
+            continue
+
+        text = (proc.stdout or "") + (proc.stderr or "")
+        interpreted = _interpret_sdr_probe(path, text)
+        if interpreted is not None:
+            return interpreted
+        if proc.returncode == 0:
+            return PathStatus(True, path, "RTL-SDR")
+        last_detail = "dongle not detected — check cable / Zadig WinUSB"
+
+    return PathStatus(False, last_path, last_detail)
 
 
 def check_hardware_trio() -> HardwareTrio:

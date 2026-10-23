@@ -1,4 +1,4 @@
-Windows helpers for TPMS Suite 2.0
+Windows helpers for TPMS Suite 6.0
 =================================
 
 Repo-root TPMS_Suite.exe — double-click launcher (starts packaged app or pythonw main.py)

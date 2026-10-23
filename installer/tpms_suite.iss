@@ -1,5 +1,5 @@
 #define MyAppName "Fyrqom TPMS Suite"
-#define MyAppVersion "4.0.0"
+#define MyAppVersion "6.0.0"
 #define MyAppPublisher "Fyrqom"
 #define MyAppExeName "Fyrqom_TPMS_Suite.exe"
 

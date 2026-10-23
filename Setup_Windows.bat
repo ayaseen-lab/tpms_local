@@ -2,9 +2,9 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-title TPMS Suite 2.0 — First-time Windows setup
+title TPMS Suite 6.0 — First-time Windows setup
 echo.
-echo  TPMS Suite 2.0 — Windows setup
+echo  TPMS Suite 6.0 — Windows setup
 echo  --------------------------------
 echo  Creates .venv, installs requirements, fetches rtl_433/Zadig.
 echo.

@@ -126,7 +126,7 @@ class CombinedApp(ctk.CTk):
                 brand, text=COMPANY_NAME.lower(), font=ui_font(22, "bold"), text_color="#FFFFFF"
             ).pack(anchor="w")
         ctk.CTkLabel(
-            brand, text="TPMS Suite 5.0", font=ui_font(12, "bold"), text_color=COLOR_SIDEBAR_ACTIVE
+            brand, text="TPMS Suite 6.0", font=ui_font(12, "bold"), text_color=COLOR_SIDEBAR_ACTIVE
         ).pack(anchor="w", pady=(6, 0))
 
         nav = ctk.CTkFrame(sidebar, fg_color="transparent")

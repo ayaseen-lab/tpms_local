@@ -1,4 +1,4 @@
-"""Fyrqom palette — polished dashboard for TPMS Suite 5.0."""
+"""Fyrqom palette — polished dashboard for TPMS Suite 6.0."""
 
 from __future__ import annotations
 

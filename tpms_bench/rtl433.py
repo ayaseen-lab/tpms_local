@@ -96,6 +96,9 @@ def _no_window_kwargs() -> dict:
 
 
 def sdr_present() -> bool:
+    """True when an RTL-SDR dongle can be opened (or is already in use)."""
+    import os
+
     if shutil.which("rtl_test"):
         probe = subprocess.run(
             ["rtl_test", "-t"],
@@ -106,28 +109,47 @@ def sdr_present() -> bool:
             **_no_window_kwargs(),
         )
         text = (probe.stdout or "") + (probe.stderr or "")
-        if "No supported devices found" in text or probe.returncode != 0:
+        if "No supported devices found" in text:
             return False
-        return True
-    # rtl_433 itself fails fast when no dongle is present.
+        if "usb_claim_interface" in text or "claimed by second instance" in text:
+            return True
+        return probe.returncode == 0
+
     binary = rtl_433_path()
     if not binary:
         return False
-    probe = subprocess.run(
-        [binary, "-T", "1"],
-        capture_output=True,
-        text=True,
-        timeout=12,
-        check=False,
-        **_no_window_kwargs(),
-    )
+    workdir = str(Path(binary).parent)
+    env = os.environ.copy()
+    if sys.platform == "win32":
+        env["PATH"] = workdir + os.pathsep + env.get("PATH", "")
+    try:
+        probe = subprocess.run(
+            [binary, "-f", "433.92M", "-T", "2", "-F", "null"],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+            cwd=workdir,
+            env=env,
+            **_no_window_kwargs(),
+        )
+    except subprocess.TimeoutExpired:
+        return True
     text = (probe.stdout or "") + (probe.stderr or "")
     if "No input drivers" in text and "RTL-SDR" not in text:
         return False
-    if "No supported devices found" in text or "usb_claim_interface error" in text:
+    if "No supported devices found" in text:
         return False
-    return probe.returncode == 0 or "Tuned to" in text or "Using device" in text
-
+    if "usb_claim_interface" in text or "claimed by second instance" in text:
+        return True
+    if "Failed to open" in text and "Found" not in text and "Using device" not in text:
+        return False
+    return (
+        probe.returncode == 0
+        or "Tuned to" in text
+        or "Using device" in text
+        or "Found 1 device" in text
+    )
 
 def _packet_rssi(data: dict) -> float | None:
     for key in ("rssi", "RSSI", "rssi_db"):
